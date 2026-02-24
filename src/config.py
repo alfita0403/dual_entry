@@ -18,6 +18,7 @@ Environment Variables:
     POLY_BUILDER_API_PASSPHRASE: Builder Program passphrase
     POLY_CLOB_HOST: CLOB API host
     POLY_CHAIN_ID: Chain ID (default: 137)
+    POLY_SIGNATURE_TYPE: Signature type (0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE)
     POLY_DATA_DIR: Data directory for credentials
     POLY_LOG_LEVEL: Logging level
 
@@ -82,17 +83,20 @@ def get_env_float(name: str, default: float = 0.0) -> float:
 
 class ConfigError(Exception):
     """Base exception for configuration errors."""
+
     pass
 
 
 class ConfigNotFoundError(ConfigError):
     """Raised when config file is not found."""
+
     pass
 
 
 @dataclass
 class BuilderConfig:
     """Builder Program configuration for gasless transactions."""
+
     api_key: str = ""
     api_secret: str = ""
     api_passphrase: str = ""
@@ -105,9 +109,10 @@ class BuilderConfig:
 @dataclass
 class ClobConfig:
     """CLOB (Central Limit Order Book) configuration."""
+
     host: str = "https://clob.polymarket.com"
     chain_id: int = 137
-    signature_type: int = 2  # Gnosis Safe
+    signature_type: int = 0  # 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
 
     def is_valid(self) -> bool:
         """Validate CLOB configuration."""
@@ -117,8 +122,9 @@ class ClobConfig:
 @dataclass
 class RelayerConfig:
     """Relayer configuration for gasless transactions."""
+
     host: str = "https://relayer-v2.polymarket.com"
-    tx_type: str = "SAFE"  # SAFE or PROXY
+    tx_type: str = ""  # SAFE or PROXY; auto-detected from signature_type
 
     def is_configured(self) -> bool:
         """Check if relayer is configured."""
@@ -171,6 +177,12 @@ class Config:
         # Auto-enable gasless if builder is configured
         if self.builder.is_configured():
             self.use_gasless = True
+        # Auto-detect relayer tx_type from signature_type
+        if not self.relayer.tx_type:
+            if self.clob.signature_type == 1:
+                self.relayer.tx_type = "PROXY"
+            else:
+                self.relayer.tx_type = "SAFE"
 
     @classmethod
     def load(cls, filepath: str = "config.yaml") -> "Config":
@@ -188,7 +200,7 @@ class Config:
         if not path.exists():
             raise ConfigNotFoundError(f"Config file not found: {filepath}")
 
-        with open(path, 'r') as f:
+        with open(path, "r") as f:
             data = yaml.safe_load(f) or {}
 
         return cls.from_dict(data)
@@ -210,7 +222,9 @@ class Config:
             config.clob = ClobConfig(
                 host=clob_data.get("host", config.clob.host),
                 chain_id=clob_data.get("chain_id", config.clob.chain_id),
-                signature_type=clob_data.get("signature_type", config.clob.signature_type),
+                signature_type=clob_data.get(
+                    "signature_type", config.clob.signature_type
+                ),
             )
 
         # Relayer config
@@ -293,16 +307,17 @@ class Config:
                 api_passphrase=api_passphrase,
             )
 
+        # Signature type (0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE)
+        signature_type = get_env_int("SIGNATURE_TYPE", 0)
+
         # CLOB config
         clob_host = get_env("CLOB_HOST")
         chain_id = get_env_int("CHAIN_ID", 137)
-        if clob_host:
-            config.clob = ClobConfig(
-                host=clob_host,
-                chain_id=chain_id,
-            )
-        elif chain_id != 137:
-            config.clob.chain_id = chain_id
+        config.clob = ClobConfig(
+            host=clob_host if clob_host else config.clob.host,
+            chain_id=chain_id,
+            signature_type=signature_type,
+        )
 
         # Other settings
         data_dir = get_env("DATA_DIR")
@@ -321,8 +336,12 @@ class Config:
         if default_price:
             config.default_price = default_price
 
-        # Auto-detect gasless mode
+        # Auto-detect gasless mode and relayer tx_type
         config.use_gasless = config.builder.is_configured()
+        if config.clob.signature_type == 1:
+            config.relayer.tx_type = "PROXY"
+        elif not config.relayer.tx_type:
+            config.relayer.tx_type = "SAFE"
 
         return config
 
@@ -353,6 +372,11 @@ class Config:
         if rpc_url:
             config.rpc_url = rpc_url
 
+        # Signature type override
+        sig_type_str = get_env("SIGNATURE_TYPE")
+        if sig_type_str:
+            config.clob.signature_type = int(sig_type_str)
+
         # Builder credentials from env override YAML
         api_key = get_env("BUILDER_API_KEY")
         api_secret = get_env("BUILDER_API_SECRET")
@@ -373,8 +397,12 @@ class Config:
         if log_level:
             config.log_level = log_level.upper()
 
-        # Re-check gasless mode
+        # Re-check gasless mode and relayer tx_type
         config.use_gasless = config.builder.is_configured()
+        if config.clob.signature_type == 1:
+            config.relayer.tx_type = "PROXY"
+        elif not config.relayer.tx_type:
+            config.relayer.tx_type = "SAFE"
 
         return config
 
@@ -384,7 +412,7 @@ class Config:
         path = Path(filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(path, 'w') as f:
+        with open(path, "w") as f:
             yaml.dump(data, f, default_flow_style=False, indent=2)
 
     def to_dict(self) -> Dict[str, Any]:

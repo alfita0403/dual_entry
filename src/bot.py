@@ -44,21 +44,23 @@ from .crypto import KeyManager, CryptoError, InvalidPasswordError
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+
 class OrderSide(str, Enum):
     """Order side constants."""
+
     BUY = "BUY"
     SELL = "SELL"
 
 
 class OrderType(str, Enum):
     """Order type constants."""
+
     GTC = "GTC"  # Good Till Cancelled
     GTD = "GTD"  # Good Till Date
     FOK = "FOK"  # Fill Or Kill
@@ -67,6 +69,7 @@ class OrderType(str, Enum):
 @dataclass
 class OrderResult:
     """Result of an order operation."""
+
     success: bool
     order_id: Optional[str] = None
     status: Optional[str] = None
@@ -84,17 +87,19 @@ class OrderResult:
             order_id=response.get("orderId"),
             status=response.get("status"),
             message=error_msg if not success else "Order placed successfully",
-            data=response
+            data=response,
         )
 
 
 class TradingBotError(Exception):
     """Base exception for trading bot errors."""
+
     pass
 
 
 class NotInitializedError(TradingBotError):
     """Raised when bot is not initialized."""
+
     pass
 
 
@@ -125,7 +130,7 @@ class TradingBot:
         encrypted_key_path: Optional[str] = None,
         password: Optional[str] = None,
         api_creds_path: Optional[str] = None,
-        log_level: int = logging.INFO
+        log_level: int = logging.INFO,
     ):
         """
         Initialize trading bot.
@@ -246,11 +251,13 @@ class TradingBot:
     def _init_clients(self) -> None:
         """Initialize API clients."""
         # CLOB client
+        signer_addr = self.signer.address if self.signer else ""
         self.clob_client = ClobClient(
             host=self.config.clob.host,
             chain_id=self.config.clob.chain_id,
             signature_type=self.config.clob.signature_type,
             funder=self.config.safe_address,
+            signer_address=signer_addr,
             api_creds=self._api_creds,
             builder_creds=self.config.builder if self.config.use_gasless else None,
         )
@@ -265,16 +272,18 @@ class TradingBot:
             )
             logger.info("Relayer client initialized (gasless enabled)")
 
-    async def _run_in_thread(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    async def _run_in_thread(
+        self, func: Callable[..., T], *args: Any, **kwargs: Any
+    ) -> T:
         """Run a blocking call in a worker thread to avoid event loop stalls."""
         return await asyncio.to_thread(func, *args, **kwargs)
 
     def is_initialized(self) -> bool:
         """Check if bot is properly initialized."""
-        return (
-            self.signer is not None and
-            self.config.safe_address and
-            self.clob_client is not None
+        return bool(
+            self.signer is not None
+            and self.config.safe_address
+            and self.clob_client is not None
         )
 
     def require_signer(self) -> OrderSigner:
@@ -292,7 +301,9 @@ class TradingBot:
         size: float,
         side: str,
         order_type: str = "GTC",
-        fee_rate_bps: int = 0
+        fee_rate_bps: int = 0,
+        neg_risk: bool = False,
+        tick_size: str = "0.01",
     ) -> OrderResult:
         """
         Place a limit order.
@@ -304,6 +315,8 @@ class TradingBot:
             side: 'BUY' or 'SELL'
             order_type: Order type (GTC, GTD, FOK)
             fee_rate_bps: Fee rate in basis points
+            neg_risk: Whether market uses neg-risk exchange
+            tick_size: Market tick size ("0.01", "0.001", etc.)
 
         Returns:
             OrderResult with order status
@@ -311,17 +324,20 @@ class TradingBot:
         signer = self.require_signer()
 
         try:
-            # Create order
+            # Create order with correct signature type from config
             order = Order(
                 token_id=token_id,
                 price=price,
                 size=size,
                 side=side,
-                maker=self.config.safe_address,
+                funder=self.config.safe_address,
                 fee_rate_bps=fee_rate_bps,
+                signature_type=self.config.clob.signature_type,
+                neg_risk=neg_risk,
+                tick_size=tick_size,
             )
 
-            # Sign order
+            # Sign order using official SDK (returns SignedOrder.dict())
             signed = signer.sign_order(order)
 
             # Submit to CLOB
@@ -332,23 +348,21 @@ class TradingBot:
             )
 
             logger.info(
-                f"Order placed: {side} {size}@{price} "
-                f"(token: {token_id[:16]}...)"
+                f"Order placed: {side} {size}@{price} (token: {token_id[:16]}...)"
             )
 
             return OrderResult.from_response(response)
 
         except Exception as e:
             logger.error(f"Failed to place order: {e}")
-            return OrderResult(
-                success=False,
-                message=str(e)
-            )
+            return OrderResult(success=False, message=str(e))
 
     async def place_orders(
         self,
         orders: List[Dict[str, Any]],
-        order_type: str = "GTC"
+        order_type: str = "GTC",
+        neg_risk: bool = False,
+        tick_size: str = "0.01",
     ) -> List[OrderResult]:
         """
         Place multiple orders.
@@ -360,6 +374,8 @@ class TradingBot:
                 - size: Number of shares
                 - side: 'BUY' or 'SELL'
             order_type: Order type (GTC, GTD, FOK)
+            neg_risk: Whether market uses neg-risk exchange
+            tick_size: Market tick size
 
         Returns:
             List of OrderResults
@@ -372,6 +388,8 @@ class TradingBot:
                 size=order_data["size"],
                 side=order_data["side"],
                 order_type=order_type,
+                neg_risk=order_data.get("neg_risk", neg_risk),
+                tick_size=order_data.get("tick_size", tick_size),
             )
             results.append(result)
 
@@ -391,21 +409,19 @@ class TradingBot:
             OrderResult with cancellation status
         """
         try:
-            response = await self._run_in_thread(self.clob_client.cancel_order, order_id)
+            response = await self._run_in_thread(
+                self.clob_client.cancel_order, order_id
+            )
             logger.info(f"Order cancelled: {order_id}")
             return OrderResult(
                 success=True,
                 order_id=order_id,
                 message="Order cancelled",
-                data=response
+                data=response,
             )
         except Exception as e:
             logger.error(f"Failed to cancel order {order_id}: {e}")
-            return OrderResult(
-                success=False,
-                order_id=order_id,
-                message=str(e)
-            )
+            return OrderResult(success=False, order_id=order_id, message=str(e))
 
     async def cancel_all_orders(self) -> OrderResult:
         """
@@ -418,18 +434,14 @@ class TradingBot:
             response = await self._run_in_thread(self.clob_client.cancel_all_orders)
             logger.info("All orders cancelled")
             return OrderResult(
-                success=True,
-                message="All orders cancelled",
-                data=response
+                success=True, message="All orders cancelled", data=response
             )
         except Exception as e:
             logger.error(f"Failed to cancel orders: {e}")
             return OrderResult(success=False, message=str(e))
 
     async def cancel_market_orders(
-        self,
-        market: Optional[str] = None,
-        asset_id: Optional[str] = None
+        self, market: Optional[str] = None, asset_id: Optional[str] = None
     ) -> OrderResult:
         """
         Cancel orders for a specific market.
@@ -447,11 +459,13 @@ class TradingBot:
                 market,
                 asset_id,
             )
-            logger.info(f"Market orders cancelled (market: {market or 'all'}, asset: {asset_id or 'all'})")
+            logger.info(
+                f"Market orders cancelled (market: {market or 'all'}, asset: {asset_id or 'all'})"
+            )
             return OrderResult(
                 success=True,
                 message=f"Orders cancelled for market {market or 'all'}",
-                data=response
+                data=response,
             )
         except Exception as e:
             logger.error(f"Failed to cancel market orders: {e}")
@@ -489,9 +503,7 @@ class TradingBot:
             return None
 
     async def get_trades(
-        self,
-        token_id: Optional[str] = None,
-        limit: int = 100
+        self, token_id: Optional[str] = None, limit: int = 100
     ) -> List[Dict[str, Any]]:
         """
         Get trade history.
@@ -504,7 +516,9 @@ class TradingBot:
             List of trades
         """
         try:
-            trades = await self._run_in_thread(self.clob_client.get_trades, token_id, limit)
+            trades = await self._run_in_thread(
+                self.clob_client.get_trades, token_id, limit
+            )
             logger.debug(f"Retrieved {len(trades)} trades")
             return trades
         except Exception as e:
@@ -538,7 +552,9 @@ class TradingBot:
             Price data
         """
         try:
-            return await self._run_in_thread(self.clob_client.get_market_price, token_id)
+            return await self._run_in_thread(
+                self.clob_client.get_market_price, token_id
+            )
         except Exception as e:
             logger.error(f"Failed to get market price: {e}")
             return {}
@@ -566,11 +582,7 @@ class TradingBot:
             return False
 
     def create_order_dict(
-        self,
-        token_id: str,
-        price: float,
-        size: float,
-        side: str
+        self, token_id: str, price: float, size: float, side: str
     ) -> Dict[str, Any]:
         """
         Create an order dictionary for batch processing.
@@ -598,7 +610,7 @@ def create_bot(
     private_key: Optional[str] = None,
     encrypted_key_path: Optional[str] = None,
     password: Optional[str] = None,
-    **kwargs
+    **kwargs,
 ) -> TradingBot:
     """
     Create a TradingBot instance with common options.
@@ -618,5 +630,5 @@ def create_bot(
         private_key=private_key,
         encrypted_key_path=encrypted_key_path,
         password=password,
-        **kwargs
+        **kwargs,
     )

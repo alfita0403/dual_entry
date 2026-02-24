@@ -27,12 +27,14 @@ Example:
     )
 """
 
+from __future__ import annotations
+
 import time
 import hmac
 import hashlib
 import base64
 import json
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, TYPE_CHECKING
 from dataclasses import dataclass
 
 import requests
@@ -40,25 +42,32 @@ import requests
 from .config import BuilderConfig
 from .http import ThreadLocalSessionMixin
 
+if TYPE_CHECKING:
+    from .signer import OrderSigner
+
 
 class ApiError(Exception):
     """Base exception for API errors."""
+
     pass
 
 
 class AuthenticationError(ApiError):
     """Raised when authentication fails."""
+
     pass
 
 
 class OrderError(ApiError):
     """Raised when order operations fail."""
+
     pass
 
 
 @dataclass
 class ApiCredentials:
     """User-level API credentials for CLOB."""
+
     api_key: str
     secret: str
     passphrase: str
@@ -66,7 +75,7 @@ class ApiCredentials:
     @classmethod
     def load(cls, filepath: str) -> "ApiCredentials":
         """Load credentials from JSON file."""
-        with open(filepath, 'r') as f:
+        with open(filepath, "r") as f:
             data = json.load(f)
         return cls(
             api_key=data.get("apiKey", ""),
@@ -89,12 +98,7 @@ class ApiClient(ThreadLocalSessionMixin):
     - Error handling
     """
 
-    def __init__(
-        self,
-        base_url: str,
-        timeout: int = 30,
-        retry_count: int = 3
-    ):
+    def __init__(self, base_url: str, timeout: int = 30, retry_count: int = 3):
         """
         Initialize API client.
 
@@ -104,7 +108,7 @@ class ApiClient(ThreadLocalSessionMixin):
             retry_count: Number of retries on failure
         """
         super().__init__()
-        self.base_url = base_url.rstrip('/')
+        self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.retry_count = retry_count
 
@@ -114,15 +118,19 @@ class ApiClient(ThreadLocalSessionMixin):
         endpoint: str,
         data: Optional[Any] = None,
         headers: Optional[Dict] = None,
-        params: Optional[Dict] = None
+        params: Optional[Dict] = None,
     ) -> Dict[str, Any]:
         """
         Make HTTP request with error handling.
 
+        IMPORTANT: For POST/DELETE with a body, the data is serialized with
+        compact JSON separators (',', ':') to match the HMAC signature.
+        The same pre-serialized bytes are sent as the request body.
+
         Args:
             method: HTTP method (GET, POST, etc.)
             endpoint: API endpoint
-            data: Request body data
+            data: Request body data (will be serialized to compact JSON)
             headers: Additional headers
             params: Query parameters
 
@@ -138,24 +146,39 @@ class ApiClient(ThreadLocalSessionMixin):
         if headers:
             request_headers.update(headers)
 
+        # Pre-serialize body as compact JSON bytes to match HMAC signature
+        body_bytes = None
+        if data is not None:
+            body_bytes = json.dumps(
+                data, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+
         last_error = None
         for attempt in range(self.retry_count):
             try:
                 session = self.session
                 if method.upper() == "GET":
                     response = session.get(
-                        url, headers=request_headers,
-                        params=params, timeout=self.timeout
+                        url,
+                        headers=request_headers,
+                        params=params,
+                        timeout=self.timeout,
                     )
                 elif method.upper() == "POST":
                     response = session.post(
-                        url, headers=request_headers,
-                        json=data, params=params, timeout=self.timeout
+                        url,
+                        headers=request_headers,
+                        data=body_bytes,
+                        params=params,
+                        timeout=self.timeout,
                     )
                 elif method.upper() == "DELETE":
                     response = session.delete(
-                        url, headers=request_headers,
-                        json=data, params=params, timeout=self.timeout
+                        url,
+                        headers=request_headers,
+                        data=body_bytes,
+                        params=params,
+                        timeout=self.timeout,
                     )
                 else:
                     raise ApiError(f"Unsupported method: {method}")
@@ -166,9 +189,11 @@ class ApiClient(ThreadLocalSessionMixin):
             except requests.exceptions.RequestException as e:
                 last_error = e
                 if attempt < self.retry_count - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                    time.sleep(2**attempt)  # Exponential backoff
 
-        raise ApiError(f"Request failed after {self.retry_count} attempts: {last_error}")
+        raise ApiError(
+            f"Request failed after {self.retry_count} attempts: {last_error}"
+        )
 
 
 class ClobClient(ApiClient):
@@ -194,11 +219,12 @@ class ClobClient(ApiClient):
         self,
         host: str = "https://clob.polymarket.com",
         chain_id: int = 137,
-        signature_type: int = 2,
+        signature_type: int = 0,
         funder: str = "",
+        signer_address: str = "",
         api_creds: Optional[ApiCredentials] = None,
         builder_creds: Optional[BuilderConfig] = None,
-        timeout: int = 30
+        timeout: int = 30,
     ):
         """
         Initialize CLOB client.
@@ -206,8 +232,9 @@ class ClobClient(ApiClient):
         Args:
             host: CLOB API host
             chain_id: Chain ID (137 for Polygon mainnet)
-            signature_type: Signature type (2 = Gnosis Safe)
-            funder: Funder/Safe address
+            signature_type: Signature type (0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE)
+            funder: Funder/Safe/Proxy address (where funds live)
+            signer_address: EOA address that signs (defaults to funder)
             api_creds: User API credentials (optional)
             builder_creds: Builder credentials for attribution (optional)
             timeout: Request timeout
@@ -217,15 +244,13 @@ class ClobClient(ApiClient):
         self.chain_id = chain_id
         self.signature_type = signature_type
         self.funder = funder
+        self.signer_address = (
+            signer_address or funder
+        )  # EOA; defaults to funder for EOA accounts
         self.api_creds = api_creds
         self.builder_creds = builder_creds
 
-    def _build_headers(
-        self,
-        method: str,
-        path: str,
-        body: str = ""
-    ) -> Dict[str, str]:
+    def _build_headers(self, method: str, path: str, body: str = "") -> Dict[str, str]:
         """
         Build authentication headers.
 
@@ -241,23 +266,28 @@ class ClobClient(ApiClient):
         """
         headers = {}
 
-        # Builder HMAC authentication
+        # Builder HMAC authentication (matches official py-builder-signing-sdk)
         if self.builder_creds and self.builder_creds.is_configured():
             timestamp = str(int(time.time()))
 
-            message = f"{timestamp}{method}{path}{body}"
-            signature = hmac.new(
-                self.builder_creds.api_secret.encode(),
-                message.encode(),
-                hashlib.sha256
-            ).hexdigest()
+            # Build message: timestamp + method + path + body
+            message = f"{timestamp}{method}{path}"
+            if body:
+                message += body
 
-            headers.update({
-                "POLY_BUILDER_API_KEY": self.builder_creds.api_key,
-                "POLY_BUILDER_TIMESTAMP": timestamp,
-                "POLY_BUILDER_PASSPHRASE": self.builder_creds.api_passphrase,
-                "POLY_BUILDER_SIGNATURE": signature,
-            })
+            # Decode base64 secret, create HMAC-SHA256, encode result as base64
+            base64_secret = base64.urlsafe_b64decode(self.builder_creds.api_secret)
+            h = hmac.new(base64_secret, message.encode("utf-8"), hashlib.sha256)
+            signature = base64.urlsafe_b64encode(h.digest()).decode("utf-8")
+
+            headers.update(
+                {
+                    "POLY_BUILDER_API_KEY": self.builder_creds.api_key,
+                    "POLY_BUILDER_TIMESTAMP": timestamp,
+                    "POLY_BUILDER_PASSPHRASE": self.builder_creds.api_passphrase,
+                    "POLY_BUILDER_SIGNATURE": signature,
+                }
+            )
 
         # User API credentials (L2 authentication)
         if self.api_creds and self.api_creds.is_valid():
@@ -276,18 +306,18 @@ class ClobClient(ApiClient):
             except Exception:
                 # Fallback: use secret directly if not base64 encoded
                 signature = hmac.new(
-                    self.api_creds.secret.encode(),
-                    message.encode(),
-                    hashlib.sha256
+                    self.api_creds.secret.encode(), message.encode(), hashlib.sha256
                 ).hexdigest()
 
-            headers.update({
-                "POLY_ADDRESS": self.funder,
-                "POLY_API_KEY": self.api_creds.api_key,
-                "POLY_TIMESTAMP": timestamp,
-                "POLY_PASSPHRASE": self.api_creds.passphrase,
-                "POLY_SIGNATURE": signature,
-            })
+            headers.update(
+                {
+                    "POLY_ADDRESS": self.signer_address,
+                    "POLY_API_KEY": self.api_creds.api_key,
+                    "POLY_TIMESTAMP": timestamp,
+                    "POLY_PASSPHRASE": self.api_creds.passphrase,
+                    "POLY_SIGNATURE": signature,
+                }
+            )
 
         return headers
 
@@ -360,7 +390,9 @@ class ClobClient(ApiClient):
             passphrase=response.get("passphrase", ""),
         )
 
-    def create_or_derive_api_key(self, signer: "OrderSigner", nonce: int = 0) -> ApiCredentials:
+    def create_or_derive_api_key(
+        self, signer: "OrderSigner", nonce: int = 0
+    ) -> ApiCredentials:
         """
         Create API credentials if not exists, otherwise derive them.
 
@@ -390,11 +422,7 @@ class ClobClient(ApiClient):
         Returns:
             Order book data
         """
-        return self._request(
-            "GET",
-            "/book",
-            params={"token_id": token_id}
-        )
+        return self._request("GET", "/book", params={"token_id": token_id})
 
     def get_market_price(self, token_id: str) -> Dict[str, Any]:
         """
@@ -406,11 +434,7 @@ class ClobClient(ApiClient):
         Returns:
             Price data
         """
-        return self._request(
-            "GET",
-            "/price",
-            params={"token_id": token_id}
-        )
+        return self._request("GET", "/price", params={"token_id": token_id})
 
     def get_open_orders(self) -> List[Dict[str, Any]]:
         """
@@ -423,11 +447,7 @@ class ClobClient(ApiClient):
 
         headers = self._build_headers("GET", endpoint)
 
-        result = self._request(
-            "GET",
-            endpoint,
-            headers=headers
-        )
+        result = self._request("GET", endpoint, headers=headers)
 
         # Handle paginated response
         if isinstance(result, dict) and "data" in result:
@@ -449,9 +469,7 @@ class ClobClient(ApiClient):
         return self._request("GET", endpoint, headers=headers)
 
     def get_trades(
-        self,
-        token_id: Optional[str] = None,
-        limit: int = 100
+        self, token_id: Optional[str] = None, limit: int = 100
     ) -> List[Dict[str, Any]]:
         """
         Get trade history.
@@ -469,12 +487,7 @@ class ClobClient(ApiClient):
         if token_id:
             params["token_id"] = token_id
 
-        result = self._request(
-            "GET",
-            endpoint,
-            headers=headers,
-            params=params
-        )
+        result = self._request("GET", endpoint, headers=headers, params=params)
 
         # Handle paginated response
         if isinstance(result, dict) and "data" in result:
@@ -484,40 +497,48 @@ class ClobClient(ApiClient):
     def post_order(
         self,
         signed_order: Dict[str, Any],
-        order_type: str = "GTC"
+        order_type: str = "GTC",
+        post_only: bool = False,
     ) -> Dict[str, Any]:
         """
         Submit a signed order.
 
+        The signed_order should be a SignedOrder.dict() from the official SDK,
+        containing all on-chain fields (salt, maker, signer, taker, tokenId,
+        makerAmount, takerAmount, expiration, nonce, feeRateBps, side,
+        signatureType, signature).
+
+        The owner field is set to the L2 API key (not the wallet address).
+
         Args:
-            signed_order: Order with signature
+            signed_order: SignedOrder.dict() with all fields including signature
             order_type: Order type (GTC, GTD, FOK)
+            post_only: Whether to place as post-only (maker) order
 
         Returns:
             Response with order ID and status
         """
         endpoint = "/order"
 
-        # Build request body
+        # Determine owner: must be the L2 API key, not the wallet address
+        owner = ""
+        if self.api_creds and self.api_creds.api_key:
+            owner = self.api_creds.api_key
+        elif self.builder_creds and self.builder_creds.api_key:
+            # Fallback for builder-only auth
+            owner = self.builder_creds.api_key
+
+        # Build request body - signed_order IS the order dict
         body = {
-            "order": signed_order.get("order", signed_order),
-            "owner": self.funder,
+            "order": signed_order,
+            "owner": owner,
             "orderType": order_type,
         }
 
-        # Add signature
-        if "signature" in signed_order:
-            body["signature"] = signed_order["signature"]
-
-        body_json = json.dumps(body, separators=(',', ':'))
+        body_json = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
         headers = self._build_headers("POST", endpoint, body_json)
 
-        return self._request(
-            "POST",
-            endpoint,
-            data=body,
-            headers=headers
-        )
+        return self._request("POST", endpoint, data=body, headers=headers)
 
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """
@@ -531,15 +552,10 @@ class ClobClient(ApiClient):
         """
         endpoint = "/order"
         body = {"orderID": order_id}
-        body_json = json.dumps(body, separators=(',', ':'))
+        body_json = json.dumps(body, separators=(",", ":"))
         headers = self._build_headers("DELETE", endpoint, body_json)
 
-        return self._request(
-            "DELETE",
-            endpoint,
-            data=body,
-            headers=headers
-        )
+        return self._request("DELETE", endpoint, data=body, headers=headers)
 
     def cancel_orders(self, order_ids: List[str]) -> Dict[str, Any]:
         """
@@ -552,15 +568,10 @@ class ClobClient(ApiClient):
             Cancellation response with canceled and not_canceled lists
         """
         endpoint = "/orders"
-        body_json = json.dumps(order_ids, separators=(',', ':'))
+        body_json = json.dumps(order_ids, separators=(",", ":"))
         headers = self._build_headers("DELETE", endpoint, body_json)
 
-        return self._request(
-            "DELETE",
-            endpoint,
-            data=order_ids,
-            headers=headers
-        )
+        return self._request("DELETE", endpoint, data=order_ids, headers=headers)
 
     def cancel_all_orders(self) -> Dict[str, Any]:
         """
@@ -572,16 +583,12 @@ class ClobClient(ApiClient):
         endpoint = "/cancel-all"
         headers = self._build_headers("DELETE", endpoint)
 
-        return self._request(
-            "DELETE",
-            endpoint,
-            headers=headers
-        )
+        return self._request("DELETE", endpoint, headers=headers)
 
     def cancel_market_orders(
         self,
         market: Optional[str] = None,
-        asset_id: Optional[str] = None
+        asset_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Cancel orders for a specific market.
@@ -594,21 +601,18 @@ class ClobClient(ApiClient):
             Cancellation response with canceled and not_canceled lists
         """
         endpoint = "/cancel-market-orders"
-        body = {}
+        body: Dict[str, str] = {}
 
         if market:
             body["market"] = market
         if asset_id:
             body["asset_id"] = asset_id
 
-        body_json = json.dumps(body, separators=(',', ':')) if body else ""
+        body_json = json.dumps(body, separators=(",", ":")) if body else ""
         headers = self._build_headers("DELETE", endpoint, body_json)
 
         return self._request(
-            "DELETE",
-            endpoint,
-            data=body if body else None,
-            headers=headers
+            "DELETE", endpoint, data=body if body else None, headers=headers
         )
 
 
@@ -633,7 +637,7 @@ class RelayerClient(ApiClient):
         chain_id: int = 137,
         builder_creds: Optional[BuilderConfig] = None,
         tx_type: str = "SAFE",
-        timeout: int = 60
+        timeout: int = 60,
     ):
         """
         Initialize Relayer client.
@@ -650,24 +654,22 @@ class RelayerClient(ApiClient):
         self.builder_creds = builder_creds
         self.tx_type = tx_type
 
-    def _build_headers(
-        self,
-        method: str,
-        path: str,
-        body: str = ""
-    ) -> Dict[str, str]:
+    def _build_headers(self, method: str, path: str, body: str = "") -> Dict[str, str]:
         """Build Builder HMAC authentication headers."""
         if not self.builder_creds or not self.builder_creds.is_configured():
             raise AuthenticationError("Builder credentials required for relayer")
 
         timestamp = str(int(time.time()))
 
-        message = f"{timestamp}{method}{path}{body}"
-        signature = hmac.new(
-            self.builder_creds.api_secret.encode(),
-            message.encode(),
-            hashlib.sha256
-        ).hexdigest()
+        # Build message: timestamp + method + path + body
+        message = f"{timestamp}{method}{path}"
+        if body:
+            message += body
+
+        # Decode base64 secret, create HMAC-SHA256, encode result as base64
+        base64_secret = base64.urlsafe_b64decode(self.builder_creds.api_secret)
+        h = hmac.new(base64_secret, message.encode("utf-8"), hashlib.sha256)
+        signature = base64.urlsafe_b64encode(h.digest()).decode("utf-8")
 
         return {
             "POLY_BUILDER_API_KEY": self.builder_creds.api_key,
@@ -688,21 +690,13 @@ class RelayerClient(ApiClient):
         """
         endpoint = "/deploy"
         body = {"safeAddress": safe_address}
-        body_json = json.dumps(body, separators=(',', ':'))
+        body_json = json.dumps(body, separators=(",", ":"))
         headers = self._build_headers("POST", endpoint, body_json)
 
-        return self._request(
-            "POST",
-            endpoint,
-            data=body,
-            headers=headers
-        )
+        return self._request("POST", endpoint, data=body, headers=headers)
 
     def approve_usdc(
-        self,
-        safe_address: str,
-        spender: str,
-        amount: int
+        self, safe_address: str, spender: str, amount: int
     ) -> Dict[str, Any]:
         """
         Approve USDC spending.
@@ -721,22 +715,13 @@ class RelayerClient(ApiClient):
             "spender": spender,
             "amount": str(amount),
         }
-        body_json = json.dumps(body, separators=(',', ':'))
+        body_json = json.dumps(body, separators=(",", ":"))
         headers = self._build_headers("POST", endpoint, body_json)
 
-        return self._request(
-            "POST",
-            endpoint,
-            data=body,
-            headers=headers
-        )
+        return self._request("POST", endpoint, data=body, headers=headers)
 
     def approve_token(
-        self,
-        safe_address: str,
-        token_id: str,
-        spender: str,
-        amount: int
+        self, safe_address: str, token_id: str, spender: str, amount: int
     ) -> Dict[str, Any]:
         """
         Approve an ERC-1155 token.
@@ -757,12 +742,7 @@ class RelayerClient(ApiClient):
             "spender": spender,
             "amount": str(amount),
         }
-        body_json = json.dumps(body, separators=(',', ':'))
+        body_json = json.dumps(body, separators=(",", ":"))
         headers = self._build_headers("POST", endpoint, body_json)
 
-        return self._request(
-            "POST",
-            endpoint,
-            data=body,
-            headers=headers
-        )
+        return self._request("POST", endpoint, data=body, headers=headers)
