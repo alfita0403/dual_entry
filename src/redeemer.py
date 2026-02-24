@@ -27,8 +27,10 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 
 from eth_abi.abi import encode as eth_abi_encode
+from eth_abi.packed import encode_packed
 from eth_utils.address import to_checksum_address
 from web3 import Web3
+import json
 
 
 PROXY_WALLET_FACTORY_ADDRESS = to_checksum_address(
@@ -114,10 +116,13 @@ class Redeemer:
             condition_id = condition_id[2:]
         condition_id_bytes = bytes.fromhex(condition_id.zfill(64))
 
-        return eth_abi_encode(
+        inner_data = eth_abi_encode(
             ["address", "bytes32", "bytes32", "uint256[]"],
             [USDC_ADDRESS, parent_collection_id, condition_id_bytes, index_sets],
         )
+
+        fn_selector = encode_packed(["bytes4"], [b"\x8e\xf4\xbe\x0f"])
+        return fn_selector + inner_data
 
     def encode_redeem_neg_risk(
         self, condition_id: str, yes_amount: int, no_amount: int
@@ -129,10 +134,13 @@ class Redeemer:
             condition_id = condition_id[2:]
         condition_id_bytes = bytes.fromhex(condition_id.zfill(64))
 
-        return eth_abi_encode(
+        inner_data = eth_abi_encode(
             ["bytes32", "uint256[]"],
             [condition_id_bytes, amounts],
         )
+
+        fn_selector = encode_packed(["bytes4"], [b"\x8e\xf4\xbe\x0f"])
+        return fn_selector + inner_data
 
     def send_transaction(
         self,
@@ -141,26 +149,35 @@ class Redeemer:
         value: int = 0,
     ) -> str:
         """Send a transaction through the proxy wallet."""
-        proxy_txn = {
-            "typeCode": 1,  # Call
-            "to": to_checksum_address(to),
-            "value": value,
-            "data": data.hex() if isinstance(data, bytes) else data,
-        }
+        proxy_txn = [
+            1,  # typeCode (uint8)
+            to_checksum_address(to),  # to (address)
+            value,  # value (uint256)
+            data,  # data (bytes) - keep as bytes!
+        ]
 
-        tx_data = self.factory_contract.functions.proxy([proxy_txn]).build_transaction(
-            {
-                "from": self.account.address,
-                "value": value,
-            }
+        # Encode the proxy call manually
+        calls_data = eth_abi_encode(["(uint8,address,uint256,bytes)[]"], [[proxy_txn]])
+
+        # Get the function selector for proxy
+        proxy_fn_selector = encode_packed(
+            ["bytes4"],
+            [b"\x8d\x80\xff\x0a"],
         )
+
+        # Full data: selector + encoded args
+        full_data = proxy_fn_selector + calls_data
+
+        import time
+
+        time.sleep(2)  # Wait for previous tx to confirm
 
         tx_params = {
             "from": self.account.address,
             "to": PROXY_WALLET_FACTORY_ADDRESS,
-            "data": tx_data["data"],
+            "data": full_data.hex(),
             "value": value,
-            "gas": 500000,
+            "gas": 300000,
             "gasPrice": self.w3.eth.gas_price,
             "nonce": self.w3.eth.get_transaction_count(self.account.address),
             "chainId": 137,
@@ -237,8 +254,8 @@ class Redeemer:
 
         return self.send_transaction(target, data)
 
-    def redeem_all(self, user_address: str) -> List[Dict[str, Any]]:
-        """Redeem all redeemable positions for a user."""
+    def redeem_all(self, user_address: str, limit: int = 4) -> List[Dict[str, Any]]:
+        """Redeem redeemable positions for a user (default: last 4)."""
         positions = self.get_redeemable_positions(user_address)
 
         if not positions:
@@ -246,8 +263,12 @@ class Redeemer:
 
         grouped = self.group_by_condition(positions)
 
+        # Sort by condition_id (which is roughly chronological) and take last 'limit'
+        sorted_conditions = sorted(grouped.keys(), reverse=True)[:limit]
+
         results = []
-        for condition_id, cond_positions in grouped.items():
+        for condition_id in sorted_conditions:
+            cond_positions = grouped[condition_id]
             pos = cond_positions[0]
 
             try:

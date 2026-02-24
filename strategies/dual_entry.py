@@ -55,7 +55,9 @@ class DualEntryConfig:
     coin: str = "BTC"
     dry_run: bool = False
     market_check_interval: float = 5.0
-    redeem_interval: float = 300.0  # Seconds between redeem attempts (default 5 min)
+    redeem_interval: float = (
+        0.0  # Disabled by default - manual redeem via polymarket.com
+    )
 
     @property
     def second_price(self) -> float:
@@ -210,6 +212,7 @@ class DualEntryStrategy:
         log(f"  second_price:  {self.cfg.second_price}")
         log(f"  entry_window:  {self.cfg.entry_window}s")
         log(f"  size:          {self.cfg.size} shares")
+        log(f"  NOTE:         Claim winnings manually at polymarket.com")
         log(f"  dry_run:       {self.cfg.dry_run}")
         print()
 
