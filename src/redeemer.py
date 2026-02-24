@@ -110,9 +110,13 @@ class Redeemer:
         parent_collection_id = bytes(32)
         index_sets = [1, 2]
 
+        if condition_id.startswith("0x"):
+            condition_id = condition_id[2:]
+        condition_id_bytes = bytes.fromhex(condition_id.zfill(64))
+
         return eth_abi_encode(
             ["address", "bytes32", "bytes32", "uint256[]"],
-            [USDC_ADDRESS, parent_collection_id, condition_id, index_sets],
+            [USDC_ADDRESS, parent_collection_id, condition_id_bytes, index_sets],
         )
 
     def encode_redeem_neg_risk(
@@ -120,9 +124,14 @@ class Redeemer:
     ) -> bytes:
         """Encode redeemPositions for neg-risk markets."""
         amounts = [yes_amount, no_amount]
+
+        if condition_id.startswith("0x"):
+            condition_id = condition_id[2:]
+        condition_id_bytes = bytes.fromhex(condition_id.zfill(64))
+
         return eth_abi_encode(
             ["bytes32", "uint256[]"],
-            [condition_id, amounts],
+            [condition_id_bytes, amounts],
         )
 
     def send_transaction(
