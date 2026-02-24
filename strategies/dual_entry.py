@@ -110,7 +110,7 @@ def log(msg: str, level: str = "info") -> None:
     line = f"  {color}[{ts_now()}] {msg}{reset}"
     if _tui_active:
         _log_buffer_ref.append(line)
-        if len(_log_buffer_ref) > 10:
+        if len(_log_buffer_ref) > 20:
             _log_buffer_ref.pop(0)
     else:
         print(line)
@@ -187,10 +187,18 @@ class DualEntryStrategy:
         self.total_spent = 0.0
         self._session_gross_pnl = 0.0
         self._session_net_pnl = 0.0
+        self._unhedged_loss = 0.0
 
         self._last_redeem_ts = 0.0
         self._redeemer = None
         self._redeem_error_count = 0
+
+        self._leg1_fill_ts: float = 0.0
+        self._leg2_fill_ts: float = 0.0
+        self._leg1_real_size: float = 0.0
+        self._leg2_real_size: float = 0.0
+        self._leg1_fill_datetime: str = ""
+        self._leg2_fill_datetime: str = ""
 
     async def run(self) -> None:
         """Main strategy loop."""
@@ -329,10 +337,13 @@ class DualEntryStrategy:
             if self._leg2_filled_size > 0:
                 self._announce_hedge_result()
             elif self._leg1_filled_size > 0:
+                loss = self._leg1_cost
+                self._unhedged_loss += loss
+                self._session_net_pnl -= loss
                 log(
-                    f"Market ended with open directional exposure: "
-                    f"LEG1={self._leg1_filled_size:.4f}, LEG2={self._leg2_filled_size:.4f}",
-                    "warning",
+                    f"Market ended UNHEDGED. LEG1={self._leg1_filled_size:.4f} @ {self._leg1_avg_price:.4f}, "
+                    f"cost=${loss:.4f} LOST",
+                    "error",
                 )
             log("Market ended. Waiting for next 5m market...", "warning")
             self.state = StrategyState.DONE
@@ -659,7 +670,7 @@ class DualEntryStrategy:
                 matched_price = (
                     immediate_price if immediate_price > 0 else self._leg2_target_price
                 )
-                self._record_leg2_fill(matched_size, matched_price)
+                self._record_leg2_fill(matched_size, matched_price, self._leg2_token_id)
                 self._leg2_target_size = max(0.0, self._leg2_target_size - matched_size)
 
                 if self._leg2_target_size <= 1e-9:
@@ -717,7 +728,7 @@ class DualEntryStrategy:
                 self._forget_open_order(market_slug, order_id)
                 matched_size = size_matched if size_matched > 0 else expected_size
                 fill_price = avg_price if avg_price > 0 else self._leg2_target_price
-                self._record_leg2_fill(matched_size, fill_price)
+                self._record_leg2_fill(matched_size, fill_price, self._leg2_token_id)
 
                 self._leg2_target_size = max(0.0, self._leg2_target_size - matched_size)
                 if self._leg2_target_size <= 1e-9:
@@ -738,7 +749,9 @@ class DualEntryStrategy:
 
                 if size_matched > 0:
                     fill_price = avg_price if avg_price > 0 else self._leg2_target_price
-                    self._record_leg2_fill(size_matched, fill_price)
+                    self._record_leg2_fill(
+                        size_matched, fill_price, self._leg2_token_id
+                    )
 
                 remaining = max(0.0, expected_size - max(0.0, size_matched))
                 self._leg2_target_size = max(
@@ -1033,15 +1046,28 @@ class DualEntryStrategy:
         self._leg1_token_id = token_id
         self.total_spent += self._leg1_cost
 
+        fee_bps = self._fee_rate_cache.get(token_id or "", self._current_market_fee_bps)
+        self._leg1_real_size = size * (1 - fee_bps / 10000)
+        self._leg1_fill_ts = time.time()
+        self._leg1_fill_datetime = datetime.now().strftime("%H:%M:%S")
+
         if was_unset:
             self.leg1_entries += 1
 
-    def _record_leg2_fill(self, size: float, avg_price: float) -> None:
+    def _record_leg2_fill(
+        self, size: float, avg_price: float, token_id: Optional[str] = None
+    ) -> None:
         if size <= 0:
             return
+
         self._leg2_filled_size += size
         self._leg2_cost += size * avg_price
         self.total_spent += size * avg_price
+
+        fee_bps = self._fee_rate_cache.get(token_id or "", self._current_market_fee_bps)
+        self._leg2_real_size = size * (1 - fee_bps / 10000)
+        self._leg2_fill_ts = time.time()
+        self._leg2_fill_datetime = datetime.now().strftime("%H:%M:%S")
 
     def _activate_leg2_from_leg1(
         self,
@@ -1117,38 +1143,38 @@ class DualEntryStrategy:
         gross_cost_per_share = avg_leg1 + avg_leg2
         gross_edge_per_share = 1.0 - gross_cost_per_share
 
-        leg1_fee_bps = self._fee_rate_cache.get(
-            self._leg1_token_id or "", self._current_market_fee_bps
-        )
-        leg2_fee_bps = self._fee_rate_cache.get(
-            self._leg2_token_id or "", self._current_market_fee_bps
-        )
-        est_fee_per_share = self._estimate_fee_per_share(
-            avg_leg1, leg1_fee_bps
-        ) + self._estimate_fee_per_share(avg_leg2, leg2_fee_bps)
-        est_net_per_share = gross_edge_per_share - est_fee_per_share
+        order_size = self.cfg.size
+        gross_total = gross_edge_per_share * order_size * 2
 
-        gross_total = gross_edge_per_share * hedged_size
-        est_net_total = est_net_per_share * hedged_size
+        real_size_leg1 = (
+            self._leg1_real_size if self._leg1_real_size > 0 else self._leg1_filled_size
+        )
+        real_size_leg2 = (
+            self._leg2_real_size if self._leg2_real_size > 0 else self._leg2_filled_size
+        )
+        real_hedged = min(real_size_leg1, real_size_leg2)
+        net_edge_per_share = 1.0 - gross_cost_per_share
+        net_total = net_edge_per_share * real_hedged * 2
+
         self._last_hedged_size = hedged_size
         self._last_gross_total = gross_total
-        self._last_est_net_total = est_net_total
+        self._last_est_net_total = net_total
 
         if self._leg2_filled_size + 1e-9 >= self._leg1_filled_size:
             self.leg2_entries += 1
             self._hedge_announced = True
             self._session_gross_pnl += gross_total
-            self._session_net_pnl += est_net_total
+            self._session_net_pnl += net_total
             log(
-                f"DUAL ENTRY HEDGED size={hedged_size:.4f}. "
-                f"gross=${gross_total:.4f}, est_net_after_fees=${est_net_total:.4f}",
+                f"DUAL ENTRY HEDGED order={order_size * 2} shares, real={real_hedged * 2:.4f}. "
+                f"gross=${gross_total:.4f}, net=${net_total:.4f}",
                 "success",
             )
         else:
             residual = max(0.0, self._leg1_filled_size - self._leg2_filled_size)
             log(
                 f"Partial hedge only. hedged={hedged_size:.4f}, residual={residual:.4f}, "
-                f"gross(hedged)=${gross_total:.4f}, est_net(hedged)=${est_net_total:.4f}",
+                f"gross(hedged)=${gross_total:.4f}, net(hedged)=${net_total:.4f}",
                 "warning",
             )
 
@@ -1287,6 +1313,12 @@ class DualEntryStrategy:
         self._current_market_fee_bps = 0
         self._hedge_announced = False
         self._trade_cache.clear()
+        self._leg1_fill_ts = 0.0
+        self._leg2_fill_ts = 0.0
+        self._leg1_real_size = 0.0
+        self._leg2_real_size = 0.0
+        self._leg1_fill_datetime = ""
+        self._leg2_fill_datetime = ""
 
         self.markets_seen += 1
 
@@ -1406,10 +1438,16 @@ class DualEntryStrategy:
         )
         if self._leg1_filled_size > 0:
             side = (self._leg1_side or "?").upper()
+            real_size = (
+                self._leg1_real_size
+                if self._leg1_real_size > 0
+                else self._leg1_filled_size
+            )
+            ts_str = f" @{self._leg1_fill_datetime}" if self._leg1_fill_datetime else ""
             return (
                 f"{G}{side:4} FILLED{X}  "
-                f"{self._leg1_filled_size:.2f} shares @ {self._leg1_avg_price:.4f}  "
-                f"cost ${self._leg1_cost:.2f}"
+                f"{real_size:.2f} shares @ {self._leg1_avg_price:.4f}  "
+                f"cost ${self._leg1_cost:.2f}{ts_str}"
             )
         if self.state == StrategyState.WAITING_LEG1_FILL:
             side = (self._leg1_side or "?").upper()
@@ -1433,10 +1471,16 @@ class DualEntryStrategy:
             opposite = "DOWN" if self._leg1_side == "up" else "UP"
         if self._leg2_filled_size > 0 and self._leg2_target_size <= 1e-9:
             avg = self._leg2_cost / max(self._leg2_filled_size, 1e-12)
+            real_size = (
+                self._leg2_real_size
+                if self._leg2_real_size > 0
+                else self._leg2_filled_size
+            )
+            ts_str = f" @{self._leg2_fill_datetime}" if self._leg2_fill_datetime else ""
             return (
                 f"{G}{opposite:4} FILLED{X}  "
-                f"{self._leg2_filled_size:.2f} shares @ {avg:.4f}  "
-                f"cost ${self._leg2_cost:.2f}"
+                f"{real_size:.2f} shares @ {avg:.4f}  "
+                f"cost ${self._leg2_cost:.2f}{ts_str}"
             )
         if self.state == StrategyState.WAITING_LEG2_FILL:
             return (
@@ -1562,9 +1606,9 @@ class DualEntryStrategy:
         d.add_separator()
 
         # --- Events ---
-        d.add_line(f" {B}Events:{X}")
+        d.add_line(f" {B}Events (last 2 markets):{X}")
         if _log_buffer_ref:
-            for msg in _log_buffer_ref[-6:]:
+            for msg in _log_buffer_ref[-12:]:
                 d.add_line(msg)
         else:
             d.add_line(f"  {D}(waiting for events...){X}")
