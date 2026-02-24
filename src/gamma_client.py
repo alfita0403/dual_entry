@@ -266,6 +266,7 @@ class GammaClient(ThreadLocalSessionMixin):
             "best_bid": market.get("bestBid"),
             "best_ask": market.get("bestAsk"),
             "spread": market.get("spread"),
+            "condition_id": market.get("conditionId", ""),
             "raw": market,
         }
 

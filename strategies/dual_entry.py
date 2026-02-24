@@ -55,6 +55,7 @@ class DualEntryConfig:
     coin: str = "BTC"
     dry_run: bool = False
     market_check_interval: float = 5.0
+    redeem_interval: float = 300.0  # Seconds between redeem attempts (default 5 min)
 
     @property
     def second_price(self) -> float:
@@ -187,6 +188,10 @@ class DualEntryStrategy:
         self._session_gross_pnl = 0.0
         self._session_net_pnl = 0.0
 
+        self._last_redeem_ts = 0.0
+        self._redeemer = None
+        self._redeem_error_count = 0
+
     async def run(self) -> None:
         """Main strategy loop."""
         global _tui_active
@@ -257,6 +262,57 @@ class DualEntryStrategy:
         else:
             log("No initial WS book data yet, continuing...", "warning")
 
+    async def _redeem_loop(self) -> None:
+        """Background task to periodically redeem resolved positions."""
+        if self._redeem_error_count >= 3:
+            return
+
+        try:
+            from src.redeemer import Redeemer
+            import os
+
+            private_key = os.environ.get("POLY_PRIVATE_KEY", "")
+            proxy_address = self.bot_config.safe_address
+
+            if not private_key:
+                log("Redeem: POLY_PRIVATE_KEY not set", "warning")
+                return
+
+            if not proxy_address:
+                log("Redeem: safe_address not set", "warning")
+                return
+
+            rpc_url = os.environ.get("POLY_RPC_URL", "https://polygon-rpc.com")
+
+            redeemer = Redeemer(
+                private_key=private_key,
+                proxy_address=proxy_address,
+                rpc_url=rpc_url,
+            )
+
+            positions = redeemer.get_redeemable_positions(proxy_address)
+
+            if not positions:
+                return
+
+            log(f"Redeem: Found {len(positions)} redeemable positions", "info")
+
+            results = redeemer.redeem_all(proxy_address)
+
+            success = sum(1 for r in results if r.get("status") == "success")
+            failed = sum(1 for r in results if r.get("status") == "error")
+
+            log(
+                f"Redeem: {success} succeeded, {failed} failed",
+                "success" if failed == 0 else "warning",
+            )
+
+            self._redeem_error_count = 0
+
+        except Exception as e:
+            self._redeem_error_count += 1
+            log(f"Redeem error ({self._redeem_error_count}/3): {e}", "warning")
+
     async def _timer_tick(self) -> None:
         market = self.manager.current_market
         if not market:
@@ -310,6 +366,13 @@ class DualEntryStrategy:
                 self._render_tui(market, ticks, tick_rate, since_last_tick)
             else:
                 self._log_status_line(market, ticks, tick_rate, since_last_tick)
+
+        if (
+            self.cfg.redeem_interval > 0
+            and now - self._last_redeem_ts >= self.cfg.redeem_interval
+        ):
+            self._last_redeem_ts = now
+            self._spawn_task(self._redeem_loop())
 
     async def _on_book_update(self, snapshot: OrderbookSnapshot) -> None:
         market = self.manager.current_market
@@ -1593,6 +1656,12 @@ def main() -> None:
         default=5.0,
         help="Seconds between market discovery checks",
     )
+    parser.add_argument(
+        "--redeem-interval",
+        type=float,
+        default=300.0,
+        help="Seconds between redeem attempts (0 to disable)",
+    )
 
     args = parser.parse_args()
 
@@ -1604,6 +1673,7 @@ def main() -> None:
         coin=args.coin.upper(),
         dry_run=args.dry_run,
         market_check_interval=args.market_check_interval,
+        redeem_interval=args.redeem_interval,
     )
     strategy_cfg.validate()
 

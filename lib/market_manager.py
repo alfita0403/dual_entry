@@ -54,6 +54,7 @@ class MarketInfo:
     neg_risk: bool = False
     tick_size: str = "0.01"
     min_size: float = 0.0
+    condition_id: str = ""
     raw: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -335,6 +336,7 @@ class MarketManager:
             neg_risk=market_data.get("neg_risk", False),
             tick_size=str(market_data.get("tick_size", "0.01")),
             min_size=float(market_data.get("min_size", 0.0)),
+            condition_id=market_data.get("condition_id", ""),
             raw=market_data.get("raw", {}),
         )
 

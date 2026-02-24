@@ -480,6 +480,18 @@ class ClobClient(ApiClient):
         """
         return self._request("GET", "/price", params={"token_id": token_id})
 
+    def get_market(self, condition_id: str) -> Dict[str, Any]:
+        """
+        Get market info by condition ID.
+
+        Args:
+            condition_id: The condition ID of the market
+
+        Returns:
+            Market data including closed, tokens, winner fields
+        """
+        return self._request("GET", f"/markets/{condition_id}")
+
     def get_fee_rate_bps(self, token_id: str) -> int:
         """
         Get current maker fee rate (basis points) for a token.
