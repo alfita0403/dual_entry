@@ -21,7 +21,17 @@ Example:
 import json
 import asyncio
 import logging
-from typing import Optional, Dict, Any, List, Callable, Set, Union, Awaitable, TYPE_CHECKING
+from typing import (
+    Optional,
+    Dict,
+    Any,
+    List,
+    Callable,
+    Set,
+    Union,
+    Awaitable,
+    TYPE_CHECKING,
+)
 from dataclasses import dataclass, field
 
 if TYPE_CHECKING:
@@ -40,10 +50,12 @@ def _load_websockets():
     try:
         from websockets.asyncio.client import connect as ws_connect
         from websockets.exceptions import ConnectionClosed
+
         return ws_connect, ConnectionClosed
     except ImportError:
         try:
             import websockets
+
             return websockets.connect, websockets.exceptions.ConnectionClosed
         except ImportError:
             return None, Exception
@@ -52,6 +64,7 @@ def _load_websockets():
 @dataclass
 class OrderbookLevel:
     """Single level in the orderbook."""
+
     price: float
     size: float
 
@@ -59,6 +72,7 @@ class OrderbookLevel:
 @dataclass
 class OrderbookSnapshot:
     """Complete orderbook snapshot."""
+
     asset_id: str
     market: str
     timestamp: int
@@ -115,6 +129,7 @@ class OrderbookSnapshot:
 @dataclass
 class PriceChange:
     """Price change event."""
+
     asset_id: str
     price: float
     size: float
@@ -140,6 +155,7 @@ class PriceChange:
 @dataclass
 class LastTradePrice:
     """Last trade price event."""
+
     asset_id: str
     market: str
     price: float
@@ -237,6 +253,7 @@ class MarketWebSocket:
         try:
             # Try newer API first
             from websockets.protocol import State
+
             return self._ws.state == State.OPEN
         except (ImportError, AttributeError):
             # Fallback to older API
@@ -340,29 +357,71 @@ class MarketWebSocket:
         if not asset_ids:
             return False
 
-        if replace:
-            # Clear old subscriptions and cached data
-            self._subscribed_assets.clear()
-            self._orderbooks.clear()
+        normalized_assets = sorted(
+            {
+                str(asset_id)
+                for asset_id in asset_ids
+                if asset_id is not None and str(asset_id)
+            }
+        )
+        if not normalized_assets:
+            return False
 
-        self._subscribed_assets.update(asset_ids)
-        logger.info(f"subscribe() called with {len(asset_ids)} assets, is_connected={self.is_connected}, ws={self._ws is not None}")
+        requested_set = set(normalized_assets)
+        previous_set = set(self._subscribed_assets)
+
+        removed_assets: List[str] = []
+        added_assets: List[str] = []
+
+        if replace:
+            removed_assets = sorted(previous_set - requested_set)
+            added_assets = sorted(requested_set - previous_set)
+            self._subscribed_assets = requested_set
+
+            # Clear orderbooks for removed assets to avoid stale reads.
+            for asset_id in removed_assets:
+                self._orderbooks.pop(asset_id, None)
+        else:
+            added_assets = sorted(requested_set - previous_set)
+            self._subscribed_assets.update(requested_set)
+
+        logger.info(
+            f"subscribe() called with {len(normalized_assets)} assets, "
+            f"replace={replace}, is_connected={self.is_connected}, ws={self._ws is not None}"
+        )
 
         if not self.is_connected:
             # Will subscribe after connect
             logger.info("Not connected yet, will subscribe after connect")
             return True
 
-        subscribe_msg = {
-            "assets_ids": asset_ids,
-            "type": "MARKET",
-        }
-
         try:
+            if removed_assets:
+                unsubscribe_msg = {
+                    "assets_ids": removed_assets,
+                    "operation": "unsubscribe",
+                }
+                await self._ws.send(json.dumps(unsubscribe_msg))
+                logger.info(
+                    f"Unsubscribed from {len(removed_assets)} removed assets during replace"
+                )
+
+            # For replace mode, send full desired set to guarantee active subscription.
+            # For incremental mode, send only newly added assets.
+            assets_to_subscribe = normalized_assets if replace else added_assets
+
+            if not assets_to_subscribe:
+                return True
+
+            subscribe_msg = {
+                "assets_ids": assets_to_subscribe,
+                "operation": "subscribe",
+            }
+
             msg_json = json.dumps(subscribe_msg)
             logger.info(f"Sending subscribe message: {msg_json[:200]}")
             await self._ws.send(msg_json)
-            logger.info(f"Subscribed to {len(asset_ids)} assets successfully")
+            logger.info(f"Subscribed to {len(assets_to_subscribe)} assets successfully")
             return True
         except Exception as e:
             logger.error(f"Failed to subscribe: {e}")
@@ -383,19 +442,29 @@ class MarketWebSocket:
         if not asset_ids:
             return False
 
-        self._subscribed_assets.update(asset_ids)
+        normalized_assets = sorted(
+            {
+                str(asset_id)
+                for asset_id in asset_ids
+                if asset_id is not None and str(asset_id)
+            }
+        )
+        if not normalized_assets:
+            return False
+
+        self._subscribed_assets.update(normalized_assets)
 
         if not self.is_connected:
             return True
 
         subscribe_msg = {
-            "assets_ids": asset_ids,
+            "assets_ids": normalized_assets,
             "operation": "subscribe",
         }
 
         try:
             await self._ws.send(json.dumps(subscribe_msg))
-            logger.info(f"Subscribed to {len(asset_ids)} additional assets")
+            logger.info(f"Subscribed to {len(normalized_assets)} additional assets")
             return True
         except Exception as e:
             logger.error(f"Failed to subscribe: {e}")
@@ -411,19 +480,34 @@ class MarketWebSocket:
         Returns:
             True if unsubscription sent successfully
         """
-        if not self.is_connected or not asset_ids:
+        if not asset_ids:
             return False
 
-        self._subscribed_assets.difference_update(asset_ids)
+        normalized_assets = sorted(
+            {
+                str(asset_id)
+                for asset_id in asset_ids
+                if asset_id is not None and str(asset_id)
+            }
+        )
+        if not normalized_assets:
+            return False
+
+        self._subscribed_assets.difference_update(normalized_assets)
+        for asset_id in normalized_assets:
+            self._orderbooks.pop(asset_id, None)
+
+        if not self.is_connected:
+            return True
 
         unsubscribe_msg = {
-            "assets_ids": asset_ids,
+            "assets_ids": normalized_assets,
             "operation": "unsubscribe",
         }
 
         try:
             await self._ws.send(json.dumps(unsubscribe_msg))
-            logger.info(f"Unsubscribed from {len(asset_ids)} assets")
+            logger.info(f"Unsubscribed from {len(normalized_assets)} assets")
             return True
         except Exception as e:
             logger.error(f"Failed to unsubscribe: {e}")
@@ -436,15 +520,29 @@ class MarketWebSocket:
 
         if event_type == "book":
             snapshot = OrderbookSnapshot.from_message(data)
+
+            # Ignore stale snapshots that arrive after a subscription switch.
+            # This prevents old-market ticks from leaking into callbacks.
+            if (
+                self._subscribed_assets
+                and snapshot.asset_id not in self._subscribed_assets
+            ):
+                logger.debug(
+                    "Ignoring stale book update for unsubscribed asset %s",
+                    snapshot.asset_id,
+                )
+                return
+
             self._orderbooks[snapshot.asset_id] = snapshot
-            logger.debug(f"Book update for {snapshot.asset_id[:20]}...: mid={snapshot.mid_price:.4f}")
+            logger.debug(
+                f"Book update for {snapshot.asset_id[:20]}...: mid={snapshot.mid_price:.4f}"
+            )
             await self._run_callback(self._on_book, snapshot, label="book")
 
         elif event_type == "price_change":
             market = data.get("market", "")
             changes = [
-                PriceChange.from_dict(pc)
-                for pc in data.get("price_changes", [])
+                PriceChange.from_dict(pc) for pc in data.get("price_changes", [])
             ]
             await self._run_callback(
                 self._on_price_change,
@@ -464,7 +562,9 @@ class MarketWebSocket:
         else:
             logger.debug(f"Unknown event type: {event_type}")
 
-    async def _run_callback(self, callback: Optional[Callable[..., Any]], *args: Any, label: str) -> None:
+    async def _run_callback(
+        self, callback: Optional[Callable[..., Any]], *args: Any, label: str
+    ) -> None:
         """Run a callback that may be sync or async, logging failures."""
         if not callback:
             return
@@ -480,15 +580,32 @@ class MarketWebSocket:
         msg_count = 0
         while self._running and self.is_connected:
             try:
-                message = await asyncio.wait_for(
-                    self._ws.recv(),
-                    timeout=self.ping_interval + 5
+                raw_message = await asyncio.wait_for(
+                    self._ws.recv(), timeout=self.ping_interval + 5
                 )
+
+                if isinstance(raw_message, bytes):
+                    message = raw_message.decode("utf-8", errors="ignore")
+                else:
+                    message = str(raw_message)
+
+                message = message.strip()
+                if not message:
+                    continue
+
+                # Occasionally, non-JSON keepalive/control payloads can appear.
+                # Ignore them to avoid noisy JSON parse errors.
+                if message[0] not in ("{", "["):
+                    logger.debug(f"Ignoring non-JSON WS payload: {message[:80]}")
+                    continue
+
                 msg_count += 1
 
                 # Log first 5 messages, then every 1000
                 if msg_count <= 5 or msg_count % 1000 == 0:
-                    logger.info(f"WS message #{msg_count}: {message[:200] if len(message) > 200 else message}")
+                    logger.info(
+                        f"WS message #{msg_count}: {message[:200] if len(message) > 200 else message}"
+                    )
 
                 data = json.loads(message)
 
@@ -505,7 +622,7 @@ class MarketWebSocket:
                 logger.warning(f"WebSocket connection closed: {e}")
                 break
             except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse message: {e}")
+                logger.debug(f"Ignoring malformed JSON message: {e}")
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
                 if self._on_error:
@@ -532,8 +649,14 @@ class MarketWebSocket:
 
             # Subscribe to assets
             if self._subscribed_assets:
-                logger.info(f"Sending subscription for {len(self._subscribed_assets)} assets after connect")
-                await self.subscribe(list(self._subscribed_assets))
+                logger.info(
+                    f"Sending subscription for {len(self._subscribed_assets)} assets after connect"
+                )
+                init_subscribe_msg = {
+                    "assets_ids": sorted(self._subscribed_assets),
+                    "type": "MARKET",
+                }
+                await self._ws.send(json.dumps(init_subscribe_msg))
 
             # Run message loop
             await self._run_loop()
@@ -583,7 +706,9 @@ class OrderbookManager:
     def __init__(self):
         """Initialize orderbook manager."""
         self._ws = MarketWebSocket()
-        self._price_callback: Optional[Callable[[str, float, float, float], None]] = None
+        self._price_callback: Optional[Callable[[str, float, float, float], None]] = (
+            None
+        )
         self._connected = False
 
         # Set up internal callbacks
@@ -595,7 +720,7 @@ class OrderbookManager:
                         snapshot.asset_id,
                         snapshot.mid_price,
                         snapshot.best_bid,
-                        snapshot.best_ask
+                        snapshot.best_ask,
                     )
                     if asyncio.iscoroutine(result):
                         await result
@@ -624,8 +749,7 @@ class OrderbookManager:
         return self._ws.get_orderbook(asset_id)
 
     def on_price_update(
-        self,
-        callback: Callable[[str, float, float, float], None]
+        self, callback: Callable[[str, float, float, float], None]
     ) -> Callable[[str, float, float, float], None]:
         """
         Set callback for price updates.

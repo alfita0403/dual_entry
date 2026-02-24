@@ -2,7 +2,7 @@
 Market Manager - Market Discovery and WebSocket Management
 
 Provides unified interface for:
-- 15-minute market discovery via GammaClient
+- 5-minute or 15-minute market discovery via GammaClient
 - WebSocket connection and subscription management
 - Automatic market switching when markets expire
 - Real-time orderbook caching
@@ -33,8 +33,8 @@ Usage:
 import asyncio
 import time
 from datetime import datetime, timezone
-from dataclasses import dataclass
-from typing import Optional, Dict, Callable, List, Union, Awaitable
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Callable, List, Union, Awaitable, Any
 
 from src.gamma_client import GammaClient
 from src.websocket_client import MarketWebSocket, OrderbookSnapshot
@@ -50,6 +50,11 @@ class MarketInfo:
     token_ids: Dict[str, str]
     prices: Dict[str, float]
     accepting_orders: bool
+    event_start_time: str = ""
+    neg_risk: bool = False
+    tick_size: str = "0.01"
+    min_size: float = 0.0
+    raw: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def up_token(self) -> str:
@@ -116,6 +121,17 @@ class MarketInfo:
         except Exception:
             return None
 
+    def start_timestamp(self) -> Optional[int]:
+        """Parse market start timestamp from event_start_time or slug."""
+        if self.event_start_time:
+            try:
+                start_str = self.event_start_time.replace("Z", "+00:00")
+                return int(datetime.fromisoformat(start_str).timestamp())
+            except Exception:
+                pass
+
+        return self.slug_timestamp()
+
     def is_ending_soon(self, threshold_seconds: int = 60) -> bool:
         """Check if market is ending within threshold."""
         mins, secs = self.get_countdown()
@@ -140,7 +156,7 @@ class MarketManager:
     Manages market discovery and WebSocket connections.
 
     Provides:
-    - Automatic 15-minute market discovery
+    - Automatic market discovery (5m or 15m intervals)
     - WebSocket connection with auto-reconnect
     - Market change detection and notification
     - Orderbook caching
@@ -151,6 +167,7 @@ class MarketManager:
         coin: str = "BTC",
         market_check_interval: float = 30.0,
         auto_switch_market: bool = True,
+        interval: str = "15m",
     ):
         """
         Initialize market manager.
@@ -159,10 +176,12 @@ class MarketManager:
             coin: Coin symbol (BTC, ETH, SOL, XRP)
             market_check_interval: Seconds between market checks
             auto_switch_market: Auto switch when market changes
+            interval: Market interval ("5m" or "15m")
         """
         self.coin = coin.upper()
         self.market_check_interval = market_check_interval
         self.auto_switch_market = auto_switch_market
+        self.interval = interval
 
         # Clients
         self.gamma = GammaClient()
@@ -269,9 +288,7 @@ class MarketManager:
         return market.slug_timestamp() or market.end_timestamp()
 
     def _should_switch_market(
-        self,
-        old_market: Optional[MarketInfo],
-        new_market: MarketInfo
+        self, old_market: Optional[MarketInfo], new_market: MarketInfo
     ) -> bool:
         """Check if new market should replace current market."""
         if not old_market:
@@ -291,12 +308,15 @@ class MarketManager:
 
     def discover_market(self, update_state: bool = True) -> Optional[MarketInfo]:
         """
-        Discover current 15-minute market.
+        Discover current market based on configured interval.
 
         Returns:
             MarketInfo if found, None otherwise
         """
-        market_data = self.gamma.get_market_info(self.coin)
+        if self.interval == "5m":
+            market_data = self.gamma.get_market_info_5m(self.coin)
+        else:
+            market_data = self.gamma.get_market_info(self.coin)
 
         if not market_data:
             return None
@@ -311,6 +331,11 @@ class MarketManager:
             token_ids=market_data.get("token_ids", {}),
             prices=market_data.get("prices", {}),
             accepting_orders=market_data.get("accepting_orders", False),
+            event_start_time=market_data.get("event_start_time", ""),
+            neg_risk=market_data.get("neg_risk", False),
+            tick_size=str(market_data.get("tick_size", "0.01")),
+            min_size=float(market_data.get("min_size", 0.0)),
+            raw=market_data.get("raw", {}),
         )
 
         if update_state:

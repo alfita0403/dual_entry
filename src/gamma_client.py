@@ -2,13 +2,13 @@
 Gamma API Client - Market Discovery for Polymarket
 
 Provides access to the Gamma API for discovering active markets,
-including 15-minute Up/Down markets for crypto assets.
+including 5-minute and 15-minute Up/Down markets for crypto assets.
 
 Example:
     from src.gamma_client import GammaClient
 
     client = GammaClient()
-    market = client.get_current_15m_market("ETH")
+    market = client.get_current_5m_market("BTC")
     print(market["slug"], market["clobTokenIds"])
 """
 
@@ -28,12 +28,20 @@ class GammaClient(ThreadLocalSessionMixin):
 
     DEFAULT_HOST = "https://gamma-api.polymarket.com"
 
-    # Supported coins and their slug prefixes
+    # Supported coins and their slug prefixes (15-minute markets)
     COIN_SLUGS = {
         "BTC": "btc-updown-15m",
         "ETH": "eth-updown-15m",
         "SOL": "sol-updown-15m",
         "XRP": "xrp-updown-15m",
+    }
+
+    # Supported coins for 5-minute markets
+    COIN_SLUGS_5M = {
+        "BTC": "btc-updown-5m",
+        "ETH": "eth-updown-5m",
+        "SOL": "sol-updown-5m",
+        "XRP": "xrp-updown-5m",
     }
 
     def __init__(self, host: str = DEFAULT_HOST, timeout: int = 10):
@@ -80,7 +88,9 @@ class GammaClient(ThreadLocalSessionMixin):
         """
         coin = coin.upper()
         if coin not in self.COIN_SLUGS:
-            raise ValueError(f"Unsupported coin: {coin}. Use: {list(self.COIN_SLUGS.keys())}")
+            raise ValueError(
+                f"Unsupported coin: {coin}. Use: {list(self.COIN_SLUGS.keys())}"
+            )
 
         prefix = self.COIN_SLUGS[coin]
 
@@ -137,7 +147,9 @@ class GammaClient(ThreadLocalSessionMixin):
         # Calculate next 15-minute window
         minute = ((now.minute // 15) + 1) * 15
         if minute >= 60:
-            next_window = now.replace(hour=now.hour + 1, minute=0, second=0, microsecond=0)
+            next_window = now.replace(
+                hour=now.hour + 1, minute=0, second=0, microsecond=0
+            )
         else:
             next_window = now.replace(minute=minute, second=0, microsecond=0)
 
@@ -145,6 +157,117 @@ class GammaClient(ThreadLocalSessionMixin):
         slug = f"{prefix}-{next_ts}"
 
         return self.get_market_by_slug(slug)
+
+    def get_current_5m_market(self, coin: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the current active 5-minute market for a coin.
+
+        Args:
+            coin: Coin symbol (BTC, ETH, SOL, XRP)
+
+        Returns:
+            Market data for the current 5-minute window, or None
+        """
+        coin = coin.upper()
+        if coin not in self.COIN_SLUGS_5M:
+            raise ValueError(
+                f"Unsupported coin: {coin}. Use: {list(self.COIN_SLUGS_5M.keys())}"
+            )
+
+        prefix = self.COIN_SLUGS_5M[coin]
+        now = datetime.now(timezone.utc)
+
+        # Round to current 5-minute window
+        minute = (now.minute // 5) * 5
+        current_window = now.replace(minute=minute, second=0, microsecond=0)
+        current_ts = int(current_window.timestamp())
+
+        # Try current window
+        slug = f"{prefix}-{current_ts}"
+        market = self.get_market_by_slug(slug)
+        if market and market.get("acceptingOrders"):
+            return market
+
+        # Try next window (in case current just ended)
+        next_ts = current_ts + 300  # 5 minutes
+        slug = f"{prefix}-{next_ts}"
+        market = self.get_market_by_slug(slug)
+        if market and market.get("acceptingOrders"):
+            return market
+
+        # Try previous window (might still be active)
+        prev_ts = current_ts - 300
+        slug = f"{prefix}-{prev_ts}"
+        market = self.get_market_by_slug(slug)
+        if market and market.get("acceptingOrders"):
+            return market
+
+        return None
+
+    def get_next_5m_market(self, coin: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the next upcoming 5-minute market for a coin.
+
+        Args:
+            coin: Coin symbol (BTC, ETH, SOL, XRP)
+
+        Returns:
+            Market data for the next 5-minute window, or None
+        """
+        coin = coin.upper()
+        if coin not in self.COIN_SLUGS_5M:
+            raise ValueError(f"Unsupported coin: {coin}")
+
+        prefix = self.COIN_SLUGS_5M[coin]
+        now = datetime.now(timezone.utc)
+
+        # Calculate next 5-minute window
+        minute = ((now.minute // 5) + 1) * 5
+        if minute >= 60:
+            next_window = now.replace(
+                hour=now.hour + 1, minute=0, second=0, microsecond=0
+            )
+        else:
+            next_window = now.replace(minute=minute, second=0, microsecond=0)
+
+        next_ts = int(next_window.timestamp())
+        slug = f"{prefix}-{next_ts}"
+
+        return self.get_market_by_slug(slug)
+
+    def get_market_info_5m(self, coin: str) -> Optional[Dict[str, Any]]:
+        """
+        Get comprehensive market info for current 5-minute market.
+
+        Args:
+            coin: Coin symbol
+
+        Returns:
+            Dictionary with market info including token IDs and prices
+        """
+        market = self.get_current_5m_market(coin)
+        if not market:
+            return None
+
+        token_ids = self.parse_token_ids(market)
+        prices = self.parse_prices(market)
+
+        return {
+            "slug": market.get("slug"),
+            "question": market.get("question"),
+            "end_date": market.get("endDate"),
+            "event_start_time": market.get("eventStartTime"),
+            "token_ids": token_ids,
+            "prices": prices,
+            "accepting_orders": market.get("acceptingOrders", False),
+            "neg_risk": market.get("negRisk", False),
+            "tick_size": str(market.get("orderPriceMinTickSize", 0.01)),
+            "min_size": market.get("orderMinSize", 5),
+            "best_bid": market.get("bestBid"),
+            "best_ask": market.get("bestAsk"),
+            "spread": market.get("spread"),
+            "raw": market,
+        }
 
     def parse_token_ids(self, market: Dict[str, Any]) -> Dict[str, str]:
         """
@@ -191,9 +314,7 @@ class GammaClient(ThreadLocalSessionMixin):
 
     @staticmethod
     def _map_outcomes(
-        outcomes: List[Any],
-        values: List[Any],
-        cast=lambda v: v
+        outcomes: List[Any], values: List[Any], cast=lambda v: v
     ) -> Dict[str, Any]:
         """Map outcome labels to values with optional casting."""
         result: Dict[str, Any] = {}

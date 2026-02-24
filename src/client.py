@@ -140,6 +140,27 @@ class ApiClient(ThreadLocalSessionMixin):
         Raises:
             ApiError: On request failure
         """
+
+        def _extract_error_detail(response: Optional[requests.Response]) -> str:
+            if response is None:
+                return "no response body"
+            try:
+                data = response.json()
+                if isinstance(data, dict):
+                    for key in [
+                        "errorMsg",
+                        "error",
+                        "message",
+                        "msg",
+                        "detail",
+                    ]:
+                        if key in data and data[key]:
+                            return str(data[key])
+                return str(data)
+            except Exception:
+                text = (response.text or "").strip()
+                return text if text else "empty response body"
+
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         request_headers = {"Content-Type": "application/json"}
 
@@ -186,10 +207,33 @@ class ApiClient(ThreadLocalSessionMixin):
                 response.raise_for_status()
                 return response.json() if response.text else {}
 
+            except requests.exceptions.HTTPError as e:
+                response = e.response
+                status_code = response.status_code if response is not None else None
+                detail = _extract_error_detail(response)
+
+                error = ApiError(
+                    f"HTTP {status_code} {method.upper()} {endpoint}: {detail}"
+                )
+                last_error = error
+
+                retryable = bool(
+                    status_code is not None
+                    and (status_code >= 500 or status_code == 429)
+                )
+                if retryable and attempt < self.retry_count - 1:
+                    time.sleep(2**attempt)
+                    continue
+
+                raise error from e
+
             except requests.exceptions.RequestException as e:
                 last_error = e
                 if attempt < self.retry_count - 1:
                     time.sleep(2**attempt)  # Exponential backoff
+
+        if isinstance(last_error, ApiError):
+            raise last_error
 
         raise ApiError(
             f"Request failed after {self.retry_count} attempts: {last_error}"
@@ -436,6 +480,23 @@ class ClobClient(ApiClient):
         """
         return self._request("GET", "/price", params={"token_id": token_id})
 
+    def get_fee_rate_bps(self, token_id: str) -> int:
+        """
+        Get current maker fee rate (basis points) for a token.
+
+        Args:
+            token_id: Market token ID
+
+        Returns:
+            Maker fee in basis points (e.g., 1000)
+        """
+        result = self._request("GET", "/fee-rate", params={"token_id": token_id})
+        base_fee = result.get("base_fee", 0)
+        try:
+            return int(base_fee)
+        except Exception:
+            return 0
+
     def get_open_orders(self) -> List[Dict[str, Any]]:
         """
         Get all open orders for the funder.
@@ -469,30 +530,102 @@ class ClobClient(ApiClient):
         return self._request("GET", endpoint, headers=headers)
 
     def get_trades(
-        self, token_id: Optional[str] = None, limit: int = 100
+        self,
+        token_id: Optional[str] = None,
+        limit: int = 100,
+        trade_id: Optional[str] = None,
+        maker_address: Optional[str] = None,
+        market: Optional[str] = None,
+        before: Optional[int] = None,
+        after: Optional[int] = None,
+        max_pages: int = 10,
     ) -> List[Dict[str, Any]]:
         """
-        Get trade history.
+        Get trade history with optional filters.
 
         Args:
-            token_id: Filter by token (optional)
-            limit: Maximum number of trades
+            token_id: Filter by token ID (maps to asset_id)
+            limit: Legacy parameter kept for compatibility
+            trade_id: Filter by trade ID
+            maker_address: Filter by maker/funder address
+            market: Filter by condition ID
+            before: Filter trades before unix timestamp
+            after: Filter trades after unix timestamp
+            max_pages: Maximum pages to fetch from paginated endpoint
 
         Returns:
             List of trades
         """
         endpoint = "/data/trades"
         headers = self._build_headers("GET", endpoint)
-        params: Dict[str, Any] = {"limit": limit}
+
+        base_params: Dict[str, Any] = {}
+        if trade_id:
+            base_params["id"] = trade_id
+        if market:
+            base_params["market"] = market
         if token_id:
-            params["token_id"] = token_id
+            base_params["asset_id"] = token_id
+        if maker_address:
+            base_params["maker_address"] = maker_address
+        if before is not None:
+            base_params["before"] = int(before)
+        if after is not None:
+            base_params["after"] = int(after)
 
-        result = self._request("GET", endpoint, headers=headers, params=params)
+        # Keep compatibility for callers that pass only (token_id, limit).
+        # The endpoint is cursor-based; limit is advisory and may be ignored.
+        if limit > 0:
+            base_params["limit"] = int(limit)
 
-        # Handle paginated response
-        if isinstance(result, dict) and "data" in result:
-            return result.get("data", [])
-        return result if isinstance(result, list) else []
+        trades: List[Dict[str, Any]] = []
+        next_cursor = "MA=="
+        pages = 0
+
+        while pages < max_pages and next_cursor != "LTE=":
+            params = dict(base_params)
+            params["next_cursor"] = next_cursor
+
+            result: Any = self._request("GET", endpoint, headers=headers, params=params)
+
+            # Non-paginated fallback
+            if isinstance(result, list):
+                trades.extend([t for t in result if isinstance(t, dict)])
+                break
+
+            if not isinstance(result, dict):
+                break
+
+            page_data = result.get("data")
+            if isinstance(page_data, list):
+                trades.extend(page_data)
+            elif page_data is None and trade_id:
+                # Some backends may return a single object for id filters.
+                if result:
+                    trades.append(result)
+                break
+
+            next_cursor = result.get("next_cursor", "LTE=")
+            pages += 1
+
+            # For exact trade lookup, first page is enough.
+            if trade_id:
+                break
+
+        return trades
+
+    def get_trade(self, trade_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a single trade by ID.
+
+        Args:
+            trade_id: Trade ID
+
+        Returns:
+            Trade dict or None
+        """
+        trades = self.get_trades(trade_id=trade_id, max_pages=1)
+        return trades[0] if trades else None
 
     def post_order(
         self,
