@@ -31,6 +31,7 @@ Usage:
 import argparse
 import asyncio
 import enum
+import json
 import logging
 import os
 import sys
@@ -773,8 +774,12 @@ class CheapQuoteStrategy:
     async def _check_resolution(self, coin: str, old_slug: str) -> None:
         """Check if a finished market has resolved and record win/loss.
 
-        Retries up to 6 times with increasing delays (total ~3 min) to handle
-        the Gamma API lag between market end and price finalization.
+        Uses definitive Gamma API fields:
+          - closed == True  -> market is settled
+          - outcomePrices has "1" and "0" -> the outcome with "1" won
+
+        Retries up to 10 times over ~5 min to wait for Polymarket to
+        officially close the market and set final prices.
         """
         positions = [
             p
@@ -784,8 +789,8 @@ class CheapQuoteStrategy:
         if not positions:
             return
 
-        # Retry schedule: wait 10s, then 15s, 20s, 30s, 45s, 60s
-        delays = [10, 15, 20, 30, 45, 60]
+        # Retry schedule: total ~5 min (5m markets resolve within 1-2 min)
+        delays = [10, 10, 15, 15, 20, 30, 30, 45, 60, 60]
         gamma = GammaClient()
         winner: Optional[str] = None
 
@@ -799,23 +804,36 @@ class CheapQuoteStrategy:
                 if not market_data:
                     continue
 
-                prices = gamma.parse_prices(market_data)
-                up_price = prices.get("up", 0.5)
-                down_price = prices.get("down", 0.5)
+                # Only trust the result when Polymarket explicitly closes
+                if not market_data.get("closed", False):
+                    continue  # Not closed yet, keep waiting
 
-                if up_price >= 0.90:
-                    winner = "up"
+                # Parse outcomePrices and outcomes from raw Gamma response
+                raw_prices = market_data.get("outcomePrices", "[]")
+                raw_outcomes = market_data.get("outcomes", "[]")
+                prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+                outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+
+                # Find the outcome with price == "1" (the winner)
+                for idx, price in enumerate(prices):
+                    if str(price) == "1" and idx < len(outcomes):
+                        winner = str(outcomes[idx]).lower()
+                        break
+
+                if winner:
+                    log(
+                        f"Resolved: {old_slug} -> {winner.upper()}"
+                        f" (closed, attempt {attempt + 1})",
+                        "info",
+                    )
                     break
-                elif down_price >= 0.90:
-                    winner = "down"
-                    break
-                # else: not resolved yet, keep retrying
+
             except Exception as exc:
                 if attempt == len(delays) - 1:
                     log(f"Resolve error ({old_slug}): {exc}", "error")
 
         if winner is None:
-            log(f"Resolve: {old_slug} gave up after {len(delays)} attempts", "warning")
+            log(f"Resolve: {old_slug} not closed after {len(delays)} attempts", "warning")
             return
 
         for pos in positions:
