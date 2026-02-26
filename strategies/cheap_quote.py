@@ -197,6 +197,7 @@ class OrderTracker:
     price: float
     size: float
     placed_at: float
+    market_slug: str = ""
     filled: bool = False
     fill_price: float = 0.0
     fill_size: float = 0.0
@@ -300,6 +301,7 @@ class CheapQuoteStrategy:
         self._last_done_poll: float = 0.0
         self._last_task_cleanup: float = 0.0
         self._ws_reconnect_count: int = 0
+        self._scheduled_slugs: Set[str] = set()
 
     # ------------------------------------------------------------------
     # Main loop
@@ -485,7 +487,37 @@ class CheapQuoteStrategy:
         )
 
     def _transition_to_done(self) -> None:
+        """Transition to DONE: cancel unfilled orders and schedule resolution."""
+        old_slug = None
+        for coin in COINS:
+            m = self._coin_markets.get(coin)
+            if m:
+                old_slug = m.slug
+                break
+
         self.cycle_state = CycleState.DONE
+
+        # Cancel any live orders still on the CLOB
+        unfilled = [
+            (oid, t)
+            for oid, t in self._orders.items()
+            if not t.filled and not t.cancelled
+        ]
+        for order_id, tracker in unfilled:
+            tracker.cancelled = True
+            if not self.cfg.dry_run:
+                try:
+                    self.clob.cancel_order(order_id)
+                except Exception:
+                    pass
+
+        # Stop fill watcher
+        if self._fill_watcher_task and not self._fill_watcher_task.done():
+            self._fill_watcher_task.cancel()
+
+        # Schedule resolution for ALL coins that had fills in this cycle
+        if old_slug and self._current_positions:
+            self._schedule_resolution_all(old_slug)
 
     # ------------------------------------------------------------------
     # Order placement
@@ -511,6 +543,7 @@ class CheapQuoteStrategy:
                 coin=coin, side=side, token_id=token_id,
                 order_id=order_id, price=self.cfg.price,
                 size=self.cfg.size, placed_at=time.time(),
+                market_slug=market.slug,
             )
             self._orders[order_id] = tracker
             self._orders_placed_this_cycle += 1
@@ -558,6 +591,7 @@ class CheapQuoteStrategy:
                 coin=coin, side=side, token_id=token_id,
                 order_id=order_id, price=self.cfg.price,
                 size=self.cfg.size, placed_at=time.time(),
+                market_slug=market.slug,
             )
 
             if status in {"matched", "filled", "executed", "complete", "completed"}:
@@ -650,8 +684,8 @@ class CheapQuoteStrategy:
                         )
                     elif closed:
                         tracker.cancelled = True
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log(f"Fill check err {tracker.coin}-{tracker.side}: {exc}", "warning")
 
             await asyncio.sleep(0.5)
 
@@ -715,18 +749,13 @@ class CheapQuoteStrategy:
         cost = tracker.fill_size * tracker.fill_price
         self.total_spent += cost
 
-        slug = ""
-        market = self._coin_markets.get(tracker.coin)
-        if market:
-            slug = market.slug
-
         pos = PositionRecord(
             coin=tracker.coin,
             side=tracker.side,
             fill_price=tracker.fill_price,
             fill_size=tracker.fill_size,
             fill_time=tracker.fill_time,
-            market_slug=slug,
+            market_slug=tracker.market_slug,
             order_id=tracker.order_id,
             cost=cost,
         )
@@ -750,14 +779,17 @@ class CheapQuoteStrategy:
 
         count = 0
         for order_id, tracker in to_cancel:
-            tracker.cancelled = True
-            count += 1
             if self.cfg.dry_run:
+                tracker.cancelled = True
+                count += 1
                 continue
             try:
                 await asyncio.to_thread(self.clob.cancel_order, order_id)
+                tracker.cancelled = True
+                count += 1
             except Exception as exc:
                 log(f"Cancel err {tracker.coin}-{tracker.side}: {exc}", "warning")
+                # Leave cancelled=False so fill watcher can still detect it
 
         if count > 0:
             log(f"Cancelled {count} unfilled order(s)", "warning")
@@ -766,13 +798,36 @@ class CheapQuoteStrategy:
     # Resolution tracking
     # ------------------------------------------------------------------
     def _schedule_resolution(self, coin: str, old_slug: str) -> None:
+        """Legacy per-coin entry point. Delegates to _schedule_resolution_all."""
+        # Build full slug set: all 4 coins share the same timestamp suffix
+        # e.g. btc-updown-5m-1772144400 -> extract 1772144400
+        parts = old_slug.rsplit("-", 1)
+        if len(parts) == 2:
+            ts_suffix = parts[1]
+            for c in COINS:
+                slug = f"{c.lower()}-updown-5m-{ts_suffix}"
+                self._schedule_resolution_all(slug)
+        else:
+            self._schedule_resolution_all(old_slug)
+
+    def _schedule_resolution_all(self, slug: str) -> None:
+        """Schedule resolution for a market slug (covers all coins/sides)."""
+        if slug in self._scheduled_slugs:
+            return
+        self._scheduled_slugs.add(slug)
+        # Cap the set to prevent unbounded growth
+        if len(self._scheduled_slugs) > 500:
+            self._scheduled_slugs = set(list(self._scheduled_slugs)[-200:])
+
         task = asyncio.get_running_loop().create_task(
-            self._check_resolution(coin, old_slug)
+            self._check_resolution_for_slug(slug)
         )
         self._resolution_tasks.append(task)
 
-    async def _check_resolution(self, coin: str, old_slug: str) -> None:
+    async def _check_resolution_for_slug(self, old_slug: str) -> None:
         """Check if a finished market has resolved and record win/loss.
+
+        Resolves ALL positions for this slug (any coin, any side).
 
         Uses definitive Gamma API fields:
           - closed == True  -> market is settled
@@ -784,7 +839,7 @@ class CheapQuoteStrategy:
         positions = [
             p
             for p in self._all_positions
-            if p.coin == coin and p.market_slug == old_slug and not p.resolved
+            if p.market_slug == old_slug and not p.resolved
         ]
         if not positions:
             return
@@ -911,17 +966,24 @@ class CheapQuoteStrategy:
         if self.cycle_state == CycleState.DONE:
             if now - self._last_done_poll >= 3.0:
                 self._last_done_poll = now
+                new_market_coin = None
+                # Update _coin_markets for ALL coins first
                 for coin in COINS:
                     mgr = self.managers.get(coin)
                     if not mgr or not mgr.current_market:
                         continue
                     market = mgr.current_market
                     ms = market.start_timestamp()
-                    if ms is not None and ms != self._cycle_ts:
+                    if ms is not None:
                         self._coin_markets[coin] = market
-                        log(f"[poll] New market detected via {coin}", "info")
-                        self._maybe_enter_cycle(coin, market)
-                        break
+                        if ms != self._cycle_ts and new_market_coin is None:
+                            new_market_coin = coin
+                # Then enter cycle if a new market was found
+                if new_market_coin:
+                    m = self._coin_markets.get(new_market_coin)
+                    if m:
+                        log(f"[poll] New market detected via {new_market_coin}", "info")
+                        self._maybe_enter_cycle(new_market_coin, m)
 
         # --- Periodic cleanup of completed resolution tasks ---
         if now - self._last_task_cleanup >= 30.0:
