@@ -263,7 +263,7 @@ class CheapQuoteStrategy:
         self._current_positions: List[PositionRecord] = []
         self._all_positions: List[PositionRecord] = []
 
-        # Session stats
+        # Session stats (restored from trade log on startup)
         self.cycles_seen: int = 0
         self.total_orders_placed: int = 0
         self.total_fills: int = 0
@@ -272,6 +272,7 @@ class CheapQuoteStrategy:
         self.total_resolved: int = 0
         self.session_pnl: float = 0.0
         self.total_spent: float = 0.0
+        self._load_stats_from_log()
 
         # Per-coin caches
         self._best_asks: Dict[str, Dict[str, float]] = {
@@ -302,6 +303,44 @@ class CheapQuoteStrategy:
         self._last_task_cleanup: float = 0.0
         self._ws_reconnect_count: int = 0
         self._scheduled_slugs: Set[str] = set()
+
+    # ------------------------------------------------------------------
+    # Restore stats from trade log
+    # ------------------------------------------------------------------
+    def _load_stats_from_log(self) -> None:
+        """Read cheap_quote_trades.txt and restore cumulative stats."""
+        if not TRADE_LOG_FILE.exists():
+            return
+        try:
+            for line in TRADE_LOG_FILE.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                fields = {}
+                for part in line.split("|"):
+                    part = part.strip()
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        fields[k.strip()] = v.strip()
+
+                cost_str = fields.get("cost", "0").lstrip("$")
+                cost = _to_float(cost_str)
+                outcome = fields.get("outcome", "")
+
+                self.total_fills += 1
+                self.total_spent += cost
+
+                if outcome.startswith("WIN"):
+                    self.total_wins += 1
+                    self.total_resolved += 1
+                    # WIN +$X.XX -> extract profit
+                    profit_str = outcome.replace("WIN +$", "").replace("WIN +", "")
+                    self.session_pnl += _to_float(profit_str)
+                elif outcome.startswith("LOSS"):
+                    self.total_losses += 1
+                    self.total_resolved += 1
+                    self.session_pnl -= cost
+        except Exception:
+            pass  # If log is corrupted, start fresh
 
     # ------------------------------------------------------------------
     # Main loop
