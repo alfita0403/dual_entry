@@ -487,37 +487,34 @@ class CheapQuoteStrategy:
         )
 
     def _transition_to_done(self) -> None:
-        """Transition to DONE: cancel unfilled orders and schedule resolution."""
-        old_slug = None
-        for coin in COINS:
-            m = self._coin_markets.get(coin)
-            if m:
-                old_slug = m.slug
-                break
+        """Transition to DONE and schedule resolution.
 
+        Order cancellation is handled by the ACTIVE->HOLDING transition
+        in _tick (which uses async cancel). This method only marks
+        remaining unfilled orders as cancelled locally and schedules
+        resolution for any fills from this cycle.
+        """
         self.cycle_state = CycleState.DONE
-
-        # Cancel any live orders still on the CLOB
-        unfilled = [
-            (oid, t)
-            for oid, t in self._orders.items()
-            if not t.filled and not t.cancelled
-        ]
-        for order_id, tracker in unfilled:
-            tracker.cancelled = True
-            if not self.cfg.dry_run:
-                try:
-                    self.clob.cancel_order(order_id)
-                except Exception:
-                    pass
 
         # Stop fill watcher
         if self._fill_watcher_task and not self._fill_watcher_task.done():
             self._fill_watcher_task.cancel()
 
-        # Schedule resolution for ALL coins that had fills in this cycle
-        if old_slug and self._current_positions:
-            self._schedule_resolution_all(old_slug)
+        # Mark remaining orders as cancelled locally (the async cancel
+        # in _tick already sent cancel requests to CLOB if we came
+        # through ACTIVE->HOLDING->DONE path; for direct ACTIVE->DONE
+        # transitions we mark them here and they'll expire on the CLOB
+        # when the market ends).
+        for t in self._orders.values():
+            if not t.filled and not t.cancelled:
+                t.cancelled = True
+
+        # Schedule resolution using the market_slug stored on the
+        # positions themselves (immune to _coin_markets race).
+        if self._current_positions:
+            slug = self._current_positions[0].market_slug
+            if slug:
+                self._schedule_resolution_all(slug)
 
     # ------------------------------------------------------------------
     # Order placement
