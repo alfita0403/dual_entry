@@ -39,6 +39,7 @@ logging.getLogger("src.websocket_client").setLevel(logging.WARNING)
 from lib.market_manager import MarketInfo, MarketManager
 from src.client import ClobClient
 from src.config import Config
+from src.merger import Merger
 from src.signer import Order, OrderSigner
 from src.websocket_client import OrderbookSnapshot
 from lib.console import Colors, format_countdown, StatusDisplay
@@ -55,9 +56,6 @@ class DualEntryConfig:
     coin: str = "BTC"
     dry_run: bool = False
     market_check_interval: float = 5.0
-    redeem_interval: float = (
-        0.0  # Disabled by default - manual redeem via polymarket.com
-    )
 
     @property
     def second_price(self) -> float:
@@ -127,11 +125,13 @@ class DualEntryStrategy:
         bot_config: Config,
         signer: OrderSigner,
         clob: ClobClient,
+        merger: Optional[Merger] = None,
     ):
         self.cfg = config
         self.bot_config = bot_config
         self.signer = signer
         self.clob = clob
+        self.merger = merger
 
         self.manager = MarketManager(
             coin=config.coin,
@@ -175,8 +175,7 @@ class DualEntryStrategy:
         self._current_market_fee_bps = 0
         self._hedge_announced = False
         self._last_hedged_size = 0.0
-        self._last_gross_total = 0.0
-        self._last_est_net_total = 0.0
+        self._last_pnl = 0.0
         self._ticks_total = 0
         self._ticks_market = 0
         self._ticks_in_status_window = 0
@@ -187,13 +186,8 @@ class DualEntryStrategy:
         self.leg1_entries = 0
         self.leg2_entries = 0
         self.total_spent = 0.0
-        self._session_gross_pnl = 0.0
-        self._session_net_pnl = 0.0
+        self._session_pnl = 0.0
         self._unhedged_loss = 0.0
-
-        self._last_redeem_ts = 0.0
-        self._redeemer = None
-        self._redeem_error_count = 0
 
         self._leg1_fill_ts: float = 0.0
         self._leg2_fill_ts: float = 0.0
@@ -201,6 +195,10 @@ class DualEntryStrategy:
         self._leg2_real_size: float = 0.0
         self._leg1_fill_datetime: str = ""
         self._leg2_fill_datetime: str = ""
+
+        self._merge_completed = False
+        self._merge_tx_hash: Optional[str] = None
+        self.merges_done = 0
 
     async def run(self) -> None:
         """Main strategy loop."""
@@ -212,7 +210,6 @@ class DualEntryStrategy:
         log(f"  second_price:  {self.cfg.second_price}")
         log(f"  entry_window:  {self.cfg.entry_window}s")
         log(f"  size:          {self.cfg.size} shares")
-        log(f"  NOTE:         Claim winnings manually at polymarket.com")
         log(f"  dry_run:       {self.cfg.dry_run}")
         print()
 
@@ -273,57 +270,6 @@ class DualEntryStrategy:
         else:
             log("No initial WS book data yet, continuing...", "warning")
 
-    async def _redeem_loop(self) -> None:
-        """Background task to periodically redeem resolved positions."""
-        if self._redeem_error_count >= 3:
-            return
-
-        try:
-            from src.redeemer import Redeemer
-            import os
-
-            private_key = os.environ.get("POLY_PRIVATE_KEY", "")
-            proxy_address = self.bot_config.safe_address
-
-            if not private_key:
-                log("Redeem: POLY_PRIVATE_KEY not set", "warning")
-                return
-
-            if not proxy_address:
-                log("Redeem: safe_address not set", "warning")
-                return
-
-            rpc_url = os.environ.get("POLY_RPC_URL", "https://polygon-rpc.com")
-
-            redeemer = Redeemer(
-                private_key=private_key,
-                proxy_address=proxy_address,
-                rpc_url=rpc_url,
-            )
-
-            positions = redeemer.get_redeemable_positions(proxy_address)
-
-            if not positions:
-                return
-
-            log(f"Redeem: Found {len(positions)} redeemable positions", "info")
-
-            results = redeemer.redeem_all(proxy_address)
-
-            success = sum(1 for r in results if r.get("status") == "success")
-            failed = sum(1 for r in results if r.get("status") == "error")
-
-            log(
-                f"Redeem: {success} succeeded, {failed} failed",
-                "success" if failed == 0 else "warning",
-            )
-
-            self._redeem_error_count = 0
-
-        except Exception as e:
-            self._redeem_error_count += 1
-            log(f"Redeem error ({self._redeem_error_count}/3): {e}", "warning")
-
     async def _timer_tick(self) -> None:
         market = self.manager.current_market
         if not market:
@@ -342,7 +288,7 @@ class DualEntryStrategy:
             elif self._leg1_filled_size > 0:
                 loss = self._leg1_cost
                 self._unhedged_loss += loss
-                self._session_net_pnl -= loss
+                self._session_pnl -= loss
                 log(
                     f"Market ended UNHEDGED. LEG1={self._leg1_filled_size:.4f} @ {self._leg1_avg_price:.4f}, "
                     f"cost=${loss:.4f} LOST",
@@ -380,13 +326,6 @@ class DualEntryStrategy:
                 self._render_tui(market, ticks, tick_rate, since_last_tick)
             else:
                 self._log_status_line(market, ticks, tick_rate, since_last_tick)
-
-        if (
-            self.cfg.redeem_interval > 0
-            and now - self._last_redeem_ts >= self.cfg.redeem_interval
-        ):
-            self._last_redeem_ts = now
-            self._spawn_task(self._redeem_loop())
 
     async def _on_book_update(self, snapshot: OrderbookSnapshot) -> None:
         market = self.manager.current_market
@@ -1029,9 +968,6 @@ class DualEntryStrategy:
         steps = int(value / tick + 1e-9)
         return round(steps * tick, 6)
 
-    def _estimate_fee_per_share(self, price: float, fee_bps: int) -> float:
-        return max(0.0, price) * max(0, fee_bps) / 10000.0
-
     def _record_leg1_fill(
         self, size: float, avg_price: float, token_id: Optional[str]
     ) -> None:
@@ -1114,11 +1050,12 @@ class DualEntryStrategy:
             self._leg2_token_id or "", self._current_market_fee_bps
         )
 
-        gross_per_share = 1.0 - (avg_price + second_price)
-        est_fee_per_share = self._estimate_fee_per_share(
-            avg_price, leg1_fee_bps
-        ) + self._estimate_fee_per_share(second_price, leg2_fee_bps)
-        est_net_per_share = gross_per_share - est_fee_per_share
+        # Estimate PnL if leg2 fills at target price
+        est_total_cost = matched_size * (avg_price + second_price)
+        est_real_leg1 = matched_size * (1 - leg1_fee_bps / 10000)
+        est_real_leg2 = matched_size * (1 - leg2_fee_bps / 10000)
+        est_merge = min(est_real_leg1, est_real_leg2)
+        est_pnl = est_merge - est_total_cost
 
         self.state = StrategyState.SCANNING_LEG2
         log(
@@ -1127,8 +1064,8 @@ class DualEntryStrategy:
             "success",
         )
         log(
-            f"Edge/share gross={gross_per_share:.4f}, est_net_after_fees={est_net_per_share:.4f} "
-            f"(fee_bps L1={leg1_fee_bps}, L2={leg2_fee_bps})",
+            f"Est PnL=${est_pnl:+.4f} (cost=${est_total_cost:.4f}, "
+            f"merge={est_merge:.4f} shares, fee_bps L1={leg1_fee_bps} L2={leg2_fee_bps})",
             "info",
         )
 
@@ -1141,14 +1078,11 @@ class DualEntryStrategy:
             log("No hedged size completed.", "warning")
             return
 
-        avg_leg1 = self._leg1_cost / max(self._leg1_filled_size, 1e-12)
-        avg_leg2 = self._leg2_cost / max(self._leg2_filled_size, 1e-12)
-        gross_cost_per_share = avg_leg1 + avg_leg2
-        gross_edge_per_share = 1.0 - gross_cost_per_share
+        # --- Correct PnL ---
+        # total_cost = USDC actually spent on both legs
+        total_cost = self._leg1_cost + self._leg2_cost
 
-        order_size = self.cfg.size
-        gross_total = gross_edge_per_share * order_size * 2
-
+        # Real shares received after fees
         real_size_leg1 = (
             self._leg1_real_size if self._leg1_real_size > 0 else self._leg1_filled_size
         )
@@ -1156,30 +1090,79 @@ class DualEntryStrategy:
             self._leg2_real_size if self._leg2_real_size > 0 else self._leg2_filled_size
         )
         real_hedged = min(real_size_leg1, real_size_leg2)
-        net_edge_per_share = 1.0 - gross_cost_per_share
-        net_total = net_edge_per_share * real_hedged * 2
+
+        # Merge payout: each merged pair returns $1 USDC
+        merge_payout = real_hedged * 1.0
+        pnl = merge_payout - total_cost
 
         self._last_hedged_size = hedged_size
-        self._last_gross_total = gross_total
-        self._last_est_net_total = net_total
+        self._last_pnl = pnl
 
         if self._leg2_filled_size + 1e-9 >= self._leg1_filled_size:
             self.leg2_entries += 1
             self._hedge_announced = True
-            self._session_gross_pnl += gross_total
-            self._session_net_pnl += net_total
+            self._session_pnl += pnl
             log(
-                f"DUAL ENTRY HEDGED order={order_size * 2} shares, real={real_hedged * 2:.4f}. "
-                f"gross=${gross_total:.4f}, net=${net_total:.4f}",
+                f"DUAL ENTRY HEDGED  cost=${total_cost:.4f}, "
+                f"merge={real_hedged:.4f} shares -> ${merge_payout:.4f}, "
+                f"PnL=${pnl:+.4f}",
                 "success",
             )
+            # Auto-merge: convert both sides back into USDC immediately
+            self._spawn_task(self._auto_merge(real_hedged))
         else:
             residual = max(0.0, self._leg1_filled_size - self._leg2_filled_size)
             log(
-                f"Partial hedge only. hedged={hedged_size:.4f}, residual={residual:.4f}, "
-                f"gross(hedged)=${gross_total:.4f}, net(hedged)=${net_total:.4f}",
+                f"Partial hedge. hedged={hedged_size:.4f}, residual={residual:.4f}, "
+                f"cost=${total_cost:.4f}, est_merge=${merge_payout:.4f}, PnL=${pnl:+.4f}",
                 "warning",
             )
+
+    async def _auto_merge(self, merge_shares: float) -> None:
+        """Merge both outcome tokens back into USDC after a successful hedge."""
+        market = self.manager.current_market
+        if not market:
+            log("Merge: no active market", "warning")
+            return
+
+        condition_id = market.condition_id
+        if not condition_id:
+            log("Merge: no condition_id available, skip", "warning")
+            return
+
+        if self.cfg.dry_run:
+            log(
+                f"[DRY RUN] MERGE {merge_shares:.4f} shares -> "
+                f"${merge_shares:.4f} USDC (condition={condition_id[:16]}...)",
+                "trade",
+            )
+            self._merge_completed = True
+            self._merge_tx_hash = "dry-run"
+            self.merges_done += 1
+            return
+
+        if not self.merger:
+            log("Merge: no Merger instance configured, skip", "warning")
+            return
+
+        try:
+            log(
+                f"Merging {merge_shares:.4f} shares -> USDC "
+                f"(condition={condition_id[:16]}...)",
+                "trade",
+            )
+            tx_hash = await asyncio.to_thread(
+                self.merger.merge,
+                condition_id=condition_id,
+                shares=merge_shares,
+                neg_risk=market.neg_risk,
+            )
+            self._merge_completed = True
+            self._merge_tx_hash = tx_hash
+            self.merges_done += 1
+            log(f"MERGE OK: {tx_hash[:20]}...", "success")
+        except Exception as exc:
+            log(f"MERGE FAILED: {exc}", "error")
 
     async def _reconcile_open_orders_for_market(self, market: MarketInfo) -> None:
         if self.cfg.dry_run:
@@ -1322,6 +1305,8 @@ class DualEntryStrategy:
         self._leg2_real_size = 0.0
         self._leg1_fill_datetime = ""
         self._leg2_fill_datetime = ""
+        self._merge_completed = False
+        self._merge_tx_hash = None
 
         self.markets_seen += 1
 
@@ -1577,25 +1562,21 @@ class DualEntryStrategy:
         d.add_line(f" LEG 1 | {self._format_leg1_status()}")
         d.add_line(f" LEG 2 | {self._format_leg2_status()}")
         if self._hedge_announced:
+            merge_status = ""
+            if self._merge_completed:
+                merge_status = f"  |  {G}MERGED{X}"
+            pc = G if self._last_pnl > 0 else R if self._last_pnl < 0 else D
             d.add_line(
-                f"        {G}HEDGED{X}  gross: ${self._last_gross_total:+.4f}"
-                f"  net: ${self._last_est_net_total:+.4f}"
+                f"        {G}HEDGED{X}  PnL: {pc}${self._last_pnl:+.4f}{X}{merge_status}"
             )
         d.add_separator()
 
         # --- Session ---
-        gc = (
-            G
-            if self._session_gross_pnl > 0
-            else R
-            if self._session_gross_pnl < 0
-            else D
-        )
-        nc = G if self._session_net_pnl > 0 else R if self._session_net_pnl < 0 else D
+        sc = G if self._session_pnl > 0 else R if self._session_pnl < 0 else D
         d.add_line(
             f" Session: {self.markets_seen} mkts  {self.leg2_entries} hedges"
-            f"  |  Gross: {gc}${self._session_gross_pnl:+.4f}{X}"
-            f"  Net: {nc}${self._session_net_pnl:+.4f}{X}"
+            f"  {self.merges_done} merges"
+            f"  |  PnL: {sc}${self._session_pnl:+.4f}{X}"
             f"  |  Spent: ${self.total_spent:.2f}"
         )
         d.add_separator()
@@ -1626,6 +1607,7 @@ class DualEntryStrategy:
         log(f"  Markets seen:  {self.markets_seen}")
         log(f"  LEG1 fills:    {self.leg1_entries}")
         log(f"  LEG2 fills:    {self.leg2_entries}")
+        log(f"  Merges:        {self.merges_done}")
         log(f"  Total spent:   ${self.total_spent:.2f}")
         log(f"  Ticks (total): {self._ticks_total}")
         if self._leg1_filled_size > 0 or self._leg2_filled_size > 0:
@@ -1636,14 +1618,12 @@ class DualEntryStrategy:
         if self._last_hedged_size > 0:
             log(
                 f"  Last hedge: size={self._last_hedged_size:.4f} "
-                f"gross=${self._last_gross_total:.4f} "
-                f"est_net=${self._last_est_net_total:.4f}",
+                f"PnL=${self._last_pnl:+.4f}",
                 "success",
             )
-        if self._session_gross_pnl != 0 or self._session_net_pnl != 0:
+        if self._session_pnl != 0:
             log(
-                f"  Session PnL: gross=${self._session_gross_pnl:+.4f} "
-                f"net=${self._session_net_pnl:+.4f}",
+                f"  Session PnL: ${self._session_pnl:+.4f}",
                 "success",
             )
         log("=" * 52)
@@ -1703,13 +1683,6 @@ def main() -> None:
         default=5.0,
         help="Seconds between market discovery checks",
     )
-    parser.add_argument(
-        "--redeem-interval",
-        type=float,
-        default=300.0,
-        help="Seconds between redeem attempts (0 to disable)",
-    )
-
     args = parser.parse_args()
 
     strategy_cfg = DualEntryConfig(
@@ -1720,7 +1693,6 @@ def main() -> None:
         coin=args.coin.upper(),
         dry_run=args.dry_run,
         market_check_interval=args.market_check_interval,
-        redeem_interval=args.redeem_interval,
     )
     strategy_cfg.validate()
 
@@ -1730,6 +1702,23 @@ def main() -> None:
     log(f"  EOA:   {signer.address}", "info")
     log(f"  Proxy: {bot_config.safe_address}", "info")
     log(f"  Sig:   type {bot_config.clob.signature_type}", "info")
+
+    # Initialize merger for auto-merge after hedge
+    merger = None
+    if not args.dry_run:
+        try:
+            private_key = os.environ.get("POLY_PRIVATE_KEY", "")
+            rpc_url = os.environ.get("POLY_RPC_URL", "https://polygon-rpc.com")
+            merger = Merger(
+                private_key=private_key,
+                proxy_address=bot_config.safe_address,
+                rpc_url=rpc_url,
+            )
+            log("  Merger: ready (auto-merge after hedge)", "info")
+        except Exception as exc:
+            log(f"  Merger: disabled ({exc})", "warning")
+    else:
+        log("  Merger: dry-run mode (simulated)", "info")
     print()
 
     strategy = DualEntryStrategy(
@@ -1737,6 +1726,7 @@ def main() -> None:
         bot_config=bot_config,
         signer=signer,
         clob=clob,
+        merger=merger,
     )
 
     asyncio.run(strategy.run())

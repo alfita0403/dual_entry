@@ -394,9 +394,22 @@ class MarketManager:
             await self.ws.run(auto_reconnect=True)
 
     async def _market_check_loop(self) -> None:
-        """Periodically check for market changes."""
+        """Periodically check for market changes.
+
+        Uses accelerated polling (every 1s) when the current market has ended
+        or is about to end, to detect the next market as fast as possible.
+        """
         while self._running:
-            await asyncio.sleep(self.market_check_interval)
+            # Determine sleep interval: fast when market ended/ending, normal otherwise
+            sleep_interval = self.market_check_interval
+            if self.current_market:
+                if (
+                    self.current_market.has_ended()
+                    or self.current_market.is_ending_soon(threshold_seconds=15)
+                ):
+                    sleep_interval = 1.0
+
+            await asyncio.sleep(sleep_interval)
 
             if not self._running:
                 break

@@ -162,6 +162,10 @@ class GammaClient(ThreadLocalSessionMixin):
         """
         Get the current active 5-minute market for a coin.
 
+        Tries current, next, and previous 5-minute windows, plus two additional
+        future windows to handle edge cases where new markets are created
+        slightly ahead of their expected start time.
+
         Args:
             coin: Coin symbol (BTC, ETH, SOL, XRP)
 
@@ -182,25 +186,14 @@ class GammaClient(ThreadLocalSessionMixin):
         current_window = now.replace(minute=minute, second=0, microsecond=0)
         current_ts = int(current_window.timestamp())
 
-        # Try current window
-        slug = f"{prefix}-{current_ts}"
-        market = self.get_market_by_slug(slug)
-        if market and market.get("acceptingOrders"):
-            return market
-
-        # Try next window (in case current just ended)
-        next_ts = current_ts + 300  # 5 minutes
-        slug = f"{prefix}-{next_ts}"
-        market = self.get_market_by_slug(slug)
-        if market and market.get("acceptingOrders"):
-            return market
-
-        # Try previous window (might still be active)
-        prev_ts = current_ts - 300
-        slug = f"{prefix}-{prev_ts}"
-        market = self.get_market_by_slug(slug)
-        if market and market.get("acceptingOrders"):
-            return market
+        # Try windows in priority order: current, next, next+1, previous
+        # Including next+1 covers cases where markets are created early
+        offsets = [0, 300, 600, -300]
+        for offset in offsets:
+            slug = f"{prefix}-{current_ts + offset}"
+            market = self.get_market_by_slug(slug)
+            if market and market.get("acceptingOrders"):
+                return market
 
         return None
 
