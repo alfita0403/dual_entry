@@ -972,13 +972,17 @@ class CheapQuoteStrategy:
         B = Colors.BOLD
         D = Colors.DIM
         X = Colors.RESET
-        W = 72
+        W = 68
 
         lines: list[str] = []
-        sep = D + "-" * W + X
-        bsep = B + "=" * W + X
 
-        # --- Header ---
+        def sep() -> None:
+            lines.append(f" {D}{'.' * W}{X}")
+
+        def hsep() -> None:
+            lines.append(f" {C}{'_' * W}{X}")
+
+        # --- Header bar ---
         connected = sum(1 for m in self.managers.values() if m.is_connected)
         ws_c = G if connected == 4 else (Y if connected > 0 else R)
 
@@ -990,94 +994,108 @@ class CheapQuoteStrategy:
                     countdown = format_countdown(cd[0], cd[1])
                     break
 
-        sc = {
-            CycleState.ACTIVE: Y, CycleState.HOLDING: C,
-            CycleState.WAITING_MARKET: D, CycleState.DONE: D,
-        }.get(self.cycle_state, D)
-        st = self.cycle_state.value
+        state_map = {
+            CycleState.ACTIVE: (Y, "ACTIVE"),
+            CycleState.HOLDING: (C, "HOLD"),
+            CycleState.WAITING_MARKET: (D, "WAIT"),
+            CycleState.DONE: (D, "IDLE"),
+        }
+        sc, st = state_map.get(self.cycle_state, (D, "?"))
         if self.cycle_state == CycleState.ACTIVE:
             rem = max(0.0, self._cycle_deadline - time.time())
-            st += f" ({rem:.0f}s)"
+            st = f"BUY {rem:.0f}s"
 
         up_s = time.time() - self._session_start
         up_h, up_m = int(up_s // 3600), int((up_s % 3600) // 60)
         up_str = f"{up_h}h{up_m:02d}m" if up_h else f"{up_m}m"
-        dry = f" {R}DRY{X}" if self.cfg.dry_run else ""
+        dry = f" {R}[DRY]{X}" if self.cfg.dry_run else ""
 
-        lines.append(bsep)
+        lines.append("")
         lines.append(
-            f" {B}Cheap Quote{X}{dry}  {ws_c}WS:{connected}/4{X}"
-            f"  {countdown}  {sc}{st}{X}"
-            f"  {D}{up_str}{X}"
+            f"  {C}{B}CHEAP QUOTE HUNTER{X}{dry}"
+            f"      {ws_c}ws:{connected}/4{X}"
+            f"   {countdown}"
+            f"   {sc}{B}{st}{X}"
+            f"   {D}{up_str}{X}"
         )
         lines.append(
-            f" {D}w={self.cfg.window:.0f}s  p<={self.cfg.price}  sz={self.cfg.size:.0f}{X}"
+            f"  {D}limit {self.cfg.price}  window {self.cfg.window:.0f}s"
+            f"  size {self.cfg.size:.0f}  cycle #{self.cycles_seen}{X}"
         )
-        lines.append(sep)
+        hsep()
 
         # --- 8 prices ---
         lines.append(
-            f"  {D}{'':4}   {'UP':>8}   {'DOWN':>8}   {'UP ord':>10}   {'DOWN ord':>10}{X}"
+            f"  {D}{'':>5}    {'UP':>8}    {'DOWN':>8}"
+            f"      {'UP':>8}    {'DOWN':>8}{X}"
+        )
+        lines.append(
+            f"  {D}{'':>5}    {'ask':>8}    {'ask':>8}"
+            f"      {'order':>8}    {'order':>8}{X}"
         )
         for coin in COINS:
             ua = self._best_asks[coin]["up"]
             da = self._best_asks[coin]["down"]
-            uc = G if ua <= self.cfg.price else X
-            dc = G if da <= self.cfg.price else X
+            # Highlight prices at or below our limit
+            uc = f"{G}{B}" if ua <= self.cfg.price else D
+            dc = f"{G}{B}" if da <= self.cfg.price else D
             us = self._order_status_str(coin, "up")
             ds = self._order_status_str(coin, "down")
             lines.append(
-                f"  {B}{coin:>4}{X}   {uc}{ua:>8.4f}{X}   {dc}{da:>8.4f}{X}"
-                f"   {us:>10}   {ds:>10}"
+                f"  {B}{coin:>5}{X}"
+                f"    {uc}{ua:>8.4f}{X}    {dc}{da:>8.4f}{X}"
+                f"      {us:>8}    {ds:>8}"
             )
-        lines.append(sep)
+        hsep()
 
-        # --- Stats (one line) ---
+        # --- Stats ---
         pnl_c = G if self.session_pnl >= 0 else R
         wr = (
             f"{(self.total_wins / self.total_resolved) * 100:.0f}%"
             if self.total_resolved > 0 else "--"
         )
         lines.append(
-            f" #{self.cycles_seen}  {self.total_fills} fills"
-            f"  {self.total_wins}W/{self.total_losses}L"
-            f"  wr:{wr}"
-            f"  {pnl_c}pnl:${self.session_pnl:+.2f}{X}"
-            f"  spent:${self.total_spent:.2f}"
+            f"  {B}{self.total_fills}{X} fills"
+            f"   {G}{self.total_wins}W{X}/{R}{self.total_losses}L{X}"
+            f"   win:{B}{wr}{X}"
+            f"   pnl:{pnl_c}{B}${self.session_pnl:+.2f}{X}"
+            f"   spent:{D}${self.total_spent:.2f}{X}"
         )
-        lines.append(sep)
+        hsep()
 
         # --- Trade history (last 6 fills) ---
-        lines.append(f" {B}Trades:{X}")
+        lines.append(f"  {B}Trades{X}")
         recent = self._all_positions[-6:] if self._all_positions else []
         if recent:
             for p in reversed(recent):
                 ts = datetime.fromtimestamp(p.fill_time).strftime("%H:%M")
-                tag = f"{D}PENDING{X}"
+                tag = f"{D}...{X}"
                 if p.resolved:
                     if p.won:
                         profit = p.payout - p.cost
-                        tag = f"{G}WIN +${profit:.2f}{X}"
+                        tag = f"{G}{B}WIN{X} {G}+${profit:.2f}{X}"
                     else:
-                        tag = f"{R}LOSS -${p.cost:.2f}{X}"
+                        tag = f"{R}LOSS{X} {R}-${p.cost:.2f}{X}"
                 lines.append(
-                    f"  {D}{ts}{X}  {p.coin}-{p.side.upper():<4}"
-                    f"  @{p.fill_price:.2f} x{p.fill_size:.0f}"
-                    f"  ${p.cost:.2f}  {tag}"
+                    f"  {D}{ts}{X}"
+                    f"  {B}{p.coin}{X}-{p.side.upper():<4}"
+                    f"  {C}@{p.fill_price:.2f}{X} x{p.fill_size:.0f}"
+                    f"  {tag}"
                 )
         else:
-            lines.append(f"  {D}(no fills yet){X}")
-        lines.append(sep)
+            lines.append(f"  {D}waiting for fills...{X}")
+        hsep()
 
-        # --- Events (last 8) ---
-        lines.append(f" {B}Events:{X}")
-        evts = _log_buffer[-8:] if _log_buffer else []
+        # --- Events (last 6) ---
+        lines.append(f"  {B}Events{X}")
+        evts = _log_buffer[-6:] if _log_buffer else []
         if evts:
             for msg in evts:
                 lines.append(msg)
         else:
-            lines.append(f"  {D}(waiting...){X}")
-        lines.append(bsep)
+            lines.append(f"  {D}starting up...{X}")
+        hsep()
+        lines.append("")
 
         print("\033[H\033[J" + "\n".join(lines), flush=True)
 
