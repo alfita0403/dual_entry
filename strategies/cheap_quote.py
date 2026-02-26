@@ -1,0 +1,1235 @@
+"""
+Cheap Quote Hunter - Multi-Coin 5-Minute Markets
+
+Monitors all 4 coins (BTC, ETH, SOL, XRP) simultaneously on their 5-minute
+Up/Down markets.  Places GTC limit BUY orders at a configurable price
+threshold during a configurable window from market birth.  Holds filled
+positions to expiry and automatically tracks win/loss outcomes.
+
+Purpose:
+    Frequentist inference -- does a 5-cent quote actually win ~5 % of
+    the time, or more, or less?
+
+Order approach:
+    GTC limit BUY orders placed as soon as each market starts (up to 8
+    orders per cycle: UP + DOWN for each coin).  Cancelled when the
+    entry window expires.  This guarantees the configured price (limit
+    orders never pay more) and eliminates latency risk (the exchange
+    matches the order, not the bot).
+
+Trade log:
+    Every fill is appended to ``cheap_quote_trades.txt`` (never overwritten).
+    Each line contains timestamp, market, coin, side, price, size, cost,
+    config params, and outcome (when resolved).
+
+Usage:
+    python strategies/cheap_quote.py --dry-run
+    python strategies/cheap_quote.py --window 60 --price 0.05 --size 5
+    python strategies/cheap_quote.py --window 120 --price 0.20 --size 5
+"""
+
+import argparse
+import asyncio
+import enum
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------------
+# Path & env setup
+# ---------------------------------------------------------------------------
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+load_dotenv()
+
+logging.getLogger("src.websocket_client").setLevel(logging.WARNING)
+
+from lib.market_manager import MarketInfo, MarketManager  # noqa: E402
+from lib.console import Colors, format_countdown, StatusDisplay  # noqa: E402
+from src.client import ClobClient  # noqa: E402
+from src.config import Config  # noqa: E402
+from src.gamma_client import GammaClient  # noqa: E402
+from src.signer import Order, OrderSigner  # noqa: E402
+from src.websocket_client import OrderbookSnapshot  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+COINS: List[str] = ["BTC", "ETH", "SOL", "XRP"]
+
+TRADE_LOG_FILE = Path(__file__).resolve().parent.parent / "cheap_quote_trades.txt"
+
+# ---------------------------------------------------------------------------
+# TUI-aware logging (same pattern as dual_entry)
+# ---------------------------------------------------------------------------
+_log_buffer: list = []
+_tui_active = False
+
+
+def ts_now() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def log(msg: str, level: str = "info") -> None:
+    colors = {
+        "info": "\033[0m",
+        "success": "\033[92m",
+        "warning": "\033[93m",
+        "error": "\033[91m",
+        "trade": "\033[96m",
+    }
+    reset = "\033[0m"
+    color = colors.get(level, colors["info"])
+    line = f"  {color}[{ts_now()}] {msg}{reset}"
+    if _tui_active:
+        _log_buffer.append(line)
+        if len(_log_buffer) > 24:
+            _log_buffer.pop(0)
+    else:
+        print(line)
+
+
+# ===================================================================
+# Persistent trade log
+# ===================================================================
+def _append_trade_log(
+    pos: "PositionRecord",
+    cfg: "CheapQuoteConfig",
+    outcome: str = "PENDING",
+) -> None:
+    """Append one line per fill to the persistent trade log file."""
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = (
+        f"{now_utc} | {now_local} | "
+        f"order_id={pos.order_id} | "
+        f"market={pos.market_slug} | coin={pos.coin} | side={pos.side.upper()} | "
+        f"price={pos.fill_price:.4f} | size={pos.fill_size:.1f} | "
+        f"cost=${pos.cost:.4f} | "
+        f"window={cfg.window:.0f}s | cfg_price={cfg.price} | cfg_size={cfg.size} | "
+        f"dry_run={cfg.dry_run} | outcome={outcome}"
+    )
+    try:
+        with open(TRADE_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as exc:
+        log(f"Trade log write error: {exc}", "warning")
+
+
+def _update_trade_log_outcome(
+    order_id: str, market_slug: str, coin: str, side: str, outcome: str
+) -> None:
+    """Update the outcome field for a specific trade in the log file.
+
+    Matches by order_id first (unique key), falls back to market+coin+side.
+    """
+    try:
+        if not TRADE_LOG_FILE.exists():
+            return
+        lines = TRADE_LOG_FILE.read_text(encoding="utf-8").splitlines()
+        updated = []
+        for line in lines:
+            matched = False
+            if order_id and f"order_id={order_id}" in line:
+                matched = True
+            elif (
+                f"market={market_slug}" in line
+                and f"coin={coin}" in line
+                and f"side={side.upper()}" in line
+            ):
+                matched = True
+            if matched and "outcome=PENDING" in line:
+                line = line.replace("outcome=PENDING", f"outcome={outcome}")
+            updated.append(line)
+        TRADE_LOG_FILE.write_text("\n".join(updated) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+# ===================================================================
+# Configuration
+# ===================================================================
+@dataclass
+class CheapQuoteConfig:
+    """Configuration for the Cheap Quote strategy."""
+
+    window: float = 60.0  # seconds from market birth
+    price: float = 0.05  # max buy price (limit)
+    size: float = 5.0  # shares per order
+    dry_run: bool = False
+    market_check_interval: float = 5.0
+
+    def validate(self) -> None:
+        if not 0.01 <= self.price <= 0.99:
+            raise ValueError(f"price must be 0.01-0.99, got {self.price}")
+        if not 1.0 <= self.window <= 300.0:
+            raise ValueError(f"window must be 1-300 seconds, got {self.window}")
+        if self.size < 5:
+            raise ValueError(f"size must be >= 5, got {self.size}")
+
+
+# ===================================================================
+# State machine
+# ===================================================================
+class CycleState(enum.Enum):
+    WAITING_MARKET = "WAITING_MARKET"
+    ACTIVE = "ACTIVE"
+    HOLDING = "HOLDING"
+    DONE = "DONE"
+
+
+# ===================================================================
+# Data classes
+# ===================================================================
+@dataclass
+class OrderTracker:
+    coin: str
+    side: str
+    token_id: str
+    order_id: str
+    price: float
+    size: float
+    placed_at: float
+    filled: bool = False
+    fill_price: float = 0.0
+    fill_size: float = 0.0
+    fill_time: float = 0.0
+    cancelled: bool = False
+
+
+@dataclass
+class PositionRecord:
+    coin: str
+    side: str
+    fill_price: float
+    fill_size: float
+    fill_time: float
+    market_slug: str
+    order_id: str = ""
+    cost: float = 0.0
+    resolved: bool = False
+    won: bool = False
+    payout: float = 0.0
+
+
+# ===================================================================
+# Strategy
+# ===================================================================
+class CheapQuoteStrategy:
+    """Buy cheap quotes across 4 coins, hold to expiry."""
+
+    def __init__(
+        self,
+        cfg: CheapQuoteConfig,
+        bot_config: Config,
+        signer: OrderSigner,
+        clob: ClobClient,
+    ):
+        self.cfg = cfg
+        self.bot_config = bot_config
+        self.signer = signer
+        self.clob = clob
+
+        # 4 MarketManagers
+        self.managers: Dict[str, MarketManager] = {}
+        for coin in COINS:
+            self.managers[coin] = MarketManager(
+                coin=coin,
+                market_check_interval=cfg.market_check_interval,
+                auto_switch_market=True,
+                interval="5m",
+            )
+
+        # Cycle state
+        self.cycle_state = CycleState.WAITING_MARKET
+        self._cycle_ts: Optional[int] = None
+        self._cycle_start_ts: float = 0.0
+        self._cycle_deadline: float = 0.0
+        self._coins_entered: Set[str] = set()
+
+        # Orders
+        self._orders: Dict[str, OrderTracker] = {}
+        self._orders_placed_this_cycle: int = 0
+
+        # Positions
+        self._current_positions: List[PositionRecord] = []
+        self._all_positions: List[PositionRecord] = []
+
+        # Session stats
+        self.cycles_seen: int = 0
+        self.total_orders_placed: int = 0
+        self.total_fills: int = 0
+        self.total_wins: int = 0
+        self.total_losses: int = 0
+        self.total_resolved: int = 0
+        self.session_pnl: float = 0.0
+        self.total_spent: float = 0.0
+
+        # Per-coin caches
+        self._best_asks: Dict[str, Dict[str, float]] = {
+            c: {"up": 1.0, "down": 1.0} for c in COINS
+        }
+        self._coin_markets: Dict[str, Optional[MarketInfo]] = {
+            c: None for c in COINS
+        }
+
+        # Fee cache
+        self._fee_rate_cache: Dict[str, int] = {}
+
+        # TUI
+        self._last_render_ts: float = 0.0
+        self._ticks_total: int = 0
+        self._ticks_window: int = 0
+        self._last_tick_ts: float = 0.0
+        self._status_window_start: float = time.time()
+
+        # Tasks
+        self._fill_watcher_task: Optional[asyncio.Task] = None
+        self._resolution_tasks: List[asyncio.Task] = []
+
+        # 24h stability
+        self._session_start: float = time.time()
+        self._last_heartbeat_ts: float = 0.0
+        self._last_done_poll: float = 0.0
+        self._last_task_cleanup: float = 0.0
+        self._ws_reconnect_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+    async def run(self) -> None:
+        global _tui_active
+
+        log("Cheap Quote Strategy started (4-coin WebSocket)", "success")
+        log(f"  window:  {self.cfg.window:.0f}s")
+        log(f"  price:   {self.cfg.price}")
+        log(f"  size:    {self.cfg.size} shares")
+        log(f"  dry_run: {self.cfg.dry_run}")
+        log(f"  log:     {TRADE_LOG_FILE}")
+        print()
+
+        try:
+            await self._start_all_managers()
+            _tui_active = True
+
+            while True:
+                try:
+                    await self._tick()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    log(f"[tick error] {exc}", "error")
+                await asyncio.sleep(0.1)
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            _tui_active = False
+            await self._cleanup()
+            self._print_summary()
+
+    # ------------------------------------------------------------------
+    # Manager setup
+    # ------------------------------------------------------------------
+    async def _start_all_managers(self) -> None:
+        log("Starting 4 coin managers (BTC, ETH, SOL, XRP)...", "info")
+
+        for coin in COINS:
+            mgr = self.managers[coin]
+
+            mgr.on_market_change(
+                lambda old, new, c=coin: self._on_market_change(c, old, new)
+            )
+            mgr.on_book_update(
+                lambda snap, c=coin: self._on_book_update(c, snap)
+            )
+
+            attempts = 0
+            while True:
+                started = await mgr.start()
+                if started:
+                    break
+                attempts += 1
+                if attempts >= 5:
+                    log(f"  {coin}: no active 5m market after 5 tries", "error")
+                    break
+                log(f"  {coin}: retrying in 2s...", "warning")
+                await asyncio.sleep(2)
+
+            if mgr.current_market:
+                self._coin_markets[coin] = mgr.current_market
+                log(f"  {coin}: {mgr.current_market.slug}", "success")
+            else:
+                log(f"  {coin}: no market yet", "warning")
+
+        await asyncio.sleep(1.5)
+
+        connected = sum(1 for m in self.managers.values() if m.is_connected)
+        log(
+            f"WebSocket connections: {connected}/4",
+            "success" if connected == 4 else "warning",
+        )
+
+        # Enter cycle from first discovered market
+        for coin in COINS:
+            market = self._coin_markets.get(coin)
+            if market:
+                self._maybe_enter_cycle(coin, market)
+                break
+
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
+    def _on_market_change(self, coin: str, old_slug: str, new_slug: str) -> None:
+        mgr = self.managers[coin]
+        market = mgr.current_market
+        if market:
+            self._coin_markets[coin] = market
+            log(f"{coin} -> {new_slug}", "info")
+            self._maybe_enter_cycle(coin, market)
+
+            if old_slug:
+                self._schedule_resolution(coin, old_slug)
+
+    def _on_book_update(self, coin: str, snapshot: OrderbookSnapshot) -> None:
+        self._ticks_total += 1
+        self._ticks_window += 1
+        self._last_tick_ts = time.time()
+
+        market = self._coin_markets.get(coin)
+        if not market:
+            return
+
+        try:
+            asset_id = snapshot.asset_id
+            for side in ("up", "down"):
+                if market.token_ids.get(side) == asset_id:
+                    asks = snapshot.asks
+                    best = min(float(a.price) for a in asks) if asks else 1.0
+                    self._best_asks[coin][side] = best
+                    break
+        except Exception:
+            pass  # Malformed orderbook data; ignore and wait for next update
+
+    # ------------------------------------------------------------------
+    # Cycle management
+    # ------------------------------------------------------------------
+    def _maybe_enter_cycle(self, coin: str, market: MarketInfo) -> None:
+        market_start = market.start_timestamp()
+        if market_start is None:
+            return
+
+        now = time.time()
+        deadline = float(market_start) + self.cfg.window
+
+        # Same cycle -- add coin if needed
+        if self._cycle_ts == market_start:
+            if coin not in self._coins_entered and now < deadline:
+                self._coins_entered.add(coin)
+                asyncio.get_running_loop().create_task(
+                    self._place_orders_for_coin(coin, market)
+                )
+            return
+
+        # --- New cycle ---
+        if self.cycle_state in (CycleState.ACTIVE, CycleState.HOLDING):
+            self._transition_to_done()
+
+        self._cycle_ts = market_start
+        self._cycle_start_ts = float(market_start)
+        self._cycle_deadline = deadline
+        self._orders.clear()
+        self._current_positions.clear()
+        self._orders_placed_this_cycle = 0
+        self._coins_entered.clear()
+        self.cycles_seen += 1
+
+        if now >= deadline:
+            market_age = now - self._cycle_start_ts
+            log(
+                f"Market age {market_age:.0f}s > window {self.cfg.window:.0f}s. Skip.",
+                "warning",
+            )
+            self.cycle_state = CycleState.DONE
+            return
+
+        remaining = max(0.0, deadline - now)
+        log(
+            f"NEW CYCLE #{self.cycles_seen}: "
+            f"window={self.cfg.window:.0f}s  rem={remaining:.0f}s  "
+            f"price<={self.cfg.price}",
+            "trade",
+        )
+        self.cycle_state = CycleState.ACTIVE
+
+        for c in COINS:
+            m = self._coin_markets.get(c)
+            if m and m.start_timestamp() == market_start:
+                self._coins_entered.add(c)
+                asyncio.get_running_loop().create_task(
+                    self._place_orders_for_coin(c, m)
+                )
+
+        # Fill watcher
+        if self._fill_watcher_task and not self._fill_watcher_task.done():
+            self._fill_watcher_task.cancel()
+        self._fill_watcher_task = asyncio.get_running_loop().create_task(
+            self._watch_fills()
+        )
+
+    def _transition_to_done(self) -> None:
+        self.cycle_state = CycleState.DONE
+
+    # ------------------------------------------------------------------
+    # Order placement
+    # ------------------------------------------------------------------
+    async def _place_orders_for_coin(self, coin: str, market: MarketInfo) -> None:
+        for side in ("up", "down"):
+            token_id = market.token_ids.get(side, "")
+            if not token_id:
+                log(f"{coin}-{side.upper()}: no token ID", "warning")
+                continue
+            await self._place_single_order(coin, side, token_id, market)
+
+    async def _place_single_order(
+        self, coin: str, side: str, token_id: str, market: MarketInfo
+    ) -> None:
+        label = f"{coin}-{side.upper()}"
+
+        # Dry-run
+        if self.cfg.dry_run:
+            order_id = f"dry-{coin}-{side}-{int(time.time() * 1000)}"
+            log(f"[DRY] BUY {label}: {self.cfg.size} @ {self.cfg.price}", "trade")
+            tracker = OrderTracker(
+                coin=coin, side=side, token_id=token_id,
+                order_id=order_id, price=self.cfg.price,
+                size=self.cfg.size, placed_at=time.time(),
+            )
+            self._orders[order_id] = tracker
+            self._orders_placed_this_cycle += 1
+            self.total_orders_placed += 1
+            return
+
+        # Live
+        try:
+            fee_rate_bps = self._fee_rate_cache.get(token_id)
+            if fee_rate_bps is None:
+                fee_rate_bps = await asyncio.to_thread(
+                    self.clob.get_fee_rate_bps, token_id
+                )
+                self._fee_rate_cache[token_id] = fee_rate_bps
+
+            order = Order(
+                token_id=token_id,
+                price=self.cfg.price,
+                size=self.cfg.size,
+                side="BUY",
+                funder=self.bot_config.safe_address,
+                fee_rate_bps=fee_rate_bps,
+                signature_type=self.bot_config.clob.signature_type,
+                neg_risk=market.neg_risk,
+                tick_size=market.tick_size,
+            )
+            signed = self.signer.sign_order(order)
+            response = await asyncio.to_thread(self.clob.post_order, signed, "GTC")
+
+            success = bool(response.get("success", False))
+            if not success:
+                error = response.get("errorMsg", "unknown")
+                log(f"FAIL {label}: {error}", "error")
+                return
+
+            order_id = (
+                response.get("orderID")
+                or response.get("orderId")
+                or response.get("order_id")
+                or ""
+            )
+            status = str(response.get("status", "")).lower()
+
+            tracker = OrderTracker(
+                coin=coin, side=side, token_id=token_id,
+                order_id=order_id, price=self.cfg.price,
+                size=self.cfg.size, placed_at=time.time(),
+            )
+
+            if status in {"matched", "filled", "executed", "complete", "completed"}:
+                taking = _to_float(response.get("takingAmount", 0))
+                making = _to_float(response.get("makingAmount", 0))
+                fp = making / max(taking, 1e-12) if taking > 0 else self.cfg.price
+                # Sanity: limit BUY never fills above our limit price
+                if fp > self.cfg.price:
+                    fp = self.cfg.price
+                tracker.filled = True
+                tracker.fill_price = fp
+                # Cap at our order size
+                tracker.fill_size = min(
+                    taking if taking > 0 else self.cfg.size,
+                    self.cfg.size,
+                )
+                tracker.fill_time = time.time()
+                self._record_fill(tracker)
+                log(f"FILLED {label}: {tracker.fill_size:.1f} @ {fp:.4f}", "success")
+            else:
+                sid = order_id[:12] + "..." if len(order_id) > 12 else order_id
+                log(f"PLACED {label}: {self.cfg.size} @ {self.cfg.price} id={sid}", "success")
+
+            self._orders[order_id] = tracker
+            self._orders_placed_this_cycle += 1
+            self.total_orders_placed += 1
+
+        except Exception as exc:
+            log(f"ERROR {label}: {exc}", "error")
+
+    # ------------------------------------------------------------------
+    # Fill watcher
+    # ------------------------------------------------------------------
+    async def _watch_fills(self) -> None:
+        while self.cycle_state == CycleState.ACTIVE:
+            unfilled = [
+                (oid, t)
+                for oid, t in self._orders.items()
+                if not t.filled and not t.cancelled
+            ]
+            if not unfilled:
+                await asyncio.sleep(0.5)
+                continue
+
+            for order_id, tracker in unfilled:
+                if self.cfg.dry_run:
+                    ask = self._best_asks.get(tracker.coin, {}).get(tracker.side, 1.0)
+                    if ask <= self.cfg.price:
+                        tracker.filled = True
+                        tracker.fill_price = ask
+                        tracker.fill_size = self.cfg.size
+                        tracker.fill_time = time.time()
+                        self._record_fill(tracker)
+                        log(
+                            f"[DRY] FILLED {tracker.coin}-{tracker.side.upper()} "
+                            f"@ {ask:.4f}",
+                            "success",
+                        )
+                    continue
+
+                try:
+                    filled, closed, status, size_matched, avg_price = (
+                        await asyncio.to_thread(
+                            self._check_order_filled_sync,
+                            order_id,
+                            tracker.size,
+                        )
+                    )
+                    if filled:
+                        tracker.filled = True
+                        # Cap fill_size at our order size (API may report
+                        # aggregate market volume, not just our order).
+                        tracker.fill_size = min(
+                            size_matched if size_matched > 0 else tracker.size,
+                            tracker.size,
+                        )
+                        # Limit BUY never fills above limit price.  If the API
+                        # reports a higher price it's reading the wrong field.
+                        if avg_price > 0 and avg_price <= tracker.price:
+                            tracker.fill_price = avg_price
+                        else:
+                            tracker.fill_price = tracker.price
+                        tracker.fill_time = time.time()
+                        self._record_fill(tracker)
+                        label = f"{tracker.coin}-{tracker.side.upper()}"
+                        log(
+                            f"FILLED {label}: {tracker.fill_size:.1f} "
+                            f"@ {tracker.fill_price:.4f}",
+                            "success",
+                        )
+                    elif closed:
+                        tracker.cancelled = True
+                except Exception:
+                    pass
+
+            await asyncio.sleep(0.5)
+
+    def _check_order_filled_sync(
+        self, order_id: str, expected_size: float
+    ) -> Tuple[bool, bool, str, float, float]:
+        try:
+            payload = self.clob.get_order(order_id)
+            if payload is None:
+                return False, True, "missing", 0.0, 0.0
+
+            order_data = (
+                payload.get("order", payload) if isinstance(payload, dict) else {}
+            )
+            status = str(order_data.get("status", "")).lower()
+            size_matched = _to_float(
+                order_data.get("size_matched", order_data.get("sizeMatched", 0))
+            )
+            original_size = _to_float(
+                order_data.get("original_size", order_data.get("originalSize", 0))
+            )
+            limit_price = _to_float(order_data.get("price", 0.0))
+            avg_price = limit_price if limit_price > 0 else self.cfg.price
+
+            associate_trades = order_data.get("associate_trades", [])
+            if isinstance(associate_trades, list) and associate_trades:
+                total_sz, total_cost = 0.0, 0.0
+                for tid in associate_trades:
+                    trade = self.clob.get_trade(str(tid))
+                    if trade:
+                        tsz = _to_float(trade.get("size", 0))
+                        tpx = _to_float(trade.get("price", 0))
+                        if tsz > 0:
+                            total_sz += tsz
+                            total_cost += tsz * tpx
+                if total_sz > 0:
+                    size_matched = max(size_matched, total_sz)
+                    avg_price = total_cost / total_sz
+
+            filled_by_status = status in {
+                "matched", "filled", "executed", "complete", "completed",
+            }
+            filled_by_size = (
+                original_size > 0 and size_matched >= original_size - 1e-9
+            )
+            filled_by_expected = size_matched >= expected_size - 1e-9
+            filled = filled_by_status or filled_by_size or filled_by_expected
+
+            closed = status in {
+                "canceled", "cancelled", "expired", "failed", "rejected",
+            }
+            return filled, closed, status, size_matched, avg_price
+        except Exception:
+            return False, False, "error", 0.0, 0.0
+
+    # ------------------------------------------------------------------
+    # Position tracking
+    # ------------------------------------------------------------------
+    def _record_fill(self, tracker: OrderTracker) -> None:
+        self.total_fills += 1
+        cost = tracker.fill_size * tracker.fill_price
+        self.total_spent += cost
+
+        slug = ""
+        market = self._coin_markets.get(tracker.coin)
+        if market:
+            slug = market.slug
+
+        pos = PositionRecord(
+            coin=tracker.coin,
+            side=tracker.side,
+            fill_price=tracker.fill_price,
+            fill_size=tracker.fill_size,
+            fill_time=tracker.fill_time,
+            market_slug=slug,
+            order_id=tracker.order_id,
+            cost=cost,
+        )
+        self._current_positions.append(pos)
+        self._all_positions.append(pos)
+
+        # Append to persistent trade log
+        _append_trade_log(pos, self.cfg, outcome="PENDING")
+
+    # ------------------------------------------------------------------
+    # Cancellation
+    # ------------------------------------------------------------------
+    async def _cancel_unfilled_orders(self) -> None:
+        to_cancel = [
+            (oid, t)
+            for oid, t in self._orders.items()
+            if not t.filled and not t.cancelled
+        ]
+        if not to_cancel:
+            return
+
+        count = 0
+        for order_id, tracker in to_cancel:
+            tracker.cancelled = True
+            count += 1
+            if self.cfg.dry_run:
+                continue
+            try:
+                await asyncio.to_thread(self.clob.cancel_order, order_id)
+            except Exception as exc:
+                log(f"Cancel err {tracker.coin}-{tracker.side}: {exc}", "warning")
+
+        if count > 0:
+            log(f"Cancelled {count} unfilled order(s)", "warning")
+
+    # ------------------------------------------------------------------
+    # Resolution tracking
+    # ------------------------------------------------------------------
+    def _schedule_resolution(self, coin: str, old_slug: str) -> None:
+        task = asyncio.get_running_loop().create_task(
+            self._check_resolution(coin, old_slug)
+        )
+        self._resolution_tasks.append(task)
+
+    async def _check_resolution(self, coin: str, old_slug: str) -> None:
+        """Check if a finished market has resolved and record win/loss.
+
+        Retries up to 6 times with increasing delays (total ~3 min) to handle
+        the Gamma API lag between market end and price finalization.
+        """
+        positions = [
+            p
+            for p in self._all_positions
+            if p.coin == coin and p.market_slug == old_slug and not p.resolved
+        ]
+        if not positions:
+            return
+
+        # Retry schedule: wait 10s, then 15s, 20s, 30s, 45s, 60s
+        delays = [10, 15, 20, 30, 45, 60]
+        gamma = GammaClient()
+        winner: Optional[str] = None
+
+        for attempt, delay in enumerate(delays):
+            await asyncio.sleep(delay)
+
+            try:
+                market_data = await asyncio.to_thread(
+                    gamma.get_market_by_slug, old_slug
+                )
+                if not market_data:
+                    continue
+
+                prices = gamma.parse_prices(market_data)
+                up_price = prices.get("up", 0.5)
+                down_price = prices.get("down", 0.5)
+
+                if up_price >= 0.90:
+                    winner = "up"
+                    break
+                elif down_price >= 0.90:
+                    winner = "down"
+                    break
+                # else: not resolved yet, keep retrying
+            except Exception as exc:
+                if attempt == len(delays) - 1:
+                    log(f"Resolve error ({old_slug}): {exc}", "error")
+
+        if winner is None:
+            log(f"Resolve: {old_slug} gave up after {len(delays)} attempts", "warning")
+            return
+
+        for pos in positions:
+            pos.resolved = True
+            self.total_resolved += 1
+            if pos.side == winner:
+                pos.won = True
+                pos.payout = pos.fill_size * 1.0
+                profit = pos.payout - pos.cost
+                self.total_wins += 1
+                self.session_pnl += profit
+                outcome_str = f"WIN +${profit:.4f}"
+                log(
+                    f"WIN  {pos.coin}-{pos.side.upper()} "
+                    f"@{pos.fill_price:.2f} -> +${profit:.4f}",
+                    "success",
+                )
+            else:
+                pos.won = False
+                pos.payout = 0.0
+                self.total_losses += 1
+                self.session_pnl -= pos.cost
+                outcome_str = f"LOSS -${pos.cost:.4f}"
+                log(
+                    f"LOSS {pos.coin}-{pos.side.upper()} "
+                    f"@{pos.fill_price:.2f} -> -${pos.cost:.4f}",
+                    "error",
+                )
+
+            # Update persistent trade log
+            _update_trade_log_outcome(
+                pos.order_id, pos.market_slug, pos.coin, pos.side, outcome_str
+            )
+
+    # ------------------------------------------------------------------
+    # Main tick
+    # ------------------------------------------------------------------
+    async def _tick(self) -> None:
+        now = time.time()
+
+        # Check if all active markets ended
+        if self.cycle_state in (CycleState.ACTIVE, CycleState.HOLDING):
+            all_ended = True
+            for coin in COINS:
+                m = self._coin_markets.get(coin)
+                if m and not m.has_ended():
+                    all_ended = False
+                    break
+            if all_ended and any(self._coin_markets.get(c) for c in COINS):
+                if self.cycle_state != CycleState.DONE:
+                    log("All markets ended. Cycle complete.", "info")
+                    self._transition_to_done()
+
+        # Window expiry
+        if (
+            self.cycle_state == CycleState.ACTIVE
+            and self._cycle_deadline > 0
+            and now >= self._cycle_deadline
+        ):
+            log(
+                f"Window expired ({self.cfg.window:.0f}s). Cancelling.",
+                "warning",
+            )
+            await self._cancel_unfilled_orders()
+            self.cycle_state = CycleState.HOLDING
+            fills = len(self._current_positions)
+            log(f"HOLDING {fills} position(s) to expiry.", "trade")
+
+            if self._fill_watcher_task and not self._fill_watcher_task.done():
+                self._fill_watcher_task.cancel()
+
+        # --- Belt-and-suspenders: actively poll for new markets when DONE ---
+        # The MarketManager callbacks should handle this, but if the callback
+        # was missed (exception, race condition, etc.) we detect it here.
+        if self.cycle_state == CycleState.DONE:
+            if now - self._last_done_poll >= 3.0:
+                self._last_done_poll = now
+                for coin in COINS:
+                    mgr = self.managers.get(coin)
+                    if not mgr or not mgr.current_market:
+                        continue
+                    market = mgr.current_market
+                    ms = market.start_timestamp()
+                    if ms is not None and ms != self._cycle_ts:
+                        self._coin_markets[coin] = market
+                        log(f"[poll] New market detected via {coin}", "info")
+                        self._maybe_enter_cycle(coin, market)
+                        break
+
+        # --- Periodic cleanup of completed resolution tasks ---
+        if now - self._last_task_cleanup >= 30.0:
+            self._last_task_cleanup = now
+            self._resolution_tasks = [
+                t for t in self._resolution_tasks if not t.done()
+            ]
+
+        # --- Periodic heartbeat + WS health check (every 5 min) ---
+        if now - self._last_heartbeat_ts >= 300.0:
+            self._last_heartbeat_ts = now
+            uptime_h = (now - self._session_start) / 3600
+            connected = sum(1 for m in self.managers.values() if m.is_connected)
+            pending_res = len(self._resolution_tasks)
+            log(
+                f"[heartbeat] up={uptime_h:.1f}h  WS={connected}/4  "
+                f"cycles={self.cycles_seen}  fills={self.total_fills}  "
+                f"pnl=${self.session_pnl:+.2f}  res_tasks={pending_res}",
+                "info",
+            )
+            # Cap _all_positions to prevent unbounded memory growth:
+            # keep only the last 2000 entries (enough for ~16 hours at max fill rate)
+            if len(self._all_positions) > 2000:
+                self._all_positions = self._all_positions[-2000:]
+
+        # TUI
+        render_interval = 0.5 if _tui_active else 2.0
+        if now - self._last_render_ts >= render_interval:
+            elapsed = max(now - self._status_window_start, 1e-6)
+            tick_rate = self._ticks_window / elapsed
+            since_last = now - self._last_tick_ts if self._last_tick_ts else 0.0
+
+            if _tui_active:
+                self._render_tui(tick_rate, since_last)
+
+            self._last_render_ts = now
+            self._ticks_window = 0
+            self._status_window_start = now
+
+    # ------------------------------------------------------------------
+    # TUI
+    # ------------------------------------------------------------------
+    def _render_tui(self, tick_rate: float, since_last: float) -> None:
+        G = Colors.GREEN
+        R = Colors.RED
+        Y = Colors.YELLOW
+        C = Colors.CYAN
+        B = Colors.BOLD
+        D = Colors.DIM
+        X = Colors.RESET
+        W = 72
+
+        lines: list[str] = []
+        sep = D + "-" * W + X
+        bsep = B + "=" * W + X
+
+        # --- Header ---
+        connected = sum(1 for m in self.managers.values() if m.is_connected)
+        ws_c = G if connected == 4 else (Y if connected > 0 else R)
+
+        countdown = f"{D}--:--{X}"
+        for mgr in self.managers.values():
+            if mgr.current_market:
+                cd = mgr.current_market.get_countdown()
+                if cd and cd[0] >= 0:
+                    countdown = format_countdown(cd[0], cd[1])
+                    break
+
+        sc = {
+            CycleState.ACTIVE: Y, CycleState.HOLDING: C,
+            CycleState.WAITING_MARKET: D, CycleState.DONE: D,
+        }.get(self.cycle_state, D)
+        st = self.cycle_state.value
+        if self.cycle_state == CycleState.ACTIVE:
+            rem = max(0.0, self._cycle_deadline - time.time())
+            st += f" ({rem:.0f}s)"
+
+        up_s = time.time() - self._session_start
+        up_h, up_m = int(up_s // 3600), int((up_s % 3600) // 60)
+        up_str = f"{up_h}h{up_m:02d}m" if up_h else f"{up_m}m"
+        dry = f" {R}DRY{X}" if self.cfg.dry_run else ""
+
+        lines.append(bsep)
+        lines.append(
+            f" {B}Cheap Quote{X}{dry}  {ws_c}WS:{connected}/4{X}"
+            f"  {countdown}  {sc}{st}{X}"
+            f"  {D}{up_str}{X}"
+        )
+        lines.append(
+            f" {D}w={self.cfg.window:.0f}s  p<={self.cfg.price}  sz={self.cfg.size:.0f}{X}"
+        )
+        lines.append(sep)
+
+        # --- 8 prices ---
+        lines.append(
+            f"  {D}{'':4}   {'UP':>8}   {'DOWN':>8}   {'UP ord':>10}   {'DOWN ord':>10}{X}"
+        )
+        for coin in COINS:
+            ua = self._best_asks[coin]["up"]
+            da = self._best_asks[coin]["down"]
+            uc = G if ua <= self.cfg.price else X
+            dc = G if da <= self.cfg.price else X
+            us = self._order_status_str(coin, "up")
+            ds = self._order_status_str(coin, "down")
+            lines.append(
+                f"  {B}{coin:>4}{X}   {uc}{ua:>8.4f}{X}   {dc}{da:>8.4f}{X}"
+                f"   {us:>10}   {ds:>10}"
+            )
+        lines.append(sep)
+
+        # --- Stats (one line) ---
+        pnl_c = G if self.session_pnl >= 0 else R
+        wr = (
+            f"{(self.total_wins / self.total_resolved) * 100:.0f}%"
+            if self.total_resolved > 0 else "--"
+        )
+        lines.append(
+            f" #{self.cycles_seen}  {self.total_fills} fills"
+            f"  {self.total_wins}W/{self.total_losses}L"
+            f"  wr:{wr}"
+            f"  {pnl_c}pnl:${self.session_pnl:+.2f}{X}"
+            f"  spent:${self.total_spent:.2f}"
+        )
+        lines.append(sep)
+
+        # --- Trade history (last 6 fills) ---
+        lines.append(f" {B}Trades:{X}")
+        recent = self._all_positions[-6:] if self._all_positions else []
+        if recent:
+            for p in reversed(recent):
+                ts = datetime.fromtimestamp(p.fill_time).strftime("%H:%M")
+                tag = f"{D}PENDING{X}"
+                if p.resolved:
+                    if p.won:
+                        profit = p.payout - p.cost
+                        tag = f"{G}WIN +${profit:.2f}{X}"
+                    else:
+                        tag = f"{R}LOSS -${p.cost:.2f}{X}"
+                lines.append(
+                    f"  {D}{ts}{X}  {p.coin}-{p.side.upper():<4}"
+                    f"  @{p.fill_price:.2f} x{p.fill_size:.0f}"
+                    f"  ${p.cost:.2f}  {tag}"
+                )
+        else:
+            lines.append(f"  {D}(no fills yet){X}")
+        lines.append(sep)
+
+        # --- Events (last 8) ---
+        lines.append(f" {B}Events:{X}")
+        evts = _log_buffer[-8:] if _log_buffer else []
+        if evts:
+            for msg in evts:
+                lines.append(msg)
+        else:
+            lines.append(f"  {D}(waiting...){X}")
+        lines.append(bsep)
+
+        print("\033[H\033[J" + "\n".join(lines), flush=True)
+
+    def _order_status_str(self, coin: str, side: str) -> str:
+        G = Colors.GREEN
+        Y = Colors.YELLOW
+        D = Colors.DIM
+        X = Colors.RESET
+        for t in self._orders.values():
+            if t.coin == coin and t.side == side:
+                if t.filled:
+                    return f"{G}FILL@{t.fill_price:.2f}{X}"
+                if t.cancelled:
+                    return f"{D}canc{X}"
+                return f"{Y}resting{X}"
+        return f"{D}--{X}"
+
+    # ------------------------------------------------------------------
+    # Cleanup & summary
+    # ------------------------------------------------------------------
+    async def _cleanup(self) -> None:
+        if self._fill_watcher_task and not self._fill_watcher_task.done():
+            self._fill_watcher_task.cancel()
+        for task in self._resolution_tasks:
+            if not task.done():
+                task.cancel()
+        for mgr in self.managers.values():
+            try:
+                await mgr.stop()
+            except Exception:
+                pass
+
+    def _print_summary(self) -> None:
+        print()
+        print("=" * 60)
+        print("  CHEAP QUOTE HUNTER - SESSION SUMMARY")
+        print("=" * 60)
+        print(
+            f"  Config:        window={self.cfg.window:.0f}s"
+            f"  price={self.cfg.price}  size={self.cfg.size}"
+        )
+        print(f"  Dry run:       {self.cfg.dry_run}")
+        print(f"  Cycles seen:   {self.cycles_seen}")
+        print(f"  Orders placed: {self.total_orders_placed}")
+        print(f"  Total fills:   {self.total_fills}")
+        print(
+            f"  Resolved:      {self.total_resolved}"
+            f"  ({self.total_wins}W / {self.total_losses}L)"
+        )
+        print(f"  Total spent:   ${self.total_spent:.4f}")
+        print(f"  Session PnL:   ${self.session_pnl:+.4f}")
+
+        if self.total_resolved > 0:
+            wr = (self.total_wins / self.total_resolved) * 100
+            implied = self.cfg.price * 100
+            print(f"  Win rate:      {wr:.1f}%  (implied: {implied:.1f}%)")
+            edge = wr - implied
+            tag = "POSITIVE" if edge > 0 else "NEGATIVE" if edge < 0 else "NEUTRAL"
+            print(f"  Edge:          {edge:+.1f}pp  ({tag})")
+
+        if self._all_positions:
+            print()
+            print("  All fills:")
+            for p in self._all_positions:
+                res = ""
+                if p.resolved:
+                    res = f"  {'WIN' if p.won else 'LOSS'}"
+                ts = datetime.fromtimestamp(p.fill_time).strftime("%H:%M:%S")
+                print(
+                    f"    {ts}  {p.coin}-{p.side.upper():>4}"
+                    f"  @{p.fill_price:.4f}  x{p.fill_size:.0f}"
+                    f"  cost=${p.cost:.4f}{res}"
+                )
+
+        print("=" * 60)
+        print(f"  Trade log: {TRADE_LOG_FILE}")
+        print("=" * 60)
+
+
+# ===================================================================
+# Helpers
+# ===================================================================
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+# ===================================================================
+# Component builder
+# ===================================================================
+def build_components() -> Tuple[Config, OrderSigner, ClobClient]:
+    config = Config.from_env()
+
+    private_key = os.environ.get("POLY_PRIVATE_KEY", "")
+    if not private_key:
+        print("ERROR: POLY_PRIVATE_KEY is not set")
+        raise SystemExit(1)
+
+    signer = OrderSigner(private_key, chain_id=config.clob.chain_id)
+
+    clob = ClobClient(
+        host=config.clob.host,
+        chain_id=config.clob.chain_id,
+        signature_type=config.clob.signature_type,
+        funder=config.safe_address,
+        signer_address=signer.address,
+        builder_creds=config.builder,
+    )
+
+    api_creds = clob.create_or_derive_api_key(signer)
+    clob.set_api_creds(api_creds)
+
+    return config, signer, clob
+
+
+# ===================================================================
+# CLI
+# ===================================================================
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Cheap Quote Hunter: buy cheap quotes across 4 coins, hold to expiry"
+        )
+    )
+    parser.add_argument(
+        "--window", type=float, default=60.0,
+        help="Seconds from market birth to allow trading (1-300, default: 60)",
+    )
+    parser.add_argument(
+        "--price", type=float, default=0.05,
+        help="Maximum buy price (default: 0.05)",
+    )
+    parser.add_argument(
+        "--size", type=float, default=5.0,
+        help="Shares per order (min 5, default: 5)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Simulate without placing real orders",
+    )
+    parser.add_argument(
+        "--market-check-interval", type=float, default=5.0,
+        help="Seconds between market discovery checks (default: 5)",
+    )
+    args = parser.parse_args()
+
+    cfg = CheapQuoteConfig(
+        window=args.window,
+        price=args.price,
+        size=args.size,
+        dry_run=args.dry_run,
+        market_check_interval=args.market_check_interval,
+    )
+    cfg.validate()
+
+    print()
+    log("Initializing components...", "info")
+    bot_config, signer, clob = build_components()
+    log(f"  EOA:   {signer.address}", "info")
+    log(f"  Proxy: {bot_config.safe_address}", "info")
+    log(f"  Sig:   type {bot_config.clob.signature_type}", "info")
+    if cfg.dry_run:
+        log("  Mode:  DRY RUN", "info")
+    print()
+
+    strategy = CheapQuoteStrategy(cfg, bot_config, signer, clob)
+    asyncio.run(strategy.run())
+
+
+if __name__ == "__main__":
+    main()

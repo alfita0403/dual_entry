@@ -398,7 +398,11 @@ class MarketManager:
 
         Uses accelerated polling (every 1s) when the current market has ended
         or is about to end, to detect the next market as fast as possible.
+
+        Wraps the loop body in try/except so transient errors (network
+        timeouts, malformed API responses, etc.) never kill the task.
         """
+        _consecutive_errors = 0
         while self._running:
             # Determine sleep interval: fast when market ended/ending, normal otherwise
             sleep_interval = self.market_check_interval
@@ -414,40 +418,55 @@ class MarketManager:
             if not self._running:
                 break
 
-            old_market = self.current_market
-            old_tokens = set(old_market.token_ids.values()) if old_market else set()
-            old_slug = old_market.slug if old_market else None
+            try:
+                old_market = self.current_market
+                old_tokens = set(old_market.token_ids.values()) if old_market else set()
+                old_slug = old_market.slug if old_market else None
 
-            # Run synchronous HTTP call in thread pool to avoid blocking
-            market = await asyncio.to_thread(self.discover_market, update_state=False)
+                # Run synchronous HTTP call in thread pool to avoid blocking
+                market = await asyncio.to_thread(self.discover_market, update_state=False)
 
-            if not market:
-                continue
+                if not market:
+                    _consecutive_errors = 0  # None is normal during transitions
+                    continue
 
-            # Check if market changed and resubscribe
-            new_tokens = set(market.token_ids.values())
-            if new_tokens == old_tokens:
+                # Check if market changed and resubscribe
+                new_tokens = set(market.token_ids.values())
+                if new_tokens == old_tokens:
+                    self._update_current_market(market)
+                    _consecutive_errors = 0
+                    continue
+
+                if not (self.auto_switch_market and self.ws):
+                    self._update_current_market(market)
+                    _consecutive_errors = 0
+                    continue
+
+                if not self._should_switch_market(old_market, market):
+                    _consecutive_errors = 0
+                    continue
+
+                # Market changed - resubscribe to new tokens
+                await self.ws.subscribe(list(new_tokens), replace=True)
                 self._update_current_market(market)
-                continue
 
-            if not (self.auto_switch_market and self.ws):
-                self._update_current_market(market)
-                continue
+                # Fire market change callbacks in main thread
+                if old_slug and old_slug != market.slug:
+                    for callback in self._on_market_change_callbacks:
+                        try:
+                            callback(old_slug, market.slug)
+                        except Exception:
+                            pass
 
-            if not self._should_switch_market(old_market, market):
-                continue
+                _consecutive_errors = 0
 
-            # Market changed - resubscribe to new tokens
-            await self.ws.subscribe(list(new_tokens), replace=True)
-            self._update_current_market(market)
-
-            # Fire market change callbacks in main thread
-            if old_slug and old_slug != market.slug:
-                for callback in self._on_market_change_callbacks:
-                    try:
-                        callback(old_slug, market.slug)
-                    except Exception:
-                        pass
+            except asyncio.CancelledError:
+                raise  # Let cancellation propagate
+            except Exception:
+                _consecutive_errors += 1
+                # Back off on repeated errors to avoid tight error loops
+                if _consecutive_errors >= 5:
+                    await asyncio.sleep(min(_consecutive_errors * 2, 30))
 
     async def start(self) -> bool:
         """
