@@ -328,17 +328,20 @@ class CheapQuoteStrategy:
 
                 self.total_fills += 1
                 self.total_spent += cost
+                # Assume loss immediately (deduct cost)
+                self.session_pnl -= cost
 
                 if outcome.startswith("WIN"):
                     self.total_wins += 1
                     self.total_resolved += 1
-                    # WIN +$X.XX -> extract profit
+                    # WIN +$X.XX -> profit = payout - cost, so payout = profit + cost
                     profit_str = outcome.replace("WIN +$", "").replace("WIN +", "")
-                    self.session_pnl += _to_float(profit_str)
+                    payout = _to_float(profit_str) + cost
+                    self.session_pnl += payout
                 elif outcome.startswith("LOSS"):
                     self.total_losses += 1
                     self.total_resolved += 1
-                    self.session_pnl -= cost
+                    # Already deducted cost above; nothing more to do
         except Exception:
             pass  # If log is corrupted, start fresh
 
@@ -784,6 +787,7 @@ class CheapQuoteStrategy:
         self.total_fills += 1
         cost = tracker.fill_size * tracker.fill_price
         self.total_spent += cost
+        self.session_pnl -= cost  # assume loss immediately
 
         pos = PositionRecord(
             coin=tracker.coin,
@@ -935,7 +939,8 @@ class CheapQuoteStrategy:
                 pos.payout = pos.fill_size * 1.0
                 profit = pos.payout - pos.cost
                 self.total_wins += 1
-                self.session_pnl += profit
+                # Cost was already deducted on fill; add back full payout
+                self.session_pnl += pos.payout
                 outcome_str = f"WIN +${profit:.4f}"
                 log(
                     f"WIN  {pos.coin}-{pos.side.upper()} "
@@ -946,7 +951,7 @@ class CheapQuoteStrategy:
                 pos.won = False
                 pos.payout = 0.0
                 self.total_losses += 1
-                self.session_pnl -= pos.cost
+                # Cost was already deducted on fill; nothing to do
                 outcome_str = f"LOSS -${pos.cost:.4f}"
                 log(
                     f"LOSS {pos.coin}-{pos.side.upper()} "
