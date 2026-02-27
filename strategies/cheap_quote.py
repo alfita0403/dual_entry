@@ -693,13 +693,13 @@ class CheapQuoteStrategy:
                     ask = self._best_asks.get(tracker.coin, {}).get(tracker.side, 1.0)
                     if ask <= self.cfg.price:
                         tracker.filled = True
-                        tracker.fill_price = ask
+                        tracker.fill_price = self.cfg.price  # fill at limit price
                         tracker.fill_size = self.cfg.size
                         tracker.fill_time = time.time()
                         self._record_fill(tracker)
                         log(
-                            f"[DRY] FILLED {tracker.coin}-{tracker.side.upper()} "
-                            f"@ {ask:.4f}",
+                            f"[SIM] FILLED {tracker.coin}-{tracker.side.upper()} "
+                            f"@ {self.cfg.price:.4f}",
                             "success",
                         )
                     continue
