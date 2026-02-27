@@ -340,21 +340,22 @@ class CheapQuoteStrategy:
                 outcome = fields.get("outcome", "")
 
                 self.total_fills += 1
+                self.total_losses += 1  # assume loss
                 self.total_spent += cost
                 # Assume loss immediately (deduct cost)
                 self.session_pnl -= cost
 
                 if outcome.startswith("WIN"):
                     self.total_wins += 1
+                    self.total_losses -= 1  # flip from assumed loss to win
                     self.total_resolved += 1
                     # WIN +$X.XX -> profit = payout - cost, so payout = profit + cost
                     profit_str = outcome.replace("WIN +$", "").replace("WIN +", "")
                     payout = _to_float(profit_str) + cost
                     self.session_pnl += payout
                 elif outcome.startswith("LOSS"):
-                    self.total_losses += 1
+                    # Already counted as loss; just mark resolved
                     self.total_resolved += 1
-                    # Already deducted cost above; nothing more to do
         except Exception:
             pass  # If log is corrupted, start fresh
 
@@ -798,6 +799,7 @@ class CheapQuoteStrategy:
     # ------------------------------------------------------------------
     def _record_fill(self, tracker: OrderTracker) -> None:
         self.total_fills += 1
+        self.total_losses += 1  # assume loss immediately
         cost = tracker.fill_size * tracker.fill_price
         self.total_spent += cost
         self.session_pnl -= cost  # assume loss immediately
@@ -952,6 +954,7 @@ class CheapQuoteStrategy:
                 pos.payout = pos.fill_size * 1.0
                 profit = pos.payout - pos.cost
                 self.total_wins += 1
+                self.total_losses -= 1  # flip from assumed loss to win
                 # Cost was already deducted on fill; add back full payout
                 self.session_pnl += pos.payout
                 outcome_str = f"WIN +${profit:.4f}"
@@ -963,8 +966,7 @@ class CheapQuoteStrategy:
             else:
                 pos.won = False
                 pos.payout = 0.0
-                self.total_losses += 1
-                # Cost was already deducted on fill; nothing to do
+                # Already counted as loss on fill; nothing to change
                 outcome_str = f"LOSS -${pos.cost:.4f}"
                 log(
                     f"LOSS {pos.coin}-{pos.side.upper()} "
