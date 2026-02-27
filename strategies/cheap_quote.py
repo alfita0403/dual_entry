@@ -703,6 +703,11 @@ class CheapQuoteStrategy:
                 continue
 
             for order_id, tracker in unfilled:
+                # Re-check: opposite cancel may have flagged this tracker
+                # after the snapshot was taken (up_mode cancel-opposite).
+                if tracker.filled or tracker.cancelled:
+                    continue
+
                 if self.cfg.dry_run:
                     ask = self._best_asks.get(tracker.coin, {}).get(tracker.side, 1.0)
                     # Normal: fill when ask drops to limit (cheap quotes)
