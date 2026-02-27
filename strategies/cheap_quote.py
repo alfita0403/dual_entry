@@ -314,6 +314,7 @@ class CheapQuoteStrategy:
         self._last_heartbeat_ts: float = 0.0
         self._last_done_poll: float = 0.0
         self._last_task_cleanup: float = 0.0
+        self._last_sweep_ts: float = 0.0
         self._ws_reconnect_count: int = 0
         self._scheduled_slugs: Set[str] = set()
 
@@ -946,7 +947,13 @@ class CheapQuoteStrategy:
             log(f"Resolve: {old_slug} not closed after {len(delays)} attempts", "warning")
             return
 
+        self._apply_resolution(positions, winner)
+
+    def _apply_resolution(self, positions: List[PositionRecord], winner: str) -> None:
+        """Apply win/loss outcome to a list of positions."""
         for pos in positions:
+            if pos.resolved:
+                continue
             pos.resolved = True
             self.total_resolved += 1
             if pos.side == winner:
@@ -979,6 +986,52 @@ class CheapQuoteStrategy:
                 pos.order_id, pos.market_slug, pos.coin, pos.side, outcome_str,
                 log_file=self.log_file,
             )
+
+    # ------------------------------------------------------------------
+    # Periodic sweep: resolve any PENDING positions
+    # ------------------------------------------------------------------
+    async def _sweep_pending(self) -> None:
+        """Scan all unresolved positions and try to resolve via Gamma API.
+
+        Groups positions by market_slug, makes ONE API call per slug.
+        If market is closed, resolves immediately. If not, skips (retried
+        next sweep).  This catches anything missed by the one-shot
+        resolution tasks.
+        """
+        # Group unresolved by slug
+        pending: Dict[str, List[PositionRecord]] = {}
+        for pos in self._all_positions:
+            if not pos.resolved:
+                pending.setdefault(pos.market_slug, []).append(pos)
+
+        if not pending:
+            return
+
+        gamma = GammaClient()
+        for slug, positions in pending.items():
+            try:
+                market_data = await asyncio.to_thread(
+                    gamma.get_market_by_slug, slug
+                )
+                if not market_data or not market_data.get("closed", False):
+                    continue
+
+                raw_prices = market_data.get("outcomePrices", "[]")
+                raw_outcomes = market_data.get("outcomes", "[]")
+                prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+                outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+
+                winner = None
+                for idx, price in enumerate(prices):
+                    if str(price) == "1" and idx < len(outcomes):
+                        winner = str(outcomes[idx]).lower()
+                        break
+
+                if winner:
+                    log(f"[sweep] Resolved: {slug} -> {winner.upper()}", "info")
+                    self._apply_resolution(positions, winner)
+            except Exception as exc:
+                log(f"[sweep] error ({slug}): {exc}", "warning")
 
     # ------------------------------------------------------------------
     # Main tick
@@ -1041,6 +1094,11 @@ class CheapQuoteStrategy:
                     if m:
                         log(f"[poll] New market detected via {new_market_coin}", "info")
                         self._maybe_enter_cycle(new_market_coin, m)
+
+        # --- Periodic sweep: resolve PENDING positions (every 2 min) ---
+        if now - self._last_sweep_ts >= 120.0:
+            self._last_sweep_ts = now
+            asyncio.get_running_loop().create_task(self._sweep_pending())
 
         # --- Periodic cleanup of completed resolution tasks ---
         if now - self._last_task_cleanup >= 30.0:
