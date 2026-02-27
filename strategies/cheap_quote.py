@@ -103,8 +103,10 @@ def _append_trade_log(
     pos: "PositionRecord",
     cfg: "CheapQuoteConfig",
     outcome: str = "PENDING",
+    log_file: Optional[Path] = None,
 ) -> None:
     """Append one line per fill to the persistent trade log file."""
+    target = log_file or TRADE_LOG_FILE
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     now_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = (
@@ -117,23 +119,25 @@ def _append_trade_log(
         f"dry_run={cfg.dry_run} | outcome={outcome}"
     )
     try:
-        with open(TRADE_LOG_FILE, "a", encoding="utf-8") as f:
+        with open(target, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception as exc:
         log(f"Trade log write error: {exc}", "warning")
 
 
 def _update_trade_log_outcome(
-    order_id: str, market_slug: str, coin: str, side: str, outcome: str
+    order_id: str, market_slug: str, coin: str, side: str, outcome: str,
+    log_file: Optional[Path] = None,
 ) -> None:
     """Update the outcome field for a specific trade in the log file.
 
     Matches by order_id first (unique key), falls back to market+coin+side.
     """
+    target = log_file or TRADE_LOG_FILE
     try:
-        if not TRADE_LOG_FILE.exists():
+        if not target.exists():
             return
-        lines = TRADE_LOG_FILE.read_text(encoding="utf-8").splitlines()
+        lines = target.read_text(encoding="utf-8").splitlines()
         updated = []
         for line in lines:
             matched = False
@@ -148,7 +152,7 @@ def _update_trade_log_outcome(
             if matched and "outcome=PENDING" in line:
                 line = line.replace("outcome=PENDING", f"outcome={outcome}")
             updated.append(line)
-        TRADE_LOG_FILE.write_text("\n".join(updated) + "\n", encoding="utf-8")
+        target.write_text("\n".join(updated) + "\n", encoding="utf-8")
     except Exception:
         pass
 
@@ -165,6 +169,7 @@ class CheapQuoteConfig:
     size: float = 5.0  # shares per order
     dry_run: bool = False
     market_check_interval: float = 5.0
+    name: str = ""  # instance identifier (auto-generated if empty)
 
     def validate(self) -> None:
         if not 0.01 <= self.price <= 0.99:
@@ -238,6 +243,14 @@ class CheapQuoteStrategy:
         self.signer = signer
         self.clob = clob
 
+        # Per-instance log file: sim instances get their own file
+        if cfg.dry_run and cfg.name:
+            self.log_file = (
+                TRADE_LOG_FILE.parent / f"cheap_quote_sim_{cfg.name}.txt"
+            )
+        else:
+            self.log_file = TRADE_LOG_FILE
+
         # 4 MarketManagers
         self.managers: Dict[str, MarketManager] = {}
         for coin in COINS:
@@ -308,11 +321,11 @@ class CheapQuoteStrategy:
     # Restore stats from trade log
     # ------------------------------------------------------------------
     def _load_stats_from_log(self) -> None:
-        """Read cheap_quote_trades.txt and restore cumulative stats."""
-        if not TRADE_LOG_FILE.exists():
+        """Read trade log and restore cumulative stats."""
+        if not self.log_file.exists():
             return
         try:
-            for line in TRADE_LOG_FILE.read_text(encoding="utf-8").splitlines():
+            for line in self.log_file.read_text(encoding="utf-8").splitlines():
                 if not line.strip():
                     continue
                 fields = {}
@@ -356,7 +369,7 @@ class CheapQuoteStrategy:
         log(f"  price:   {self.cfg.price}")
         log(f"  size:    {self.cfg.size} shares")
         log(f"  dry_run: {self.cfg.dry_run}")
-        log(f"  log:     {TRADE_LOG_FILE}")
+        log(f"  log:     {self.log_file}")
         print()
 
         try:
@@ -803,7 +816,7 @@ class CheapQuoteStrategy:
         self._all_positions.append(pos)
 
         # Append to persistent trade log
-        _append_trade_log(pos, self.cfg, outcome="PENDING")
+        _append_trade_log(pos, self.cfg, outcome="PENDING", log_file=self.log_file)
 
     # ------------------------------------------------------------------
     # Cancellation
@@ -961,7 +974,8 @@ class CheapQuoteStrategy:
 
             # Update persistent trade log
             _update_trade_log_outcome(
-                pos.order_id, pos.market_slug, pos.coin, pos.side, outcome_str
+                pos.order_id, pos.market_slug, pos.coin, pos.side, outcome_str,
+                log_file=self.log_file,
             )
 
     # ------------------------------------------------------------------
@@ -1111,7 +1125,12 @@ class CheapQuoteStrategy:
         up_s = time.time() - self._session_start
         up_h, up_m = int(up_s // 3600), int((up_s % 3600) // 60)
         up_str = f"{up_h}h{up_m:02d}m" if up_h else f"{up_m}m"
-        dry = f" {R}[DRY]{X}" if self.cfg.dry_run else ""
+        if self.cfg.dry_run and self.cfg.name:
+            dry = f" {Y}[SIM: {self.cfg.name}]{X}"
+        elif self.cfg.dry_run:
+            dry = f" {R}[DRY]{X}"
+        else:
+            dry = ""
 
         lines.append("")
         lines.append(
@@ -1274,7 +1293,7 @@ class CheapQuoteStrategy:
                 )
 
         print("=" * 60)
-        print(f"  Trade log: {TRADE_LOG_FILE}")
+        print(f"  Trade log: {self.log_file}")
         print("=" * 60)
 
 
@@ -1342,10 +1361,19 @@ def main() -> None:
         help="Simulate without placing real orders",
     )
     parser.add_argument(
+        "--name", type=str, default="",
+        help="Instance name (auto-generated from config if empty)",
+    )
+    parser.add_argument(
         "--market-check-interval", type=float, default=5.0,
         help="Seconds between market discovery checks (default: 5)",
     )
     args = parser.parse_args()
+
+    # Auto-generate instance name from config when in dry-run
+    name = args.name
+    if not name and args.dry_run:
+        name = f"w{int(args.window)}_p{args.price}_s{int(args.size)}"
 
     cfg = CheapQuoteConfig(
         window=args.window,
@@ -1353,6 +1381,7 @@ def main() -> None:
         size=args.size,
         dry_run=args.dry_run,
         market_check_interval=args.market_check_interval,
+        name=name,
     )
     cfg.validate()
 
@@ -1363,7 +1392,7 @@ def main() -> None:
     log(f"  Proxy: {bot_config.safe_address}", "info")
     log(f"  Sig:   type {bot_config.clob.signature_type}", "info")
     if cfg.dry_run:
-        log("  Mode:  DRY RUN", "info")
+        log(f"  Mode:  SIM [{cfg.name}]", "info")
     print()
 
     strategy = CheapQuoteStrategy(cfg, bot_config, signer, clob)
