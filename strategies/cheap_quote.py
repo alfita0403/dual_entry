@@ -451,6 +451,9 @@ class CheapQuoteStrategy:
         market = mgr.current_market
         if market:
             self._coin_markets[coin] = market
+            # Invalidate stale orderbook data from old market so the
+            # fill-watcher doesn't see e.g. 0.01 from the resolved side.
+            self._best_asks[coin] = {"up": 1.0, "down": 1.0}
             log(f"{coin} -> {new_slug}", "info")
             self._maybe_enter_cycle(coin, market)
 
@@ -509,6 +512,9 @@ class CheapQuoteStrategy:
         self._orders_placed_this_cycle = 0
         self._coins_entered.clear()
         self.cycles_seen += 1
+        # Reset all orderbook caches — old market quotes are invalid for
+        # the new cycle.  Fills won't trigger until fresh WS data arrives.
+        self._best_asks = {c: {"up": 1.0, "down": 1.0} for c in COINS}
 
         if now >= deadline:
             market_age = now - self._cycle_start_ts
@@ -993,22 +999,61 @@ class CheapQuoteStrategy:
     async def _sweep_pending(self) -> None:
         """Scan all unresolved positions and try to resolve via Gamma API.
 
+        Two phases:
+        1. In-memory: scan ``_all_positions`` for unresolved PositionRecords.
+        2. Log-file:  scan ``self.log_file`` for ``outcome=PENDING`` lines
+           that have *no* matching in-memory record (orphaned after restart).
+
         Groups positions by market_slug, makes ONE API call per slug.
-        If market is closed, resolves immediately. If not, skips (retried
-        next sweep).  This catches anything missed by the one-shot
-        resolution tasks.
+        If market is closed, resolves immediately.  If not, skips (retried
+        next sweep).
         """
-        # Group unresolved by slug
+        # --- Phase 1: in-memory positions ---
         pending: Dict[str, List[PositionRecord]] = {}
+        in_memory_order_ids: Set[str] = set()
         for pos in self._all_positions:
+            if pos.order_id:
+                in_memory_order_ids.add(pos.order_id)
             if not pos.resolved:
                 pending.setdefault(pos.market_slug, []).append(pos)
 
-        if not pending:
+        # --- Phase 2: orphaned PENDING entries in log file ---
+        # These exist when the process restarted after fills were recorded
+        # but before they were resolved.  _load_stats_from_log restores
+        # aggregate stats (treating PENDING as a loss), but does NOT
+        # recreate PositionRecord objects.  We must resolve them here.
+        orphaned_pending: Dict[str, List[Dict[str, str]]] = {}
+        try:
+            if self.log_file.exists():
+                for line in self.log_file.read_text(encoding="utf-8").splitlines():
+                    if "outcome=PENDING" not in line:
+                        continue
+                    # Parse key=value fields
+                    fields: Dict[str, str] = {}
+                    for part in line.split("|"):
+                        part = part.strip()
+                        if "=" in part:
+                            k, v = part.split("=", 1)
+                            fields[k.strip()] = v.strip()
+                    oid = fields.get("order_id", "")
+                    slug = fields.get("market", "")
+                    if not slug:
+                        continue
+                    # Skip if already tracked in memory (Phase 1 handles it)
+                    if oid and oid in in_memory_order_ids:
+                        continue
+                    orphaned_pending.setdefault(slug, []).append(fields)
+        except Exception as exc:
+            log(f"[sweep] log scan error: {exc}", "warning")
+
+        if not pending and not orphaned_pending:
             return
 
+        # Collect all slugs we need to query
+        all_slugs = set(pending.keys()) | set(orphaned_pending.keys())
+
         gamma = GammaClient()
-        for slug, positions in pending.items():
+        for slug in all_slugs:
             try:
                 market_data = await asyncio.to_thread(
                     gamma.get_market_by_slug, slug
@@ -1027,9 +1072,55 @@ class CheapQuoteStrategy:
                         winner = str(outcomes[idx]).lower()
                         break
 
-                if winner:
+                if not winner:
+                    continue
+
+                # Resolve in-memory positions (Phase 1)
+                if slug in pending:
                     log(f"[sweep] Resolved: {slug} -> {winner.upper()}", "info")
-                    self._apply_resolution(positions, winner)
+                    self._apply_resolution(pending[slug], winner)
+
+                # Resolve orphaned log-file entries (Phase 2)
+                if slug in orphaned_pending:
+                    for entry in orphaned_pending[slug]:
+                        oid = entry.get("order_id", "")
+                        coin = entry.get("coin", "?")
+                        side = entry.get("side", "?").lower()
+                        cost_str = entry.get("cost", "0").lstrip("$")
+                        cost = _to_float(cost_str)
+                        size_str = entry.get("size", "0")
+                        fill_size = _to_float(size_str)
+
+                        is_win = (side == winner)
+
+                        if is_win:
+                            payout = fill_size * 1.0
+                            profit = payout - cost
+                            outcome_str = f"WIN +${profit:.4f}"
+                            self.total_wins += 1
+                            self.total_losses -= 1
+                            self.session_pnl += payout
+                            log(
+                                f"[sweep-orphan] WIN  {coin}-{side.upper()} "
+                                f"@${cost/fill_size if fill_size else 0:.2f} "
+                                f"-> +${profit:.4f}",
+                                "success",
+                            )
+                        else:
+                            outcome_str = f"LOSS -${cost:.4f}"
+                            # Already counted as loss on restore; nothing to change
+                            log(
+                                f"[sweep-orphan] LOSS {coin}-{side.upper()} "
+                                f"@${cost/fill_size if fill_size else 0:.2f} "
+                                f"-> -${cost:.4f}",
+                                "error",
+                            )
+
+                        self.total_resolved += 1
+                        _update_trade_log_outcome(
+                            oid, slug, coin, side, outcome_str,
+                            log_file=self.log_file,
+                        )
             except Exception as exc:
                 log(f"[sweep] error ({slug}): {exc}", "warning")
 
