@@ -1426,8 +1426,8 @@ class CheapQuoteStrategy:
         # --- Stats ---
         pnl_c = G if self.session_pnl >= 0 else R
         wr = (
-            f"{(self.total_wins / self.total_fills) * 100:.0f}%"
-            if self.total_fills > 0 else "--"
+            f"{(self.total_wins / self.total_resolved) * 100:.0f}%"
+            if self.total_resolved > 0 else "--"
         )
         lines.append(
             f"  {B}{self.total_fills}{X} fills"
@@ -1524,7 +1524,7 @@ class CheapQuoteStrategy:
         print(f"  Session PnL:   ${self.session_pnl:+.4f}")
 
         if self.total_fills > 0:
-            wr = (self.total_wins / self.total_fills) * 100
+            wr = (self.total_wins / self.total_resolved) * 100 if self.total_resolved > 0 else 0.0
             implied = self.cfg.price * 100
             print(f"  Win rate:      {wr:.1f}%  (implied: {implied:.1f}%)")
             edge = wr - implied
