@@ -343,22 +343,18 @@ class CheapQuoteStrategy:
                 outcome = fields.get("outcome", "")
 
                 self.total_fills += 1
-                self.total_losses += 1  # assume loss
                 self.total_spent += cost
-                # Assume loss immediately (deduct cost)
-                self.session_pnl -= cost
+                # PnL and W/L only change on resolution.
 
                 if outcome.startswith("WIN"):
                     self.total_wins += 1
-                    self.total_losses -= 1  # flip from assumed loss to win
                     self.total_resolved += 1
-                    # WIN +$X.XX -> profit = payout - cost, so payout = profit + cost
                     profit_str = outcome.replace("WIN +$", "").replace("WIN +", "")
-                    payout = _to_float(profit_str) + cost
-                    self.session_pnl += payout
+                    self.session_pnl += _to_float(profit_str)
                 elif outcome.startswith("LOSS"):
-                    # Already counted as loss; just mark resolved
+                    self.total_losses += 1
                     self.total_resolved += 1
+                    self.session_pnl -= cost
         except Exception:
             pass  # If log is corrupted, start fresh
 
@@ -827,10 +823,9 @@ class CheapQuoteStrategy:
     # ------------------------------------------------------------------
     def _record_fill(self, tracker: OrderTracker) -> None:
         self.total_fills += 1
-        self.total_losses += 1  # assume loss immediately
         cost = tracker.fill_size * tracker.fill_price
         self.total_spent += cost
-        self.session_pnl -= cost  # assume loss immediately
+        # PnL and W/L only change on resolution, not on fill.
 
         pos = PositionRecord(
             coin=tracker.coin,
@@ -1039,9 +1034,7 @@ class CheapQuoteStrategy:
                 pos.payout = pos.fill_size * 1.0
                 profit = pos.payout - pos.cost
                 self.total_wins += 1
-                self.total_losses -= 1  # flip from assumed loss to win
-                # Cost was already deducted on fill; add back full payout
-                self.session_pnl += pos.payout
+                self.session_pnl += profit
                 outcome_str = f"WIN +${profit:.4f}"
                 log(
                     f"WIN  {pos.coin}-{pos.side.upper()} "
@@ -1051,7 +1044,8 @@ class CheapQuoteStrategy:
             else:
                 pos.won = False
                 pos.payout = 0.0
-                # Already counted as loss on fill; nothing to change
+                self.total_losses += 1
+                self.session_pnl -= pos.cost
                 outcome_str = f"LOSS -${pos.cost:.4f}"
                 log(
                     f"LOSS {pos.coin}-{pos.side.upper()} "
@@ -1181,8 +1175,7 @@ class CheapQuoteStrategy:
                             profit = payout - cost
                             outcome_str = f"WIN +${profit:.4f}"
                             self.total_wins += 1
-                            self.total_losses -= 1
-                            self.session_pnl += payout
+                            self.session_pnl += profit
                             log(
                                 f"[sweep-orphan] WIN  {coin}-{side.upper()} "
                                 f"@${cost/fill_size if fill_size else 0:.2f} "
@@ -1191,7 +1184,8 @@ class CheapQuoteStrategy:
                             )
                         else:
                             outcome_str = f"LOSS -${cost:.4f}"
-                            # Already counted as loss on restore; nothing to change
+                            self.total_losses += 1
+                            self.session_pnl -= cost
                             log(
                                 f"[sweep-orphan] LOSS {coin}-{side.upper()} "
                                 f"@${cost/fill_size if fill_size else 0:.2f} "
