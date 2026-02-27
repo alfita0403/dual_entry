@@ -168,6 +168,7 @@ class CheapQuoteConfig:
     price: float = 0.05  # max buy price (limit)
     size: float = 5.0  # shares per order
     dry_run: bool = False
+    up_mode: bool = False  # buy when ask >= price (probable outcomes)
     market_check_interval: float = 5.0
     name: str = ""  # instance identifier (auto-generated if empty)
 
@@ -704,7 +705,13 @@ class CheapQuoteStrategy:
             for order_id, tracker in unfilled:
                 if self.cfg.dry_run:
                     ask = self._best_asks.get(tracker.coin, {}).get(tracker.side, 1.0)
-                    if ask <= self.cfg.price:
+                    # Normal: fill when ask drops to limit (cheap quotes)
+                    # Up mode: fill when ask rises to threshold (probable)
+                    fill_hit = (
+                        ask >= self.cfg.price if self.cfg.up_mode
+                        else ask <= self.cfg.price
+                    )
+                    if fill_hit:
                         tracker.filled = True
                         tracker.fill_price = self.cfg.price  # fill at limit price
                         tracker.fill_size = self.cfg.size
@@ -1323,9 +1330,10 @@ class CheapQuoteStrategy:
             f"   {sc}{B}{st}{X}"
             f"   {D}{up_str}{X}"
         )
+        mode_str = f"  {Y}UP{X}" if self.cfg.up_mode else ""
         lines.append(
             f"  {D}limit {self.cfg.price}  window {self.cfg.window:.0f}s"
-            f"  size {self.cfg.size:.0f}  cycle #{self.cycles_seen}{X}"
+            f"  size {self.cfg.size:.0f}  cycle #{self.cycles_seen}{X}{mode_str}"
         )
         hsep()
 
@@ -1341,9 +1349,13 @@ class CheapQuoteStrategy:
         for coin in COINS:
             ua = self._best_asks[coin]["up"]
             da = self._best_asks[coin]["down"]
-            # Highlight prices at or below our limit
-            uc = f"{G}{B}" if ua <= self.cfg.price else D
-            dc = f"{G}{B}" if da <= self.cfg.price else D
+            # Highlight prices that would trigger a fill
+            if self.cfg.up_mode:
+                uc = f"{G}{B}" if ua >= self.cfg.price else D
+                dc = f"{G}{B}" if da >= self.cfg.price else D
+            else:
+                uc = f"{G}{B}" if ua <= self.cfg.price else D
+                dc = f"{G}{B}" if da <= self.cfg.price else D
             us = self._order_status_str(coin, "up")
             ds = self._order_status_str(coin, "down")
             lines.append(
@@ -1544,6 +1556,10 @@ def main() -> None:
         help="Simulate without placing real orders",
     )
     parser.add_argument(
+        "--up", action="store_true",
+        help="Buy when ask >= price (probable outcomes) instead of ask <= price",
+    )
+    parser.add_argument(
         "--name", type=str, default="",
         help="Instance name (auto-generated from config if empty)",
     )
@@ -1556,13 +1572,15 @@ def main() -> None:
     # Auto-generate instance name from config when in dry-run
     name = args.name
     if not name and args.dry_run:
-        name = f"w{int(args.window)}_p{args.price}_s{int(args.size)}"
+        up_tag = "_up" if args.up else ""
+        name = f"w{int(args.window)}_p{args.price}_s{int(args.size)}{up_tag}"
 
     cfg = CheapQuoteConfig(
         window=args.window,
         price=args.price,
         size=args.size,
         dry_run=args.dry_run,
+        up_mode=args.up,
         market_check_interval=args.market_check_interval,
         name=name,
     )
