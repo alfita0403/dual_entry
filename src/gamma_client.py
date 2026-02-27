@@ -14,7 +14,7 @@ Example:
 
 import json
 from typing import Optional, Dict, Any, List
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .http import ThreadLocalSessionMixin
 
@@ -147,8 +147,9 @@ class GammaClient(ThreadLocalSessionMixin):
         # Calculate next 15-minute window
         minute = ((now.minute // 15) + 1) * 15
         if minute >= 60:
-            next_window = now.replace(
-                hour=now.hour + 1, minute=0, second=0, microsecond=0
+            next_window = (
+                now.replace(minute=0, second=0, microsecond=0)
+                + timedelta(hours=1)
             )
         else:
             next_window = now.replace(minute=minute, second=0, microsecond=0)
@@ -217,8 +218,9 @@ class GammaClient(ThreadLocalSessionMixin):
         # Calculate next 5-minute window
         minute = ((now.minute // 5) + 1) * 5
         if minute >= 60:
-            next_window = now.replace(
-                hour=now.hour + 1, minute=0, second=0, microsecond=0
+            next_window = (
+                now.replace(minute=0, second=0, microsecond=0)
+                + timedelta(hours=1)
             )
         else:
             next_window = now.replace(minute=minute, second=0, microsecond=0)

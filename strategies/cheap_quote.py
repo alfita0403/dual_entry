@@ -315,6 +315,7 @@ class CheapQuoteStrategy:
         self._last_done_poll: float = 0.0
         self._last_task_cleanup: float = 0.0
         self._last_sweep_ts: float = 0.0
+        self._sweep_task: Optional[asyncio.Task] = None
         self._ws_reconnect_count: int = 0
         self._scheduled_slugs: Set[str] = set()
 
@@ -515,6 +516,8 @@ class CheapQuoteStrategy:
         # Reset all orderbook caches — old market quotes are invalid for
         # the new cycle.  Fills won't trigger until fresh WS data arrives.
         self._best_asks = {c: {"up": 1.0, "down": 1.0} for c in COINS}
+        # Clear fee cache — token IDs change every cycle.
+        self._fee_rate_cache.clear()
 
         if now >= deadline:
             market_age = now - self._cycle_start_ts
@@ -572,12 +575,14 @@ class CheapQuoteStrategy:
             if not t.filled and not t.cancelled:
                 t.cancelled = True
 
-        # Schedule resolution using the market_slug stored on the
-        # positions themselves (immune to _coin_markets race).
-        if self._current_positions:
-            slug = self._current_positions[0].market_slug
-            if slug:
-                self._schedule_resolution_all(slug)
+        # Schedule resolution for ALL unique slugs in current positions
+        # (each coin has a different slug, e.g. btc-updown-5m-X vs
+        # eth-updown-5m-X).  Previously only the first slug was scheduled.
+        seen_slugs: Set[str] = set()
+        for pos in self._current_positions:
+            if pos.market_slug and pos.market_slug not in seen_slugs:
+                seen_slugs.add(pos.market_slug)
+                self._schedule_resolution_all(pos.market_slug)
 
     # ------------------------------------------------------------------
     # Order placement
@@ -877,9 +882,11 @@ class CheapQuoteStrategy:
         if slug in self._scheduled_slugs:
             return
         self._scheduled_slugs.add(slug)
-        # Cap the set to prevent unbounded growth
+        # Cap the set to prevent unbounded growth.  Clear entirely when
+        # too large — duplicate scheduling is harmless (resolution tasks
+        # check pos.resolved and exit early if already done).
         if len(self._scheduled_slugs) > 500:
-            self._scheduled_slugs = set(list(self._scheduled_slugs)[-200:])
+            self._scheduled_slugs.clear()
 
         task = asyncio.get_running_loop().create_task(
             self._check_resolution_for_slug(slug)
@@ -1010,10 +1017,16 @@ class CheapQuoteStrategy:
         """
         # --- Phase 1: in-memory positions ---
         pending: Dict[str, List[PositionRecord]] = {}
-        in_memory_order_ids: Set[str] = set()
+        in_memory_keys: Set[str] = set()
         for pos in self._all_positions:
+            # Track by order_id when available; fall back to composite key
+            # so that positions with empty order_id are still recognized.
             if pos.order_id:
-                in_memory_order_ids.add(pos.order_id)
+                in_memory_keys.add(pos.order_id)
+            else:
+                in_memory_keys.add(
+                    f"{pos.market_slug}|{pos.coin}|{pos.side}"
+                )
             if not pos.resolved:
                 pending.setdefault(pos.market_slug, []).append(pos)
 
@@ -1040,8 +1053,13 @@ class CheapQuoteStrategy:
                     if not slug:
                         continue
                     # Skip if already tracked in memory (Phase 1 handles it)
-                    if oid and oid in in_memory_order_ids:
+                    if oid and oid in in_memory_keys:
                         continue
+                    if not oid:
+                        coin = fields.get("coin", "")
+                        side = fields.get("side", "").lower()
+                        if f"{slug}|{coin}|{side}" in in_memory_keys:
+                            continue
                     orphaned_pending.setdefault(slug, []).append(fields)
         except Exception as exc:
             log(f"[sweep] log scan error: {exc}", "warning")
@@ -1189,7 +1207,12 @@ class CheapQuoteStrategy:
         # --- Periodic sweep: resolve PENDING positions (every 2 min) ---
         if now - self._last_sweep_ts >= 120.0:
             self._last_sweep_ts = now
-            asyncio.get_running_loop().create_task(self._sweep_pending())
+            # Guard: don't stack concurrent sweeps (Phase 2 orphan stats
+            # have no idempotency flag — overlapping sweeps double-count).
+            if self._sweep_task is None or self._sweep_task.done():
+                self._sweep_task = asyncio.get_running_loop().create_task(
+                    self._sweep_pending()
+                )
 
         # --- Periodic cleanup of completed resolution tasks ---
         if now - self._last_task_cleanup >= 30.0:
@@ -1210,10 +1233,19 @@ class CheapQuoteStrategy:
                 f"pnl=${self.session_pnl:+.2f}  res_tasks={pending_res}",
                 "info",
             )
-            # Cap _all_positions to prevent unbounded memory growth:
-            # keep only the last 2000 entries (enough for ~16 hours at max fill rate)
+            # Cap _all_positions to prevent unbounded memory growth.
+            # Only evict RESOLVED positions (from front); never drop
+            # unresolved ones — they need the sweep to resolve them.
             if len(self._all_positions) > 2000:
-                self._all_positions = self._all_positions[-2000:]
+                trimmed: List[PositionRecord] = []
+                to_drop = len(self._all_positions) - 2000
+                dropped = 0
+                for p in self._all_positions:
+                    if dropped < to_drop and p.resolved:
+                        dropped += 1
+                        continue
+                    trimmed.append(p)
+                self._all_positions = trimmed
 
         # TUI
         render_interval = 0.5 if _tui_active else 2.0
