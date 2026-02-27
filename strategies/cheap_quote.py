@@ -722,6 +722,8 @@ class CheapQuoteStrategy:
                             f"@ {self.cfg.price:.4f}",
                             "success",
                         )
+                        if self.cfg.up_mode:
+                            self._cancel_opposite(tracker)
                     continue
 
                 try:
@@ -754,6 +756,8 @@ class CheapQuoteStrategy:
                             f"@ {tracker.fill_price:.4f}",
                             "success",
                         )
+                        if self.cfg.up_mode:
+                            await self._cancel_opposite_live(tracker)
                     elif closed:
                         tracker.cancelled = True
                 except Exception as exc:
@@ -867,6 +871,55 @@ class CheapQuoteStrategy:
 
         if count > 0:
             log(f"Cancelled {count} unfilled order(s)", "warning")
+
+    def _cancel_opposite(self, filled_tracker: "OrderTracker") -> None:
+        """Cancel the opposite side order for the same coin (dry-run).
+
+        In up_mode, buying both sides guarantees a loss.  When one side
+        fills, immediately cancel the other to keep it directional.
+        """
+        opp = "down" if filled_tracker.side == "up" else "up"
+        for t in self._orders.values():
+            if (
+                t.coin == filled_tracker.coin
+                and t.side == opp
+                and t.market_slug == filled_tracker.market_slug
+                and not t.filled
+                and not t.cancelled
+            ):
+                t.cancelled = True
+                log(
+                    f"[UP] Auto-cancel {t.coin}-{opp.upper()} "
+                    f"(opposite of filled {filled_tracker.side.upper()})",
+                    "warning",
+                )
+                break
+
+    async def _cancel_opposite_live(self, filled_tracker: "OrderTracker") -> None:
+        """Cancel the opposite side order for the same coin (live).
+
+        Same logic as _cancel_opposite but sends a real cancel to the CLOB.
+        """
+        opp = "down" if filled_tracker.side == "up" else "up"
+        for oid, t in self._orders.items():
+            if (
+                t.coin == filled_tracker.coin
+                and t.side == opp
+                and t.market_slug == filled_tracker.market_slug
+                and not t.filled
+                and not t.cancelled
+            ):
+                try:
+                    await asyncio.to_thread(self.clob.cancel_order, oid)
+                    t.cancelled = True
+                    log(
+                        f"[UP] Auto-cancel {t.coin}-{opp.upper()} "
+                        f"(opposite of filled {filled_tracker.side.upper()})",
+                        "warning",
+                    )
+                except Exception as exc:
+                    log(f"[UP] Cancel opposite err: {exc}", "warning")
+                break
 
     # ------------------------------------------------------------------
     # Resolution tracking
