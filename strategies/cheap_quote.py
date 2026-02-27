@@ -209,6 +209,9 @@ class OrderTracker:
     fill_size: float = 0.0
     fill_time: float = 0.0
     cancelled: bool = False
+    # up_mode live: order not yet submitted, waiting for ask >= threshold
+    awaiting_trigger: bool = False
+    submitted_at: float = 0.0
 
 
 @dataclass
@@ -612,7 +615,25 @@ class CheapQuoteStrategy:
             self.total_orders_placed += 1
             return
 
-        # Live
+        # Up-mode live: don't submit now — wait for ask >= threshold.
+        # Create a tracker in "awaiting_trigger" state; the fill watcher
+        # will submit the order when the price condition is met.
+        if self.cfg.up_mode:
+            placeholder_id = f"up-pending-{coin}-{side}-{int(time.time() * 1000)}"
+            log(f"[UP] WATCHING {label}: waiting for ask >= {self.cfg.price}", "trade")
+            tracker = OrderTracker(
+                coin=coin, side=side, token_id=token_id,
+                order_id=placeholder_id, price=self.cfg.price,
+                size=self.cfg.size, placed_at=time.time(),
+                market_slug=market.slug,
+                awaiting_trigger=True,
+            )
+            self._orders[placeholder_id] = tracker
+            self._orders_placed_this_cycle += 1
+            self.total_orders_placed += 1
+            return
+
+        # Live (normal mode)
         try:
             fee_rate_bps = self._fee_rate_cache.get(token_id)
             if fee_rate_bps is None:
@@ -684,6 +705,75 @@ class CheapQuoteStrategy:
         except Exception as exc:
             log(f"ERROR {label}: {exc}", "error")
 
+    async def _submit_live_order(self, tracker: OrderTracker) -> Optional[str]:
+        """Submit a real GTC limit BUY to the CLOB for an up_mode tracker.
+
+        Returns the real order_id on success, or None on failure.
+        """
+        label = f"{tracker.coin}-{tracker.side.upper()}"
+        try:
+            market = self._coin_markets.get(tracker.coin)
+            neg_risk = market.neg_risk if market else False
+            tick_size = market.tick_size if market else "0.01"
+
+            fee_rate_bps = self._fee_rate_cache.get(tracker.token_id)
+            if fee_rate_bps is None:
+                fee_rate_bps = await asyncio.to_thread(
+                    self.clob.get_fee_rate_bps, tracker.token_id
+                )
+                self._fee_rate_cache[tracker.token_id] = fee_rate_bps
+
+            order = Order(
+                token_id=tracker.token_id,
+                price=self.cfg.price,
+                size=self.cfg.size,
+                side="BUY",
+                funder=self.bot_config.safe_address,
+                fee_rate_bps=fee_rate_bps,
+                signature_type=self.bot_config.clob.signature_type,
+                neg_risk=neg_risk,
+                tick_size=tick_size,
+            )
+            signed = self.signer.sign_order(order)
+            response = await asyncio.to_thread(self.clob.post_order, signed, "GTC")
+
+            if not response.get("success", False):
+                error = response.get("errorMsg", "unknown")
+                log(f"[UP] SUBMIT FAIL {label}: {error}", "error")
+                return None
+
+            order_id = (
+                response.get("orderID")
+                or response.get("orderId")
+                or response.get("order_id")
+                or ""
+            )
+
+            # Check if it filled immediately
+            status = str(response.get("status", "")).lower()
+            if status in {"matched", "filled", "executed", "complete", "completed"}:
+                taking = _to_float(response.get("takingAmount", 0))
+                making = _to_float(response.get("makingAmount", 0))
+                fp = making / max(taking, 1e-12) if taking > 0 else self.cfg.price
+                if fp > self.cfg.price:
+                    fp = self.cfg.price
+                tracker.filled = True
+                tracker.fill_price = fp
+                tracker.fill_size = min(
+                    taking if taking > 0 else self.cfg.size,
+                    self.cfg.size,
+                )
+                tracker.fill_time = time.time()
+                tracker.order_id = order_id
+                self._record_fill(tracker)
+                log(f"FILLED {label}: {tracker.fill_size:.1f} @ {fp:.4f}", "success")
+                await self._cancel_opposite_live(tracker)
+
+            return order_id
+        except Exception as exc:
+            log(f"[UP] SUBMIT ERR {label}: {exc}", "error")
+            return None
+
     # ------------------------------------------------------------------
     # Fill watcher
     # ------------------------------------------------------------------
@@ -727,6 +817,52 @@ class CheapQuoteStrategy:
                             self._cancel_opposite(tracker)
                     continue
 
+                # --- Up-mode live: reactive order placement ---
+                if tracker.awaiting_trigger:
+                    ask = self._best_asks.get(tracker.coin, {}).get(tracker.side, 0.0)
+                    if ask >= self.cfg.price:
+                        # Ask reached threshold — submit limit order now
+                        real_oid = await self._submit_live_order(tracker)
+                        if real_oid:
+                            # Move tracker to the new real order_id
+                            del self._orders[order_id]
+                            tracker.order_id = real_oid
+                            tracker.awaiting_trigger = False
+                            tracker.submitted_at = time.time()
+                            self._orders[real_oid] = tracker
+                            log(
+                                f"[UP] SUBMIT {tracker.coin}-{tracker.side.upper()}"
+                                f" @ {self.cfg.price} (ask={ask:.4f})",
+                                "trade",
+                            )
+                    continue
+
+                # --- Up-mode live: 3s timeout for resting orders ---
+                if self.cfg.up_mode and tracker.submitted_at > 0:
+                    elapsed = time.time() - tracker.submitted_at
+                    if elapsed > 3.0:
+                        try:
+                            await asyncio.to_thread(
+                                self.clob.cancel_order, tracker.order_id
+                            )
+                        except Exception:
+                            pass
+                        # Reset to awaiting_trigger
+                        old_oid = tracker.order_id
+                        new_oid = f"up-pending-{tracker.coin}-{tracker.side}-{int(time.time() * 1000)}"
+                        del self._orders[old_oid]
+                        tracker.order_id = new_oid
+                        tracker.awaiting_trigger = True
+                        tracker.submitted_at = 0.0
+                        self._orders[new_oid] = tracker
+                        log(
+                            f"[UP] TIMEOUT {tracker.coin}-{tracker.side.upper()}"
+                            f" (no fill in {elapsed:.1f}s, retrying)",
+                            "warning",
+                        )
+                        continue
+
+                # --- Normal live fill check ---
                 try:
                     filled, closed, status, size_matched, avg_price = (
                         await asyncio.to_thread(
@@ -737,14 +873,10 @@ class CheapQuoteStrategy:
                     )
                     if filled:
                         tracker.filled = True
-                        # Cap fill_size at our order size (API may report
-                        # aggregate market volume, not just our order).
                         tracker.fill_size = min(
                             size_matched if size_matched > 0 else tracker.size,
                             tracker.size,
                         )
-                        # Limit BUY never fills above limit price.  If the API
-                        # reports a higher price it's reading the wrong field.
                         if avg_price > 0 and avg_price <= tracker.price:
                             tracker.fill_price = avg_price
                         else:
@@ -857,7 +989,8 @@ class CheapQuoteStrategy:
 
         count = 0
         for order_id, tracker in to_cancel:
-            if self.cfg.dry_run:
+            if self.cfg.dry_run or tracker.awaiting_trigger:
+                # Dry-run or up_mode pending: no real order on CLOB
                 tracker.cancelled = True
                 count += 1
                 continue
