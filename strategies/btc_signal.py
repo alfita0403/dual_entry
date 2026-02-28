@@ -622,21 +622,15 @@ class SignalStrategy:
             btc_up_ask = self._best_asks.get("BTC", {}).get("up", 1.0)
             btc_down_ask = self._best_asks.get("BTC", {}).get("down", 1.0)
 
-            # Guard: skip if EITHER BTC side is still at reset/empty value (1.0).
-            # After cycle reset all asks start at 1.0 which would
-            # falsely trigger >= threshold before real data arrives.
-            # Must use OR: if only one side has data, the stale side
-            # at 1.0 would falsely trigger a signal on that side.
-            # Real asks are never exactly 1.0 (always some spread);
-            # empty orderbooks also return 1.0 (can't trade without asks).
-            if btc_up_ask == 1.0 or btc_down_ask == 1.0:
-                await asyncio.sleep(0.5)
-                continue
-
+            # Per-side stale-data guard: only fire a signal when that
+            # specific side has received real orderbook data (!= 1.0).
+            # This prevents false triggers from the 1.0 reset sentinel
+            # while allowing the bot to act as soon as ONE side is ready
+            # (no need to wait for the opposite side's data to arrive).
             signal_side: Optional[str] = None
-            if btc_up_ask >= self.cfg.price:
+            if btc_up_ask != 1.0 and btc_up_ask >= self.cfg.price:
                 signal_side = "up"
-            elif btc_down_ask >= self.cfg.price:
+            elif btc_down_ask != 1.0 and btc_down_ask >= self.cfg.price:
                 signal_side = "down"
 
             if signal_side is not None:
