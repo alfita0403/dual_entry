@@ -293,6 +293,7 @@ class SignalStrategy:
         self.total_resolved: int = 0
         self.session_pnl: float = 0.0
         self.total_spent: float = 0.0
+        self.total_shares: float = 0.0
 
         # Per-coin stats
         self.coin_wins: Dict[str, int] = {c: 0 for c in COINS}
@@ -371,8 +372,11 @@ class SignalStrategy:
 
                 coin = fields.get("coin", "").upper()
 
+                size = _to_float(fields.get("size", "0"))
+
                 self.total_fills += 1
                 self.total_spent += cost
+                self.total_shares += size
                 # PnL and W/L only change on resolution.
 
                 if outcome.startswith("WIN"):
@@ -1090,6 +1094,7 @@ class SignalStrategy:
         self.total_fills += 1
         cost = tracker.fill_size * tracker.fill_price
         self.total_spent += cost
+        self.total_shares += tracker.fill_size
         # PnL and W/L only change on resolution, not on fill.
 
         pos = PositionRecord(
@@ -1779,8 +1784,7 @@ class SignalStrategy:
         if self.total_fills > 0:
             wr = (self.total_wins / self.total_resolved) * 100 if self.total_resolved > 0 else 0.0
             print(f"  Win rate:      {wr:.1f}%")
-            total_shares = sum(p.fill_size for p in self._all_positions)
-            avg_price = self.total_spent / total_shares if total_shares > 0 else 0.0
+            avg_price = self.total_spent / self.total_shares if self.total_shares > 0 else 0.0
             print(f"  Avg buy price: {avg_price:.4f}")
 
             print()
