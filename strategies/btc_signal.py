@@ -852,6 +852,7 @@ class SignalStrategy:
         self,
         order_id: str,
         buy_price: float,
+        token_id: str = "",
     ) -> Optional[Tuple[float, float]]:
         """Query CLOB API for real fill data after a FOK fill.
 
@@ -859,6 +860,13 @@ class SignalStrategy:
         ``makingAmount``.  This method queries ``GET /data/order`` for
         ``size_matched`` and then inspects the associated trades'
         ``maker_orders`` to obtain the real execution price.
+
+        In binary markets, a BUY UP can match against a BUY DOWN
+        (complement/mint match).  When this happens,
+        ``maker_orders[].price`` is the DOWN price, not the UP price.
+        This method detects complement matches by comparing the maker's
+        ``asset_id`` against our ``token_id`` and adjusts the execution
+        price to ``1 - maker_price``.
 
         Returns:
             ``(taking, making)`` if verified — *taking* = shares matched,
@@ -905,8 +913,34 @@ class SignalStrategy:
                             mp = _to_float(mo.get("price", 0))
                             ma = _to_float(mo.get("matched_amount", 0))
                             if mp > 0 and ma > 0:
+                                # Detect complement match: maker traded
+                                # the OTHER token (e.g. BUY DOWN matched
+                                # our BUY UP via minting).  In that case
+                                # maker_price is the complement price and
+                                # our real cost per share = 1 - mp.
+                                is_complement = False
+                                maker_asset = mo.get("asset_id", "")
+                                if maker_asset and token_id:
+                                    is_complement = (maker_asset != token_id)
+                                elif buy_price > 0:
+                                    # Heuristic: maker_price closer to
+                                    # (1 - buy_price) than to buy_price
+                                    # means complement match.
+                                    d_direct = abs(mp - buy_price)
+                                    d_compl = abs(mp - (1.0 - buy_price))
+                                    is_complement = d_compl < d_direct
+
+                                exec_price = (1.0 - mp) if is_complement else mp
                                 real_size += ma
-                                real_cost += ma * mp
+                                real_cost += ma * exec_price
+
+                                if is_complement:
+                                    log(
+                                        f"[verify] complement match:"
+                                        f" maker_price={mp:.4f}"
+                                        f" -> exec_price={exec_price:.4f}",
+                                        "info",
+                                    )
                     else:
                         # Fallback: top-level trade data
                         ts = _to_float(trade.get("size", 0))
@@ -926,8 +960,8 @@ class SignalStrategy:
                 avg_price = real_cost / real_size
                 making = taking * avg_price
             else:
-                # No trade data: estimate cost from USDC budget
-                making = buy_price * self.cfg.size
+                # No trade data: estimate cost from limit price
+                making = buy_price * taking
 
             avg = making / taking if taking > 0 else buy_price
             log(
@@ -1048,7 +1082,7 @@ class SignalStrategy:
                 taking = 0.0
                 making = 0.0
                 if order_id:
-                    verified = await self._verify_fill(order_id, buy_price)
+                    verified = await self._verify_fill(order_id, buy_price, token_id)
                     if verified:
                         taking, making = verified
                 # Fallback to POST response only if verify failed
