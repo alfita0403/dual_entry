@@ -44,7 +44,7 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -622,7 +622,9 @@ class CorrelationStrategy:
 
             if self._btc_bought:
                 # BTC already bought -- only scan for more followers
-                assert self._btc_locked_side is not None
+                if not self._btc_locked_side:
+                    await asyncio.sleep(0.5)
+                    continue
                 follower_side = "down" if self._btc_locked_side == "up" else "up"
                 self._scanning = True
                 self._current_trigger_side = self._btc_locked_side
@@ -716,16 +718,12 @@ class CorrelationStrategy:
             if btc_tracker:
                 self._btc_bought = True
                 self._btc_locked_side = btc_side
-                self._followers_bought.add(follower_coin)
                 log(
                     f"[SIM] FILLED BTC-{btc_side.upper()} @ {self.cfg.price:.4f}",
                     "success",
                 )
             if follower_tracker:
-                if not self._btc_bought:
-                    # Edge case: BTC fill failed but follower succeeded
-                    # This shouldn't happen in sim, but guard anyway
-                    pass
+                self._followers_bought.add(follower_coin)
                 log(
                     f"[SIM] FILLED {follower_coin}-{follower_side.upper()}"
                     f" @ {self.cfg.price:.4f}",
@@ -859,10 +857,13 @@ class CorrelationStrategy:
         side: str,
         token_id: str,
         market: MarketInfo,
-    ) -> Optional[str]:
+    ) -> Optional[OrderTracker]:
         """Submit a real GTC limit BUY to the CLOB.
 
-        Returns the real order_id on success, or None on failure.
+        Returns the filled OrderTracker on immediate fill.  If the order
+        rests (ask moved away from threshold between check and submit),
+        it is cancelled immediately and None is returned.  The watcher
+        loop will retry on the next iteration if conditions still hold.
         """
         label = f"{coin}-{side.upper()}"
         try:
@@ -925,20 +926,26 @@ class CorrelationStrategy:
                     self.cfg.size,
                 )
                 tracker.fill_time = time.time()
+                self._orders[order_id] = tracker
+                self._orders_placed_this_cycle += 1
+                self.total_orders_placed += 1
                 self._record_fill(tracker)
                 log(f"FILLED {label}: {tracker.fill_size:.1f} @ {fp:.4f}", "success")
-            else:
-                sid = order_id[:12] + "..." if len(order_id) > 12 else order_id
-                log(
-                    f"PLACED {label}: {self.cfg.size} @ {self.cfg.price} id={sid}",
-                    "success",
-                )
+                return tracker
 
+            # --- Order is resting (ask moved away from threshold) ---
+            # Cancel immediately -- the correlation window is tight and
+            # we don't want resting orders accumulating on the book.
             self._orders[order_id] = tracker
             self._orders_placed_this_cycle += 1
             self.total_orders_placed += 1
-
-            return order_id
+            log(f"RESTING {label}: cancelling (ask moved)", "warning")
+            try:
+                await asyncio.to_thread(self.clob.cancel_order, order_id)
+                tracker.cancelled = True
+            except Exception:
+                pass  # Will be cleaned up by _cancel_unfilled_orders at window expiry
+            return None
         except Exception as exc:
             log(f"SUBMIT ERR {label}: {exc}", "error")
             return None
