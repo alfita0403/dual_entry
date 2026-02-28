@@ -677,6 +677,7 @@ class SignalStrategy:
 
             if signal_side is not None:
                 self._signal_side = signal_side
+                t0 = time.perf_counter()
 
                 # Find cheapest follower on the SAME side
                 cheapest_coin: Optional[str] = None
@@ -704,9 +705,12 @@ class SignalStrategy:
                         round(btc_signal_ask - 0.01, 2),
                     )
                     buy_limit = max(buy_limit, cheapest_ask)  # never below ask
+                    t_detect_us = (time.perf_counter() - t0) * 1_000_000
                     await self._execute_signal_trade(
                         cheapest_coin, signal_side, buy_limit,
                         ask_price=cheapest_ask,
+                        t0=t0,
+                        t_detect_us=t_detect_us,
                     )
                     # One attempt only: whether the FOK filled or missed,
                     # mark the cycle as attempted.  The opportunity is
@@ -726,6 +730,8 @@ class SignalStrategy:
         buy_price: float,
         *,
         ask_price: Optional[float] = None,
+        t0: float = 0.0,
+        t_detect_us: float = 0.0,
     ) -> None:
         """Execute a single trade: buy cheapest follower via FOK.
 
@@ -734,6 +740,8 @@ class SignalStrategy:
             ask_price: The raw best-ask at signal time (for logging /
                        dry-run sim).  Falls back to *buy_price* when
                        not provided.
+            t0: perf_counter timestamp at signal detection (for latency log).
+            t_detect_us: microseconds spent on detection logic.
         """
         if ask_price is None:
             ask_price = buy_price
@@ -742,7 +750,8 @@ class SignalStrategy:
         log(
             f"SIGNAL: BTC-{side.upper()} @{btc_ask:.4f} >= {self.cfg.price}"
             f" -> BUY {coin}-{side.upper()} limit={buy_price:.4f}"
-            f" (ask={ask_price:.4f})",
+            f" (ask={ask_price:.4f})"
+            f" [detect={t_detect_us:.0f}us]",
             "trade",
         )
 
@@ -753,8 +762,10 @@ class SignalStrategy:
                 self._bought_coin = coin
                 self._bought_side = side
                 self._bought_price = ask_price
+                total_us = (time.perf_counter() - t0) * 1_000_000 if t0 else 0
                 log(
-                    f"[SIM] FILLED {coin}-{side.upper()} @{ask_price:.4f}",
+                    f"[SIM] FILLED {coin}-{side.upper()} @{ask_price:.4f}"
+                    f" [total={total_us:.0f}us]",
                     "success",
                 )
         else:
@@ -768,7 +779,7 @@ class SignalStrategy:
                 return
 
             result = await self._submit_live_order(
-                coin, side, token_id, market, buy_price
+                coin, side, token_id, market, buy_price, t0=t0,
             )
             if result:
                 self._bought_coin = coin
@@ -915,6 +926,7 @@ class SignalStrategy:
         token_id: str,
         market: MarketInfo,
         buy_price: float,
+        t0: float = 0.0,
     ) -> Optional[OrderTracker]:
         """Submit a FOK limit BUY to the CLOB.
 
@@ -923,13 +935,17 @@ class SignalStrategy:
         """
         label = f"{coin}-{side.upper()}"
         try:
+            t_fee_start = time.perf_counter()
             fee_rate_bps = self._fee_rate_cache.get(token_id)
+            fee_cached = fee_rate_bps is not None
             if fee_rate_bps is None:
                 fee_rate_bps = await asyncio.to_thread(
                     self.clob.get_fee_rate_bps, token_id
                 )
                 self._fee_rate_cache[token_id] = fee_rate_bps
+            t_fee_us = (time.perf_counter() - t_fee_start) * 1_000_000
 
+            t_sign_start = time.perf_counter()
             order = Order(
                 token_id=token_id,
                 price=buy_price,
@@ -942,6 +958,7 @@ class SignalStrategy:
                 tick_size=market.tick_size,
             )
             signed = self.signer.sign_order(order)
+            t_sign_us = (time.perf_counter() - t_sign_start) * 1_000_000
 
             # Tight timeout for FOK: no retries, 5s max.
             # The opportunity is instant — waiting 30s or retrying
@@ -949,6 +966,7 @@ class SignalStrategy:
             prev_timeout, prev_retry = self.clob.timeout, self.clob.retry_count
             self.clob.timeout = 5
             self.clob.retry_count = 1
+            t_post_start = time.perf_counter()
             try:
                 response = await asyncio.to_thread(
                     self.clob.post_order, signed, "FOK"
@@ -956,10 +974,19 @@ class SignalStrategy:
             finally:
                 self.clob.timeout = prev_timeout
                 self.clob.retry_count = prev_retry
+            t_post_us = (time.perf_counter() - t_post_start) * 1_000_000
+            t_total_us = (time.perf_counter() - t0) * 1_000_000 if t0 else 0
+
+            timing = (
+                f"[fee={'hit' if fee_cached else 'MISS'}={t_fee_us:.0f}us"
+                f" sign={t_sign_us:.0f}us"
+                f" post={t_post_us:.0f}us"
+                f" total={t_total_us:.0f}us]"
+            )
 
             if not response.get("success", False):
                 error = response.get("errorMsg", "unknown")
-                log(f"FOK FAIL {label}: {error}", "error")
+                log(f"FOK FAIL {label}: {error} {timing}", "error")
                 return None
 
             order_id = (
@@ -989,10 +1016,12 @@ class SignalStrategy:
                 # POST /order often omits fill amounts.  Verify via
                 # GET /data/order + associated trades to get the real
                 # fill size and execution price.
+                t_verify_start = time.perf_counter()
                 if taking <= 0 and order_id:
                     verified = await self._verify_fill(order_id, buy_price)
                     if verified:
                         taking, making = verified
+                t_verify_us = (time.perf_counter() - t_verify_start) * 1_000_000
 
                 fp = making / max(taking, 1e-12) if taking > 0 else buy_price
                 tracker.filled = True
@@ -1003,11 +1032,18 @@ class SignalStrategy:
                 self._orders_placed_this_cycle += 1
                 self.total_orders_placed += 1
                 self._record_fill(tracker)
-                log(f"FILLED {label}: {tracker.fill_size:.2f} @ {fp:.4f}", "success")
+                log(
+                    f"FILLED {label}: {tracker.fill_size:.2f} @ {fp:.4f}"
+                    f" {timing} [verify={t_verify_us:.0f}us]",
+                    "success",
+                )
                 return tracker
 
             # FOK: if not filled, it's killed. No resting possible.
-            log(f"FOK KILLED {label}: order not filled (ask moved)", "warning")
+            log(
+                f"FOK KILLED {label}: order not filled (ask moved) {timing}",
+                "warning",
+            )
             self._orders[order_id] = tracker
             self._orders_placed_this_cycle += 1
             self.total_orders_placed += 1
