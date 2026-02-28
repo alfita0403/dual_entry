@@ -118,7 +118,7 @@ def _append_trade_log(
         f"{now_utc} | {now_local} | "
         f"order_id={pos.order_id} | "
         f"market={pos.market_slug} | coin={pos.coin} | side={pos.side.upper()} | "
-        f"price={pos.fill_price:.4f} | size={pos.fill_size:.1f} | "
+        f"price={pos.fill_price:.4f} | size={pos.fill_size:.4f} | "
         f"cost=${pos.cost:.4f} | "
         f"window={cfg.window:.0f}s | cfg_price={cfg.price} | cfg_size={cfg.size} | "
         f"dry_run={cfg.dry_run} | outcome={outcome}"
@@ -754,6 +754,102 @@ class SignalStrategy:
         return tracker
 
     # ------------------------------------------------------------------
+    # Post-fill verification (real size & price from CLOB API)
+    # ------------------------------------------------------------------
+    async def _verify_fill(
+        self,
+        order_id: str,
+        buy_price: float,
+    ) -> Optional[Tuple[float, float]]:
+        """Query CLOB API for real fill data after a FOK fill.
+
+        The POST /order response often omits ``takingAmount`` and
+        ``makingAmount``.  This method queries ``GET /data/order`` for
+        ``size_matched`` and then inspects the associated trades'
+        ``maker_orders`` to obtain the real execution price.
+
+        Returns:
+            ``(taking, making)`` if verified — *taking* = shares matched,
+            *making* = total USDC cost (shares × avg fill price).
+            ``None`` if the data is unavailable.
+        """
+        try:
+            await asyncio.sleep(0.5)
+
+            order_data = await asyncio.to_thread(
+                self.clob.get_order, order_id
+            )
+            if not order_data:
+                return None
+
+            # Unwrap envelope if the response wraps order inside a key
+            if isinstance(order_data, dict) and "order" in order_data:
+                order_data = order_data["order"]
+
+            size_matched = _to_float(
+                order_data.get("size_matched")
+                or order_data.get("sizeMatched")
+                or 0
+            )
+
+            # --- real execution prices from trades ---
+            associate_trades = order_data.get("associate_trades") or []
+            trade_ids: List[str] = []
+            if isinstance(associate_trades, list):
+                trade_ids = [str(tid) for tid in associate_trades if tid]
+
+            real_size = 0.0
+            real_cost = 0.0
+            for tid in trade_ids[:5]:
+                try:
+                    trade = await asyncio.to_thread(
+                        self.clob.get_trade, tid
+                    )
+                    if not trade:
+                        continue
+                    makers = trade.get("maker_orders") or []
+                    if makers:
+                        for mo in makers:
+                            mp = _to_float(mo.get("price", 0))
+                            ma = _to_float(mo.get("matched_amount", 0))
+                            if mp > 0 and ma > 0:
+                                real_size += ma
+                                real_cost += ma * mp
+                    else:
+                        # Fallback: top-level trade data
+                        ts = _to_float(trade.get("size", 0))
+                        tp = _to_float(trade.get("price", 0))
+                        if ts > 0 and tp > 0:
+                            real_size += ts
+                            real_cost += ts * tp
+                except Exception:
+                    continue
+
+            # --- best available fill data ---
+            taking = size_matched if size_matched > 0 else real_size
+            if taking <= 0:
+                return None
+
+            if real_cost > 0 and real_size > 0:
+                avg_price = real_cost / real_size
+                making = taking * avg_price
+            else:
+                # No trade data: estimate cost from USDC budget
+                making = buy_price * self.cfg.size
+
+            avg = making / taking if taking > 0 else buy_price
+            log(
+                f"[verify] size={taking:.4f} avg_price={avg:.4f} "
+                f"(order sm={size_matched:.4f}, trades={len(trade_ids)})",
+                "info",
+            )
+            return (taking, making)
+
+        except Exception as exc:
+            log(f"[verify] err: {exc}", "warning")
+            return None
+
+    # ------------------------------------------------------------------
     # Live order submission (FOK)
     # ------------------------------------------------------------------
     async def _submit_live_order(
@@ -820,11 +916,16 @@ class SignalStrategy:
             if status in {"matched", "filled", "executed", "complete", "completed"}:
                 taking = _to_float(response.get("takingAmount", 0))
                 making = _to_float(response.get("makingAmount", 0))
+
+                # POST /order often omits fill amounts.  Verify via
+                # GET /data/order + associated trades to get the real
+                # fill size and execution price.
+                if taking <= 0 and order_id:
+                    verified = await self._verify_fill(order_id, buy_price)
+                    if verified:
+                        taking, making = verified
+
                 fp = making / max(taking, 1e-12) if taking > 0 else buy_price
-                # No cap: trust the real CLOB fill price from making/taking.
-                # A limit BUY at buy_price can fill at or below, but fees or
-                # tick-size rounding may shift the effective price. The real
-                # fill price must be recorded for accurate PnL tracking.
                 tracker.filled = True
                 tracker.fill_price = fp
                 tracker.fill_size = min(
@@ -836,7 +937,7 @@ class SignalStrategy:
                 self._orders_placed_this_cycle += 1
                 self.total_orders_placed += 1
                 self._record_fill(tracker)
-                log(f"FILLED {label}: {tracker.fill_size:.1f} @ {fp:.4f}", "success")
+                log(f"FILLED {label}: {tracker.fill_size:.2f} @ {fp:.4f}", "success")
                 return tracker
 
             # FOK: if not filled, it's killed. No resting possible.
@@ -1470,7 +1571,7 @@ class SignalStrategy:
                 lines.append(
                     f"  {D}{ts}{X}"
                     f"  {B}{p.coin}{X}-{p.side.upper():<4}"
-                    f"  {C}@{p.fill_price:.2f}{X} x{p.fill_size:.0f}"
+                    f"  {C}@{p.fill_price:.2f}{X} x{p.fill_size:.2f}"
                     f"  {tag}"
                 )
         else:
@@ -1564,7 +1665,7 @@ class SignalStrategy:
                 ts = datetime.fromtimestamp(p.fill_time).strftime("%H:%M:%S")
                 print(
                     f"    {ts}  {p.coin}-{p.side.upper():>4}"
-                    f"  @{p.fill_price:.4f}  x{p.fill_size:.0f}"
+                    f"  @{p.fill_price:.4f}  x{p.fill_size:.2f}"
                     f"  cost=${p.cost:.4f}{res}"
                 )
 
