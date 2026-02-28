@@ -622,11 +622,14 @@ class SignalStrategy:
             btc_up_ask = self._best_asks.get("BTC", {}).get("up", 1.0)
             btc_down_ask = self._best_asks.get("BTC", {}).get("down", 1.0)
 
-            # Guard: skip if BTC asks are still at reset value (1.0).
+            # Guard: skip if EITHER BTC side is still at reset/empty value (1.0).
             # After cycle reset all asks start at 1.0 which would
             # falsely trigger >= threshold before real data arrives.
-            # In real markets UP + DOWN ≈ 1.0, so both at 1.0 = stale.
-            if btc_up_ask >= 0.999 and btc_down_ask >= 0.999:
+            # Must use OR: if only one side has data, the stale side
+            # at 1.0 would falsely trigger a signal on that side.
+            # Real asks are never exactly 1.0 (always some spread);
+            # empty orderbooks also return 1.0 (can't trade without asks).
+            if btc_up_ask == 1.0 or btc_down_ask == 1.0:
                 await asyncio.sleep(0.5)
                 continue
 
@@ -1340,7 +1343,7 @@ class SignalStrategy:
         btc_up_ask = self._best_asks.get("BTC", {}).get("up", 1.0)
         btc_down_ask = self._best_asks.get("BTC", {}).get("down", 1.0)
 
-        if self._trade_executed and self._bought_coin and self._bought_side:
+        if self._trade_executed and self._bought_coin and self._bought_side and self._bought_price is not None:
             btc_tag = f"{G}{B}SIGNAL {self._signal_side.upper() if self._signal_side else '?'}{X}"
             target_tag = f"{D}--{X}"
             trade_tag = (
