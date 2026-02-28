@@ -502,7 +502,9 @@ class SignalStrategy:
             for side in ("up", "down"):
                 if market.token_ids.get(side) == asset_id:
                     asks = snapshot.asks
-                    best = min(float(a.price) for a in asks) if asks else 1.0
+                    # asks are already sorted ascending by WS client;
+                    # index-0 is the best ask — no need for min().
+                    best = asks[0].price if asks else 1.0
                     self._best_asks[coin][side] = best
                     # Wake the trading loop instantly on any book update
                     self._book_event.set()
@@ -940,7 +942,20 @@ class SignalStrategy:
                 tick_size=market.tick_size,
             )
             signed = self.signer.sign_order(order)
-            response = await asyncio.to_thread(self.clob.post_order, signed, "FOK")
+
+            # Tight timeout for FOK: no retries, 5s max.
+            # The opportunity is instant — waiting 30s or retrying
+            # on 5xx is pointless because the price already moved.
+            prev_timeout, prev_retry = self.clob.timeout, self.clob.retry_count
+            self.clob.timeout = 5
+            self.clob.retry_count = 1
+            try:
+                response = await asyncio.to_thread(
+                    self.clob.post_order, signed, "FOK"
+                )
+            finally:
+                self.clob.timeout = prev_timeout
+                self.clob.retry_count = prev_retry
 
             if not response.get("success", False):
                 error = response.get("errorMsg", "unknown")

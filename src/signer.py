@@ -135,6 +135,14 @@ class OrderSigner:
         self.private_key = f"0x{private_key}"
         self.chain_id = chain_id
 
+        # Pre-build SDK signer (reused across all sign_order calls)
+        self._clob_signer = ClobSigner(
+            private_key=self.private_key,
+            chain_id=self.chain_id,
+        )
+        # Cached builders keyed by (sig_type, funder)
+        self._builder_cache: Dict[tuple, ClobOrderBuilder] = {}
+
     @classmethod
     def from_encrypted(cls, encrypted_data: dict, password: str) -> "OrderSigner":
         """
@@ -219,18 +227,16 @@ class OrderSigner:
             SignerError: If signing fails
         """
         try:
-            # Create the SDK's Signer wrapper (needs private_key + chain_id)
-            clob_signer = ClobSigner(
-                private_key=self.private_key,
-                chain_id=self.chain_id,
-            )
-
-            # Create the ClobOrderBuilder with our credentials
-            builder = ClobOrderBuilder(
-                signer=clob_signer,
-                sig_type=order.signature_type,
-                funder=order.funder,
-            )
+            # Reuse cached builder (same signer/sig_type/funder every call)
+            cache_key = (order.signature_type, order.funder)
+            builder = self._builder_cache.get(cache_key)
+            if builder is None:
+                builder = ClobOrderBuilder(
+                    signer=self._clob_signer,
+                    sig_type=order.signature_type,
+                    funder=order.funder,
+                )
+                self._builder_cache[cache_key] = builder
 
             # Build OrderArgs for the SDK
             order_args = OrderArgs(
