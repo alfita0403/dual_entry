@@ -172,6 +172,7 @@ class SignalConfig:
     window: float = 60.0  # seconds from market birth
     price: float = 0.80  # BTC signal threshold (>= this triggers a buy)
     size: float = 5.0  # shares per order
+    slippage: float = 0.03  # cents above ask for FOK fill buffer
     dry_run: bool = False
     market_check_interval: float = 5.0
     name: str = ""  # instance identifier (auto-generated if empty)
@@ -183,6 +184,8 @@ class SignalConfig:
             raise ValueError(f"window must be 1-300 seconds, got {self.window}")
         if self.size < 5:
             raise ValueError(f"size must be >= 5, got {self.size}")
+        if not 0.01 <= self.slippage <= 0.20:
+            raise ValueError(f"slippage must be 0.01-0.20, got {self.slippage}")
 
 
 # ===================================================================
@@ -557,7 +560,7 @@ class SignalStrategy:
         log(
             f"NEW CYCLE #{self.cycles_seen}: "
             f"window={self.cfg.window:.0f}s  rem={remaining:.0f}s  "
-            f"btc>={self.cfg.price}",
+            f"btc>={self.cfg.price}  slip={self.cfg.slippage:.2f}",
             "trade",
         )
         self.cycle_state = CycleState.ACTIVE
@@ -653,9 +656,23 @@ class SignalStrategy:
                 # cheapest — but BTC is never traded, so skip.
                 btc_signal_ask = self._best_asks.get("BTC", {}).get(signal_side, 1.0)
                 if cheapest_coin and cheapest_ask < btc_signal_ask:
-                    await self._execute_signal_trade(
-                        cheapest_coin, signal_side, cheapest_ask
+                    # Slippage buffer: send FOK at ask + slippage so the
+                    # order fills even if the ask moves 1-3c in the ~50ms
+                    # between detection and execution.  Cap below BTC's
+                    # ask minus 1c to preserve the statistical edge.
+                    buy_limit = min(
+                        round(cheapest_ask + self.cfg.slippage, 2),
+                        round(btc_signal_ask - 0.01, 2),
                     )
+                    buy_limit = max(buy_limit, cheapest_ask)  # never below ask
+                    await self._execute_signal_trade(
+                        cheapest_coin, signal_side, buy_limit,
+                        ask_price=cheapest_ask,
+                    )
+                    # One attempt only: whether the FOK filled or missed,
+                    # mark the cycle as attempted.  The opportunity is
+                    # instant -- chasing higher prices destroys the edge.
+                    self._trade_executed = True
             else:
                 # BTC not signalling -- clear TUI state
                 self._signal_side = None
@@ -670,28 +687,37 @@ class SignalStrategy:
         coin: str,
         side: str,
         buy_price: float,
+        *,
+        ask_price: Optional[float] = None,
     ) -> None:
-        """Execute a single trade: buy cheapest follower at its ask price.
+        """Execute a single trade: buy cheapest follower via FOK.
 
-        In dry-run: instant sim fill at the follower's ask price.
-        In live: submit FOK order at the follower's ask price.
+        Args:
+            buy_price: FOK limit price (ask + slippage buffer).
+            ask_price: The raw best-ask at signal time (for logging /
+                       dry-run sim).  Falls back to *buy_price* when
+                       not provided.
         """
+        if ask_price is None:
+            ask_price = buy_price
+
         btc_ask = self._best_asks.get("BTC", {}).get(side, 0.0)
         log(
             f"SIGNAL: BTC-{side.upper()} @{btc_ask:.4f} >= {self.cfg.price}"
-            f" -> BUY {coin}-{side.upper()} @{buy_price:.4f}",
+            f" -> BUY {coin}-{side.upper()} limit={buy_price:.4f}"
+            f" (ask={ask_price:.4f})",
             "trade",
         )
 
         if self.cfg.dry_run:
-            tracker = self._record_sim_fill(coin, side, buy_price)
+            # Sim fills at the raw ask, not the buffered limit
+            tracker = self._record_sim_fill(coin, side, ask_price)
             if tracker:
-                self._trade_executed = True
                 self._bought_coin = coin
                 self._bought_side = side
-                self._bought_price = buy_price
+                self._bought_price = ask_price
                 log(
-                    f"[SIM] FILLED {coin}-{side.upper()} @{buy_price:.4f}",
+                    f"[SIM] FILLED {coin}-{side.upper()} @{ask_price:.4f}",
                     "success",
                 )
         else:
@@ -708,7 +734,6 @@ class SignalStrategy:
                 coin, side, token_id, market, buy_price
             )
             if result:
-                self._trade_executed = True
                 self._bought_coin = coin
                 self._bought_side = side
                 self._bought_price = result.fill_price
@@ -922,10 +947,7 @@ class SignalStrategy:
                 fp = making / max(taking, 1e-12) if taking > 0 else buy_price
                 tracker.filled = True
                 tracker.fill_price = fp
-                tracker.fill_size = min(
-                    taking if taking > 0 else self.cfg.size,
-                    self.cfg.size,
-                )
+                tracker.fill_size = taking if taking > 0 else self.cfg.size
                 tracker.fill_time = time.time()
                 self._orders[order_id] = tracker
                 self._orders_placed_this_cycle += 1
@@ -1411,8 +1433,10 @@ class SignalStrategy:
         sc, st = state_map.get(self.cycle_state, (D, "?"))
         if self.cycle_state == CycleState.ACTIVE:
             rem = max(0.0, self._cycle_deadline - time.time())
-            if self._trade_executed:
+            if self._bought_coin:
                 st = f"DONE {rem:.0f}s"
+            elif self._trade_executed:
+                st = f"MISS {rem:.0f}s"
             else:
                 st = f"SCAN {rem:.0f}s"
 
@@ -1436,7 +1460,8 @@ class SignalStrategy:
         )
         lines.append(
             f"  {D}btc>={self.cfg.price}  window {self.cfg.window:.0f}s"
-            f"  size {self.cfg.size:.0f}  cycle #{self.cycles_seen}{X}"
+            f"  size {self.cfg.size:.0f}  slip {self.cfg.slippage:.2f}"
+            f"  cycle #{self.cycles_seen}{X}"
         )
         hsep()
 
@@ -1622,6 +1647,7 @@ class SignalStrategy:
         print(
             f"  Config:        window={self.cfg.window:.0f}s"
             f"  btc>={self.cfg.price}  size={self.cfg.size}"
+            f"  slippage={self.cfg.slippage:.2f}"
         )
         print(f"  Dry run:       {self.cfg.dry_run}")
         print(f"  Cycles seen:   {self.cycles_seen}")
@@ -1736,6 +1762,10 @@ def main() -> None:
         help="Instance name (auto-generated from config if empty)",
     )
     parser.add_argument(
+        "--slippage", type=float, default=0.03,
+        help="FOK slippage buffer above ask price (0.01-0.20, default: 0.03)",
+    )
+    parser.add_argument(
         "--market-check-interval", type=float, default=5.0,
         help="Seconds between market discovery checks (default: 5)",
     )
@@ -1750,6 +1780,7 @@ def main() -> None:
         window=args.window,
         price=args.price,
         size=args.size,
+        slippage=args.slippage,
         dry_run=args.dry_run,
         market_check_interval=args.market_check_interval,
         name=name,
