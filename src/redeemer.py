@@ -106,6 +106,7 @@ class Redeemer:
             address=PROXY_WALLET_FACTORY_ADDRESS,
             abi=PROXY_FACTORY_ABI,
         )
+        self._next_nonce = None
 
     def encode_redeem_standard(self, condition_id: str) -> bytes:
         """Encode redeemPositions for standard (non-neg-risk) markets."""
@@ -168,9 +169,14 @@ class Redeemer:
         # Full data: selector + encoded args
         full_data = proxy_fn_selector + calls_data
 
-        import time
+        # Get nonce: use tracked nonce or fetch pending from chain
+        if self._next_nonce is None:
+            nonce = self.w3.eth.get_transaction_count(self.account.address, "pending")
+        else:
+            nonce = self._next_nonce
 
-        time.sleep(2)  # Wait for previous tx to confirm
+        # Use 1.3x gas price to avoid "replacement underpriced" errors
+        gas_price = int(self.w3.eth.gas_price * 1.3)
 
         tx_params = {
             "from": self.account.address,
@@ -178,14 +184,17 @@ class Redeemer:
             "data": full_data.hex(),
             "value": value,
             "gas": 300000,
-            "gasPrice": self.w3.eth.gas_price,
-            "nonce": self.w3.eth.get_transaction_count(self.account.address),
+            "gasPrice": gas_price,
+            "nonce": nonce,
             "chainId": 137,
         }
 
         signed = self.account.sign_transaction(tx_params)
         tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+        # Track nonce for next transaction
+        self._next_nonce = nonce + 1
 
         return receipt["transactionHash"].hex()
 

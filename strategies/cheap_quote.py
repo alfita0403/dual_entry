@@ -796,6 +796,11 @@ class CheapQuoteStrategy:
 
                 if self.cfg.dry_run:
                     ask = self._best_asks.get(tracker.coin, {}).get(tracker.side, 1.0)
+                    # Stale-data guard: at cycle start asks are 1.0 (sentinel).
+                    # In up_mode (>= threshold), 1.0 falsely triggers every order.
+                    # Real asks in a binary market are never exactly 1.0.
+                    if self.cfg.up_mode and ask == 1.0:
+                        continue
                     # Normal: fill when ask drops to limit (cheap quotes)
                     # Up mode: fill when ask rises to threshold (probable)
                     fill_hit = (
@@ -820,6 +825,9 @@ class CheapQuoteStrategy:
                 # --- Up-mode live: reactive order placement ---
                 if tracker.awaiting_trigger:
                     ask = self._best_asks.get(tracker.coin, {}).get(tracker.side, 0.0)
+                    # Stale-data guard: same as dry-run — skip sentinel 1.0
+                    if ask == 1.0:
+                        continue
                     if ask >= self.cfg.price:
                         # Ask reached threshold — submit limit order now
                         real_oid = await self._submit_live_order(tracker)

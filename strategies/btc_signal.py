@@ -654,7 +654,11 @@ class SignalStrategy:
                         cheapest_ask = ask
                         cheapest_coin = coin
 
-                if cheapest_coin and cheapest_ask < 1.0:
+                # Follower must be cheaper than BTC on the signal side.
+                # If all followers are >= BTC's ask, BTC itself is the
+                # cheapest — but BTC is never traded, so skip.
+                btc_signal_ask = self._best_asks.get("BTC", {}).get(signal_side, 1.0)
+                if cheapest_coin and cheapest_ask < btc_signal_ask:
                     await self._execute_signal_trade(
                         cheapest_coin, signal_side, cheapest_ask
                     )
@@ -817,8 +821,10 @@ class SignalStrategy:
                 taking = _to_float(response.get("takingAmount", 0))
                 making = _to_float(response.get("makingAmount", 0))
                 fp = making / max(taking, 1e-12) if taking > 0 else buy_price
-                if fp > buy_price:
-                    fp = buy_price
+                # No cap: trust the real CLOB fill price from making/taking.
+                # A limit BUY at buy_price can fill at or below, but fees or
+                # tick-size rounding may shift the effective price. The real
+                # fill price must be recorded for accurate PnL tracking.
                 tracker.filled = True
                 tracker.fill_price = fp
                 tracker.fill_size = min(
