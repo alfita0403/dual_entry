@@ -730,7 +730,9 @@ class CorrelationStrategy:
                     "success",
                 )
         else:
-            # Live: submit both orders simultaneously
+            # Live: submit BTC first, then follower only if BTC fills.
+            # Sequential guarantees we never hold a naked follower
+            # without the BTC hedge (the correlation thesis requires both).
             btc_market = self._coin_markets.get("BTC")
             follower_market = self._coin_markets.get(follower_coin)
             if not btc_market or not follower_market:
@@ -743,30 +745,39 @@ class CorrelationStrategy:
                 log("PAIR ABORT: missing token IDs", "error")
                 return
 
-            results = await asyncio.gather(
-                self._submit_live_order("BTC", btc_side, btc_token, btc_market),
-                self._submit_live_order(
-                    follower_coin, follower_side, follower_token, follower_market
-                ),
-                return_exceptions=True,
-            )
-
-            btc_result = results[0]
-            follower_result = results[1]
-
-            if isinstance(btc_result, Exception):
-                log(f"PAIR BTC order error: {btc_result}", "error")
+            # --- Step 1: BTC must fill first ---
+            try:
+                btc_result = await self._submit_live_order(
+                    "BTC", btc_side, btc_token, btc_market
+                )
+            except Exception as exc:
+                log(f"PAIR BTC order error: {exc}", "error")
                 btc_result = None
-            if isinstance(follower_result, Exception):
+
+            if not btc_result:
                 log(
-                    f"PAIR {follower_coin} order error: {follower_result}",
+                    f"PAIR ABORT: BTC-{btc_side.upper()} did not fill,"
+                    f" skipping {follower_coin}",
+                    "warning",
+                )
+                return
+
+            self._btc_bought = True
+            self._btc_locked_side = btc_side
+
+            # --- Step 2: follower (BTC already secured) ---
+            try:
+                follower_result = await self._submit_live_order(
+                    follower_coin, follower_side, follower_token,
+                    follower_market,
+                )
+            except Exception as exc:
+                log(
+                    f"PAIR {follower_coin} order error: {exc}",
                     "error",
                 )
                 follower_result = None
 
-            if btc_result:
-                self._btc_bought = True
-                self._btc_locked_side = btc_side
             if follower_result:
                 self._followers_bought.add(follower_coin)
 
@@ -1022,8 +1033,6 @@ class CorrelationStrategy:
         if slug in self._scheduled_slugs:
             return
         self._scheduled_slugs.add(slug)
-        if len(self._scheduled_slugs) > 500:
-            self._scheduled_slugs.clear()
 
         task = asyncio.get_running_loop().create_task(
             self._check_resolution_for_slug(slug)
