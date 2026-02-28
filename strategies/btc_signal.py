@@ -1037,17 +1037,20 @@ class SignalStrategy:
             )
 
             if status in {"matched", "filled", "executed", "complete", "completed"}:
-                taking = _to_float(response.get("takingAmount", 0))
-                making = _to_float(response.get("makingAmount", 0))
-
-                # POST /order often omits fill amounts.  Verify via
-                # GET /data/order + associated trades to get the real
-                # fill size and execution price.
+                # ALWAYS verify via GET /data/order + trades.
+                # POST response's takingAmount/makingAmount are unreliable
+                # (observed: POST said 5.65 shares, PM actually filled 5.57).
                 t_verify_start = time.perf_counter()
-                if taking <= 0 and order_id:
+                taking = 0.0
+                making = 0.0
+                if order_id:
                     verified = await self._verify_fill(order_id, buy_price)
                     if verified:
                         taking, making = verified
+                # Fallback to POST response only if verify failed
+                if taking <= 0:
+                    taking = _to_float(response.get("takingAmount", 0))
+                    making = _to_float(response.get("makingAmount", 0))
                 t_verify_us = (time.perf_counter() - t_verify_start) * 1_000_000
 
                 fp = making / max(taking, 1e-12) if taking > 0 else buy_price
@@ -1776,8 +1779,9 @@ class SignalStrategy:
         if self.total_fills > 0:
             wr = (self.total_wins / self.total_resolved) * 100 if self.total_resolved > 0 else 0.0
             print(f"  Win rate:      {wr:.1f}%")
-            avg_price = self.total_spent / self.total_fills if self.total_fills > 0 else 0.0
-            print(f"  Avg buy price: ${avg_price:.4f}")
+            total_shares = sum(p.fill_size for p in self._all_positions)
+            avg_price = self.total_spent / total_shares if total_shares > 0 else 0.0
+            print(f"  Avg buy price: {avg_price:.4f}")
 
             print()
             print("  Per-coin breakdown (followers only):")
