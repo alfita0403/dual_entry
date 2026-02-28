@@ -98,6 +98,10 @@ class Redeemer:
         self.proxy_address = to_checksum_address(proxy_address)
         self.w3 = Web3(Web3.HTTPProvider(rpc_url))
 
+        # Polygon is a POA chain - inject middleware to handle extraData
+        from web3.middleware import ExtraDataToPOAMiddleware
+        self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+
         if not self.w3.is_connected():
             raise ValueError(f"Cannot connect to RPC: {rpc_url}")
 
@@ -122,7 +126,7 @@ class Redeemer:
             [USDC_ADDRESS, parent_collection_id, condition_id_bytes, index_sets],
         )
 
-        fn_selector = encode_packed(["bytes4"], [b"\x8e\xf4\xbe\x0f"])
+        fn_selector = encode_packed(["bytes4"], [b"\x01\xb7\x03\x7c"])
         return fn_selector + inner_data
 
     def encode_redeem_neg_risk(
@@ -140,7 +144,7 @@ class Redeemer:
             [condition_id_bytes, amounts],
         )
 
-        fn_selector = encode_packed(["bytes4"], [b"\x8e\xf4\xbe\x0f"])
+        fn_selector = encode_packed(["bytes4"], [b"\xdb\xec\xcb\x23"])
         return fn_selector + inner_data
 
     def send_transaction(
@@ -150,24 +154,16 @@ class Redeemer:
         value: int = 0,
     ) -> str:
         """Send a transaction through the proxy wallet."""
-        proxy_txn = [
-            1,  # typeCode (uint8)
-            to_checksum_address(to),  # to (address)
-            value,  # value (uint256)
-            data,  # data (bytes) - keep as bytes!
-        ]
-
-        # Encode the proxy call manually
-        calls_data = eth_abi_encode(["(uint8,address,uint256,bytes)[]"], [[proxy_txn]])
-
-        # Get the function selector for proxy
-        proxy_fn_selector = encode_packed(
-            ["bytes4"],
-            [b"\x8d\x80\xff\x0a"],
+        # Build the call using web3's ABI encoder (correct selector + encoding)
+        call_tuple = (
+            1,  # typeCode: 1 = DELEGATECALL
+            to_checksum_address(to),
+            value,
+            data,
         )
-
-        # Full data: selector + encoded args
-        full_data = proxy_fn_selector + calls_data
+        full_data = self.factory_contract.functions.proxy(
+            [call_tuple]
+        )._encode_transaction_data()
 
         # Get nonce: use tracked nonce or fetch pending from chain
         if self._next_nonce is None:
@@ -175,15 +171,17 @@ class Redeemer:
         else:
             nonce = self._next_nonce
 
-        # Use 1.3x gas price to avoid "replacement underpriced" errors
-        gas_price = int(self.w3.eth.gas_price * 1.3)
+        # Gas pricing: use network suggestion with a minimum of 50 gwei
+        suggested = self.w3.eth.gas_price
+        min_gas = self.w3.to_wei(50, "gwei")
+        gas_price = max(int(suggested * 1.5), min_gas)
 
         tx_params = {
             "from": self.account.address,
             "to": PROXY_WALLET_FACTORY_ADDRESS,
-            "data": full_data.hex(),
+            "data": full_data,  # already hex from _encode_transaction_data()
             "value": value,
-            "gas": 300000,
+            "gas": 500000,
             "gasPrice": gas_price,
             "nonce": nonce,
             "chainId": 137,
@@ -191,7 +189,7 @@ class Redeemer:
 
         signed = self.account.sign_transaction(tx_params)
         tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
         # Track nonce for next transaction
         self._next_nonce = nonce + 1
