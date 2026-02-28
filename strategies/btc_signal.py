@@ -576,10 +576,22 @@ class SignalStrategy:
             if m and m.start_timestamp() == market_start:
                 self._coins_entered.add(c)
 
+        # Pre-fetch fee rates for all known tokens so the hot path
+        # never blocks on an HTTP call to /fee-rate.
+        loop = asyncio.get_running_loop()
+        for c in self._coins_entered:
+            m = self._coin_markets.get(c)
+            if not m:
+                continue
+            for s in ("up", "down"):
+                tid = m.token_ids.get(s, "")
+                if tid and tid not in self._fee_rate_cache:
+                    loop.create_task(self._prefetch_fee(tid))
+
         # Start the watcher
         if self._fill_watcher_task and not self._fill_watcher_task.done():
             self._fill_watcher_task.cancel()
-        self._fill_watcher_task = asyncio.get_running_loop().create_task(
+        self._fill_watcher_task = loop.create_task(
             self._watch_and_trade()
         )
 
@@ -602,6 +614,17 @@ class SignalStrategy:
             if pos.market_slug and pos.market_slug not in seen_slugs:
                 seen_slugs.add(pos.market_slug)
                 self._schedule_resolution_all(pos.market_slug)
+
+    # ------------------------------------------------------------------
+    # Fee pre-fetch (runs as background task at cycle start)
+    # ------------------------------------------------------------------
+    async def _prefetch_fee(self, token_id: str) -> None:
+        """Fetch fee rate in the background so the hot path has a cache hit."""
+        try:
+            fee = await asyncio.to_thread(self.clob.get_fee_rate_bps, token_id)
+            self._fee_rate_cache[token_id] = fee
+        except Exception:
+            pass  # Will fall back to on-demand fetch if this fails
 
     # ------------------------------------------------------------------
     # Core: watch BTC signal and execute on cheapest follower
