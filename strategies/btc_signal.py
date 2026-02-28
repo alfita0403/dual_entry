@@ -319,6 +319,9 @@ class SignalStrategy:
         self._bought_side: Optional[str] = None  # which side was bought
         self._bought_price: Optional[float] = None  # at what price
 
+        # Event-driven: WS callback signals this when BTC book updates
+        self._book_event: asyncio.Event = asyncio.Event()
+
         # TUI
         self._last_render_ts: float = 0.0
         self._ticks_total: int = 0
@@ -501,6 +504,8 @@ class SignalStrategy:
                     asks = snapshot.asks
                     best = min(float(a.price) for a in asks) if asks else 1.0
                     self._best_asks[coin][side] = best
+                    # Wake the trading loop instantly on any book update
+                    self._book_event.set()
                     break
         except Exception:
             pass  # Malformed orderbook data; ignore and wait for next update
@@ -604,21 +609,30 @@ class SignalStrategy:
     async def _watch_and_trade(self) -> None:
         """Main trading loop for the signal strategy.
 
-        Monitors BTC asks. When BTC UP or DOWN ask >= threshold, finds
-        the cheapest follower on the SAME side and buys via FOK.
+        Event-driven: wakes on every WebSocket book update via
+        ``_book_event`` (<1 ms latency) instead of polling with sleep.
+        When BTC UP or DOWN ask >= threshold, finds the cheapest
+        follower on the SAME side and buys via FOK.
         Only one trade per 5-minute cycle.
         """
         while self.cycle_state == CycleState.ACTIVE:
+            # Wait for the next book update (any coin).
+            # Timeout at 2s so deadline/TUI checks still run even
+            # if no WS ticks arrive.
+            try:
+                await asyncio.wait_for(self._book_event.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+            self._book_event.clear()
+
             now = time.time()
 
             # Window expired check
             if now >= self._cycle_deadline:
-                await asyncio.sleep(0.1)
                 continue
 
             # Already traded this cycle -- nothing more to do
             if self._trade_executed:
-                await asyncio.sleep(1.0)
                 continue
 
             # --- BTC signal detection ---
@@ -676,8 +690,6 @@ class SignalStrategy:
             else:
                 # BTC not signalling -- clear TUI state
                 self._signal_side = None
-
-            await asyncio.sleep(0.5)
 
     # ------------------------------------------------------------------
     # Signal trade execution
