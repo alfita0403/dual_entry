@@ -305,6 +305,10 @@ class SignalStrategy:
         self._best_asks: Dict[str, Dict[str, float]] = {
             c: {"up": 1.0, "down": 1.0} for c in COINS
         }
+        # Polymarket server timestamps for each book update (seconds)
+        self._book_pm_ts: Dict[str, Dict[str, float]] = {
+            c: {"up": 0.0, "down": 0.0} for c in COINS
+        }
         self._coin_markets: Dict[str, Optional[MarketInfo]] = {
             c: None for c in COINS
         }
@@ -506,6 +510,12 @@ class SignalStrategy:
                     # index-0 is the best ask — no need for min().
                     best = asks[0].price if asks else 1.0
                     self._best_asks[coin][side] = best
+                    # Store Polymarket's server timestamp (seconds).
+                    # If PM sends millis (>1e12), convert to seconds.
+                    pm_ts = snapshot.timestamp
+                    if pm_ts > 1e12:
+                        pm_ts = pm_ts / 1000.0
+                    self._book_pm_ts[coin][side] = float(pm_ts)
                     # Wake the trading loop instantly on any book update
                     self._book_event.set()
                     break
@@ -544,6 +554,7 @@ class SignalStrategy:
 
         # Reset all orderbook caches
         self._best_asks = {c: {"up": 1.0, "down": 1.0} for c in COINS}
+        self._book_pm_ts = {c: {"up": 0.0, "down": 0.0} for c in COINS}
         # Clear fee cache — token IDs change every cycle
         self._fee_rate_cache.clear()
 
@@ -678,6 +689,8 @@ class SignalStrategy:
             if signal_side is not None:
                 self._signal_side = signal_side
                 t0 = time.perf_counter()
+                # Polymarket's timestamp for the BTC tick that triggered
+                pm_signal_ts = self._book_pm_ts.get("BTC", {}).get(signal_side, 0.0)
 
                 # Find cheapest follower on the SAME side
                 cheapest_coin: Optional[str] = None
@@ -711,6 +724,7 @@ class SignalStrategy:
                         ask_price=cheapest_ask,
                         t0=t0,
                         t_detect_us=t_detect_us,
+                        pm_signal_ts=pm_signal_ts,
                     )
                     # One attempt only: whether the FOK filled or missed,
                     # mark the cycle as attempted.  The opportunity is
@@ -732,6 +746,7 @@ class SignalStrategy:
         ask_price: Optional[float] = None,
         t0: float = 0.0,
         t_detect_us: float = 0.0,
+        pm_signal_ts: float = 0.0,
     ) -> None:
         """Execute a single trade: buy cheapest follower via FOK.
 
@@ -742,16 +757,21 @@ class SignalStrategy:
                        not provided.
             t0: perf_counter timestamp at signal detection (for latency log).
             t_detect_us: microseconds spent on detection logic.
+            pm_signal_ts: Polymarket server timestamp (epoch seconds) of
+                          the BTC book tick that triggered the signal.
         """
         if ask_price is None:
             ask_price = buy_price
+
+        # WS lag: how old was the BTC tick when we acted on it
+        ws_lag_ms = (time.time() - pm_signal_ts) * 1000 if pm_signal_ts > 0 else 0
 
         btc_ask = self._best_asks.get("BTC", {}).get(side, 0.0)
         log(
             f"SIGNAL: BTC-{side.upper()} @{btc_ask:.4f} >= {self.cfg.price}"
             f" -> BUY {coin}-{side.upper()} limit={buy_price:.4f}"
             f" (ask={ask_price:.4f})"
-            f" [detect={t_detect_us:.0f}us]",
+            f" [detect={t_detect_us:.0f}us ws_lag={ws_lag_ms:.1f}ms]",
             "trade",
         )
 
@@ -779,7 +799,8 @@ class SignalStrategy:
                 return
 
             result = await self._submit_live_order(
-                coin, side, token_id, market, buy_price, t0=t0,
+                coin, side, token_id, market, buy_price,
+                t0=t0, pm_signal_ts=pm_signal_ts,
             )
             if result:
                 self._bought_coin = coin
@@ -927,6 +948,7 @@ class SignalStrategy:
         market: MarketInfo,
         buy_price: float,
         t0: float = 0.0,
+        pm_signal_ts: float = 0.0,
     ) -> Optional[OrderTracker]:
         """Submit a FOK limit BUY to the CLOB.
 
@@ -977,11 +999,16 @@ class SignalStrategy:
             t_post_us = (time.perf_counter() - t_post_start) * 1_000_000
             t_total_us = (time.perf_counter() - t0) * 1_000_000 if t0 else 0
 
+            # E2E: from Polymarket's BTC book timestamp to now (POST done).
+            # This is the real-world latency the user cares about.
+            e2e_ms = (time.time() - pm_signal_ts) * 1000 if pm_signal_ts > 0 else 0
+
             timing = (
                 f"[fee={'hit' if fee_cached else 'MISS'}={t_fee_us:.0f}us"
                 f" sign={t_sign_us:.0f}us"
                 f" post={t_post_us:.0f}us"
-                f" total={t_total_us:.0f}us]"
+                f" total={t_total_us:.0f}us"
+                f" e2e={e2e_ms:.1f}ms]"
             )
 
             if not response.get("success", False):
