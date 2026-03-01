@@ -1114,7 +1114,12 @@ class StatArbStrategy:
         fee_rate_bps: int,
         label: str,
     ) -> Optional[Dict[str, Any]]:
-        """Send one FOK SELL to the CLOB. Returns the raw response or None."""
+        """Send one FOK SELL to the CLOB.
+
+        Returns response dict on success/expected failure, or None on
+        unexpected error.  HTTP 400 "balance" errors are returned as
+        {"success": False, "errorMsg": ...} so callers can retry.
+        """
         try:
             order = Order(
                 token_id=token_id,
@@ -1142,6 +1147,10 @@ class StatArbStrategy:
 
             return response
         except Exception as exc:
+            err = str(exc).lower()
+            if "balance" in err or "allowance" in err:
+                # Return as dict so retry loop can handle it
+                return {"success": False, "errorMsg": str(exc)}
             log(f"SELL FOK ERR {label}: {exc}", "error")
             return None
 
@@ -1357,9 +1366,18 @@ class StatArbStrategy:
                 )
                 signed = self.signer.sign_order(order)
 
-                response = await asyncio.to_thread(
-                    self.clob.post_order, signed, "GTC"
-                )
+                try:
+                    response = await asyncio.to_thread(
+                        self.clob.post_order, signed, "GTC"
+                    )
+                except Exception as exc:
+                    err = str(exc).lower()
+                    if ("balance" in err or "allowance" in err) \
+                            and attempt_i < len(size_attempts) - 1:
+                        log(f"GTC retry #{attempt_i+1}: {exc}", "info")
+                        continue
+                    log(f"GTC TP ERR {label}: {exc}", "warning")
+                    return  # non-balance error, give up
 
                 if response.get("success", False):
                     oid = (response.get("orderID")
