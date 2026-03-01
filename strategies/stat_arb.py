@@ -1196,17 +1196,15 @@ class StatArbStrategy:
                 )
                 self._fee_rate_cache[token_id] = fee_rate_bps
 
-            tick = float(market.tick_size) if market.tick_size else 0.01
-
-            # Best source: wallet_size from balance API (queried after buy)
-            # Fallback: re-query balance now, then retry with decreasing %
+            # Best source: wallet_size from on-chain balanceOf
+            # Fallback: re-query now, then retry with decreasing %
             raw_size = pos.wallet_size
             if not raw_size:
                 await self._query_wallet_balance(token_id)
                 raw_size = pos.wallet_size
 
             if raw_size:
-                # Exact balance known — single attempt
+                # Exact balance known — single attempt, 6-decimal precision
                 size_attempts = [raw_size]
             else:
                 # Balance unknown — retry with decreasing sizes
@@ -1216,9 +1214,9 @@ class StatArbStrategy:
             response = None
             sell_size = 0.0
             for attempt_i, attempt_raw in enumerate(size_attempts):
-                sell_size = max(round(int(attempt_raw / tick) * tick, 6), tick)
+                sell_size = round(attempt_raw, 6)
                 if attempt_i > 0:
-                    log(f"SELL retry #{attempt_i}: size={sell_size:.4f}", "info")
+                    log(f"SELL retry #{attempt_i}: size={sell_size:.6f}", "info")
 
                 response = await self._try_sell_fok(
                     token_id, market, sell_price, sell_size, fee_rate_bps, label,
@@ -1300,32 +1298,36 @@ class StatArbStrategy:
     async def _query_wallet_balance(self, token_id: str) -> None:
         """Query exact on-chain token balance via CTF balanceOf.
 
-        This is the same source Polymarket uses for the MAX button.
-        Stores the result in pos.wallet_size so sell orders use the
-        exact amount — zero residual shares.
+        On-chain settlement takes ~3s after CLOB fill confirmation,
+        so we retry with 1-second delays until the balance appears.
         """
         pos = self._position
         if not pos or self.cfg.dry_run:
             return
-        try:
-            raw = await asyncio.to_thread(
-                self._ctf.functions.balanceOf(
-                    self._safe_checksum, int(token_id),
-                ).call,
-            )
-            balance = raw / 1e6  # CTF tokens use 6 decimals
-            if balance > 0:
-                pos.wallet_size = balance
-                log(
-                    f"On-chain balance: {balance:.6f} shares"
-                    f" (fill_size={pos.fill_size:.6f},"
-                    f" fee={pos.fill_size - balance:+.6f})",
-                    "info",
+        # Retry: on-chain settlement takes ~3s after CLOB confirms fill
+        for attempt in range(6):  # 0, 1, 2, 3, 4, 5 seconds
+            if attempt > 0:
+                await asyncio.sleep(1.0)
+            try:
+                raw = await asyncio.to_thread(
+                    self._ctf.functions.balanceOf(
+                        self._safe_checksum, int(token_id),
+                    ).call,
                 )
-            else:
-                log("On-chain balance is 0 — retry sell will find correct size", "warning")
-        except Exception as exc:
-            log(f"On-chain balance query failed: {exc}", "warning")
+                balance = raw / 1e6  # CTF tokens use 6 decimals
+                if balance > 0:
+                    pos.wallet_size = balance
+                    log(
+                        f"On-chain balance: {balance:.6f} shares"
+                        f" (fill_size={pos.fill_size:.6f},"
+                        f" fee={pos.fill_size - balance:+.6f},"
+                        f" settled in {attempt}s)",
+                        "info",
+                    )
+                    return
+            except Exception as exc:
+                log(f"On-chain query err (attempt {attempt}): {exc}", "warning")
+        log("On-chain balance still 0 after 5s — retry sell will find size", "warning")
 
     # ------------------------------------------------------------------
     # GTC limit sell at TP price (maker = 0% fee)
@@ -1357,8 +1359,6 @@ class StatArbStrategy:
                 )
                 self._fee_rate_cache[token_id] = fee_rate_bps
 
-            tick = float(market.tick_size) if market.tick_size else 0.01
-
             # Use wallet_size if known, else retry with decreasing sizes
             if pos.wallet_size:
                 size_attempts = [pos.wallet_size]
@@ -1367,7 +1367,7 @@ class StatArbStrategy:
                                  [1.00, 0.99, 0.98, 0.97, 0.96, 0.95, 0.94, 0.93, 0.92]]
 
             for attempt_i, raw_size in enumerate(size_attempts):
-                sell_size = max(round(int(raw_size / tick) * tick, 6), tick)
+                sell_size = round(raw_size, 6)
 
                 order = Order(
                     token_id=token_id,
