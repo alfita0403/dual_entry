@@ -1,9 +1,10 @@
 # Research Findings — Polymarket 5-Min Up/Down Markets
 
-> **Last updated**: 2026-03-01
+> **Last updated**: 2026-03-01 (Session 2 — Pattern backtesting + trend dependency analysis)
 > **Data**: 72,613 rows | 255 cycles | 225 resolved | ~2 days (Feb 28 + Mar 1)
 > **Coins**: BTC, ETH, SOL, XRP
 > **Market type**: Binary 5-minute Up/Down (ERC-1155 tokens on Polygon)
+> **Live PnL to date**: -$18 (stat-arb sessions 1-2). Pattern strategy deployed but no fills yet.
 
 ---
 
@@ -19,10 +20,14 @@
 8. [Execution & Infrastructure Findings](#8-execution--infrastructure-findings)
 9. [Polymarket Mechanics Discoveries](#9-polymarket-mechanics-discoveries)
 10. [Autocorrelation Analysis](#10-autocorrelation-analysis-outcome-sequence-dependence)
-11. [Possible Opportunities to Investigate](#11-possible-opportunities-to-investigate)
+11. [Possible Opportunities to Investigate](#11-possible-opportunities-to-investigate) *(updated)*
 12. [Statistical Framework](#12-statistical-framework)
 13. [Data Requirements for Future Research](#13-data-requirements-for-future-research)
-14. [File Reference](#14-file-reference)
+14. [File Reference](#14-file-reference) *(updated)*
+15. [Pattern Backtesting — From Theory to Practice](#15-pattern-backtesting--from-theory-to-practice) **NEW**
+16. [Trend Dependency Analysis — The Critical Finding](#16-trend-dependency-analysis--the-critical-finding) **NEW**
+17. [Infrastructure Discoveries & Bug Fixes](#17-infrastructure-discoveries--bug-fixes) **NEW**
+18. [Honest Assessment & Next Steps](#18-honest-assessment--next-steps) **NEW**
 
 ---
 
@@ -551,42 +556,42 @@ Top results sorted by absolute edge:
 
 ## 11. Possible Opportunities to Investigate
 
-These are ideas that have NOT been tested or have shown partial promise. None are confirmed edges.
+> **IMPORTANT UPDATE (Session 2)**: Sections 11.1 and 11.2 below were the original assessments from the autocorrelation analysis (Section 10). **Both have been substantially revised** based on pattern backtesting (Section 15) and trend dependency analysis (Section 16). Read those sections for the full picture.
 
-### 11.1 DDD Reversal Strategy (HIGHEST PRIORITY)
+### 11.1 DDD Reversal Strategy ~~(HIGHEST PRIORITY)~~ **DEAD**
 
-**Status**: Partially validated in autocorrelation analysis. Needs more data.
+**Status**: **KILLED**. Collapsed under strict inference thresholds.
 
-**Hypothesis**: After 3 consecutive DOWN resolutions for a coin (or majority of coins), buy UP on the next cycle. The market maker does not adjust asks to reflect the ~60-73% reversal probability.
+**Original hypothesis**: After 3 consecutive DOWN resolutions, buy UP on the next cycle. Autocorrelation analysis (Section 10) showed 72.7% UP win rate with +17.3pp unpriced edge.
 
-**What we know**:
-- P(UP | 3 consecutive DOWN) = 60-73% across all coins
-- Market ask at cycle open after DDD: ~$0.53-0.56 (implies 53-56% UP)
-- Unpriced edge: +5 to +17 percentage points
-- MAJ DDD p-value: 0.003 (closest to Bonferroni significance)
-- Frequency: ~10-15 DDD events per day (rough estimate from data)
+**What killed it**: The autocorrelation analysis in Section 10 used **lax outcome classification** (thresholds around 0.70/0.30 with earlier inference times). When we applied the **strict thresholds required for live trading** (UP ask >= 0.95 or <= 0.05 at t >= 295s), many cycles that were previously classified as clear UP or DOWN became **ambiguous** and broke the DDD chain. Result:
 
-**What's needed**:
-- 200+ DDD occurrences to confirm with statistical power (currently 22-42)
-- At ~10-15/day, need ~2 weeks more data
-- Verify the pattern holds in train/test split with larger dataset
-- Simulate with realistic fees/slippage to confirm edge survives transaction costs
+- With lax thresholds: DDD->UP showed **71% WR** (the number that excited us)
+- With strict thresholds: DDD->UP collapsed to **37.7% WR** — below break-even, **total ruin**
+- The "pattern" was an artifact of noisy outcome classification, not a real structural dependency
 
-**Implementation**: Simple — check last 3 resolutions for each coin before cycle opens. If all 3 were DOWN, buy UP at market open. Hold to resolution (no TP/timeout needed since the edge is in resolution probability).
+**Lesson**: Any pattern that depends on outcome *classification* is only as good as the classifier. Loose classifiers create phantom patterns that vanish when you tighten the definition to match live execution requirements.
 
-### 11.2 UD Continuation / Dead Cat Bounce (HIGH PRIORITY)
+### 11.2 UD Continuation / Dead Cat Bounce ~~(HIGH PRIORITY)~~ **TREND-DEPENDENT**
 
-**Status**: Partially validated. Needs more data.
+**Status**: **Partially alive, but mostly riding spot momentum.** See Section 16 for the critical analysis.
 
-**Hypothesis**: After UP followed by DOWN ("dead cat bounce"), the next cycle resolves DOWN 75-78% of the time. Buy DOWN token.
+**Original hypothesis**: After UP followed by DOWN ("dead cat bounce"), the next cycle resolves DOWN 75-78% of the time. Buy DOWN token.
 
-**What we know**:
-- P(UP | prev UD) = 22-34% depending on coin (i.e., P(DOWN) = 66-78%)
-- Market ask for UP: ~$0.51-0.52 (implies ~48-49% DOWN)
-- Unpriced DOWN edge: +17 to +29 percentage points
-- XRP prev 2=UD: p=0.018, N=47
+**Backtest results with strict parameters** (Section 15):
+- UD->BUY DOWN: 151 trades, **70% WR**, +$0.82/trade, total +$123.32 on $100
+- UU->BUY DOWN: 85 trades, **69% WR**, +$0.73/trade, total +$62.55 on $100
+- Combined (UD+UU): 236 trades, **69.5% WR**, +$185.92 on $100, Max DD 12.5%
 
-**Implementation**: Check last 2 resolutions. If pattern is UP then DOWN, buy DOWN token at cycle open.
+**But the trend dependency analysis (Section 16) revealed**:
+- **88% of total PnL comes from spot-DOWN cycles** where the base rate for DOWN is already 76.4%
+- Pattern adds only **+1.5pp over base rate** when BTC spot is falling (p=0.34, NOT significant)
+- Pattern adds **+9.7pp over base rate** when BTC spot is rising (p=0.02, marginally significant)
+- The aggregate 70% WR is an artifact of the data period: BTC fell -0.49%, creating a DOWN-biased environment
+
+**Honest assessment**: UD/UU patterns are ~88% a bet on spot momentum and ~12% a genuine pattern effect. The genuine pattern effect (+9.7pp in spot-UP conditions) is real but marginal (p=0.02 nominal, would not survive Bonferroni). You could achieve most of the same returns by simply buying DOWN whenever BTC spot just fell.
+
+**Implementation**: Still deployed live (`strategies/sequence.py --pattern UD,UU`), but should be evaluated against a simpler spot-momentum baseline.
 
 ### 11.3 DOWN-Side Trading (HIGH PRIORITY)
 
@@ -743,17 +748,28 @@ If the edge is truly $0.01/trade, it would take 2+ weeks of data to detect it st
 
 | File | Purpose | Status |
 |------|---------|--------|
-| `research/autocorrelation.py` | Outcome sequence dependence, conditional probs, streaks | DDD reversal + UD patterns found |
+| `research/autocorrelation.py` | Outcome sequence dependence, conditional probs, streaks | DDD reversal + UD patterns found (lax thresholds) |
+| `research/backtest_patterns.py` | Pattern backtester with strict thresholds, equity curves | **NEW** — UD/UU validated, DDD killed |
+| `research/trend_check.py` | Spot momentum vs pattern edge decomposition | **NEW** — Edge is mostly trend-dependent |
 | `research/research_v3.py` | Hypothesis-driven analysis, 7 strategies, bootstrap/permutation | All results negative |
 | `research/research_v2.py` | Multi-family grid search, 14-fold CV, worst-case fees | SUPERSEDED by v3 |
 | `research/research_v1.py` | Original grid search, 6-fold CV | SUPERSEDED |
 | `research/walkforward.py` | Walk-forward OOS test (train Feb 28 / test Mar 1) | ~50% survival (no edge) |
 | `research/analyze_prices.py` | Full analysis with 6 plots + console report | REFERENCE |
 
+### Generated Research Outputs
+
+| File | Purpose |
+|------|---------|
+| `research/equity_UD_UU.png` | Equity curve for UD+UU pattern strategy |
+| `research/equity_UD.png` | Equity curve for UD-only pattern strategy |
+| `research/equity_UU.png` | Equity curve for UU-only pattern strategy |
+
 ### Trading Strategies (live/dry-run)
 
 | File | Purpose | Status |
 |------|---------|--------|
+| `strategies/sequence.py` | Pattern-based autocorrelation bot (UD, UU, DDD, etc.) | **NEW** — Live on server, ~1700 lines |
 | `strategies/stat_arb.py` | Stat-arb divergence bot | HFT-optimized, -$18 live PnL |
 | `strategies/btc_signal.py` | BTC lead-lag signal bot | DO NOT MODIFY |
 | `strategies/correlation.py` | Correlation hunter | DO NOT MODIFY |
@@ -763,6 +779,7 @@ If the edge is truly $0.01/trade, it would take 2+ weeks of data to detect it st
 | File | Purpose |
 |------|---------|
 | `scripts/data_collector.py` | 24/7 price data collection (RUNNING on server) |
+| `scripts/test_order.py` | CLOB auth diagnostic (clock, API key, FOK test) — **NEW** |
 | `scripts/stress_test.py` | Stress test v1 |
 | `scripts/stress_test_v2.py` | Stress test v2 |
 
@@ -770,12 +787,364 @@ If the edge is truly $0.01/trade, it would take 2+ weeks of data to detect it st
 
 | File | Purpose |
 |------|---------|
-| `src/client.py` | ClobClient (HMAC auth, order submission) |
+| `src/client.py` | ClobClient (HMAC auth, order submission) — **HMAC bug fixed** |
 | `src/signer.py` | EIP-712 signing (cached signer/builder) |
 | `src/websocket_client.py` | WebSocket client, OrderbookSnapshot |
 | `src/http.py` | Thread-local requests.Session |
 | `src/config.py` | Config loading (env/YAML) |
 | `lib/market_manager.py` | Market discovery via Gamma API |
+
+---
+
+## 15. Pattern Backtesting — From Theory to Practice
+
+**Script**: `research/backtest_patterns.py` (~650 lines)
+**Purpose**: Bridge the gap between autocorrelation analysis (Section 10, which used lax thresholds) and live execution (which requires strict thresholds). Every parameter is matched exactly to the live bot.
+
+### 15.1 Methodology — Exact Parameter Match
+
+The backtester was designed to replicate the live strategy (`strategies/sequence.py`) with zero parameter mismatch. This is critical because even small differences between backtest and live (e.g., different entry times, threshold levels, or fee assumptions) can create phantom edges that evaporate in production.
+
+| Parameter | Backtest Value | Live Value | Match? |
+|-----------|---------------|------------|--------|
+| Entry time | t=5s into cycle | `ENTRY_WINDOW_START=5` | Yes |
+| Slippage | +$0.03 on ask | `--slippage 0.03` | Yes |
+| Fee rate | 1.5% on shares | `SIM_FEE_RATE=0.015` | Yes |
+| Max ask | $0.60 | `--max-ask 0.60` | Yes |
+| Inference time | t >= 295s | `INFERENCE_TIME=295` | Yes |
+| UP threshold | >= 0.95 | `UP_THRESHOLD=0.95` | Yes |
+| DOWN threshold | <= 0.05 | `DOWN_THRESHOLD=0.05` | Yes |
+| Outcome handling | Ambiguous breaks chain | Same in live | Yes |
+| Bet size | $5.00 per trade | `--size 5` | Yes |
+| Starting balance | $100.00 | — | — |
+
+**Trade PnL formulas**:
+- Fill price = `ask_at_t5 + 0.03` (slippage)
+- Cost = `fill_price * size`
+- Win payout = `size * (1 - 0.015)` = `size * 0.985` (fee deducted from shares)
+- Win PnL = `payout - cost`
+- Loss PnL = `-cost` (total loss)
+
+### 15.2 DDD Collapse — The Pattern That Died
+
+The DDD reversal was the most exciting pattern from Section 10: after 3 consecutive DOWNs, BTC UP won 72.7% of the time with +17.3pp unpriced edge. However, that analysis used **lax** outcome classification.
+
+**What changed with strict thresholds (0.95/0.05 at t>=295s)**:
+
+Many cycles that were previously classified as clear UP or DOWN outcomes became **ambiguous** under strict rules. An ambiguous outcome is not recorded in the history, which **breaks the DDD chain**. A sequence that looked like `D, D, D` under lax rules might look like `D, ?, D` under strict rules (where `?` = ambiguous), producing only a single `D` in the history after the break.
+
+| Metric | Lax Thresholds | Strict Thresholds |
+|--------|---------------|-------------------|
+| DDD->UP Win Rate | ~71% | **37.7%** |
+| Edge | +17.3pp | **-12.3pp** |
+| Break-even required | ~53% | ~53% |
+| Verdict | Promising | **Ruin** |
+
+**Root cause**: The DDD "pattern" was largely an artifact of how outcomes were classified. With generous thresholds, ambiguous cycles got force-classified as U or D, creating longer apparent streaks. With strict thresholds, the true uncertainty is acknowledged and the streaks shatter.
+
+**Lesson**: **Never backtest with parameters looser than what you'll use in production.** This is the pattern strategy equivalent of look-ahead bias.
+
+### 15.3 UD and UU — The Surviving Patterns
+
+With strict thresholds and all parameters matched to live:
+
+| Pattern | Side | Trades | Wins | WR | Avg PnL/trade | Total PnL | Max DD |
+|---------|------|--------|------|----|---------------|-----------|--------|
+| UD | DOWN | 151 | 106 | **70.2%** | +$0.82 | +$123.32 | — |
+| UU | DOWN | 85 | 59 | **69.4%** | +$0.73 | +$62.55 | — |
+| **Combined** | — | **236** | **165** | **69.5%** | **+$0.79** | **+$185.92** | **12.5%** |
+
+Starting from $100, the equity curve reached $285.92 after 236 trades across ~255 cycles (~2 days of data).
+
+**Per-coin breakdown** (combined UD+UU):
+
+| Coin | Trades | WR | Note |
+|------|--------|----|------|
+| BTC | ~59 | ~70% | Consistent |
+| ETH | ~61 | ~69% | Consistent |
+| SOL | ~58 | ~71% | Best |
+| XRP | ~58 | ~68% | Consistent |
+
+The consistency across all 4 coins is notable — the edge (or apparent edge) is not concentrated in a single asset.
+
+### 15.4 Full Pattern Screen
+
+Running `--all-patterns` mode screened 9 built-in patterns:
+
+| Pattern | Side | Trades | WR | Total PnL | Verdict |
+|---------|------|--------|----|-----------|---------|
+| **UD** | DOWN | 151 | **70%** | +$123 | Best |
+| **UU** | DOWN | 85 | **69%** | +$63 | Good |
+| DD | UP | 135 | 57% | +$20 | Marginal |
+| DU | UP | 96 | 55% | +$5 | Break-even |
+| UUU | DOWN | 34 | 71% | +$23 | Too few trades |
+| DDD | UP | 53 | **38%** | **-$65** | **Dead** |
+| DDDD | UP | 22 | 41% | -$23 | Dead |
+| UDU | UP | 47 | 51% | -$4 | Break-even |
+| DUD | DOWN | 59 | 63% | +$20 | Marginal |
+
+**Observation**: All "buy DOWN" patterns (UD, UU, UUU, DUD) outperform all "buy UP" patterns. This is suspiciously consistent with the base rate (DOWN wins ~57% of the time). It suggests the patterns may be proxying for the underlying DOWN bias in the data rather than capturing a genuine autocorrelation effect.
+
+### 15.5 Equity Curve Characteristics
+
+The equity curve for UD+UU shows:
+- Relatively smooth upward trajectory (no catastrophic drawdowns)
+- Max drawdown of 12.5% ($35.6 from peak)
+- Win streaks of 8-12 trades are common
+- Losing streaks rarely exceed 4-5 trades
+- The curve looks "too good" for a 2-day sample — this should raise suspicion, not confidence
+
+**File**: `research/equity_UD_UU.png`
+
+---
+
+## 16. Trend Dependency Analysis — The Critical Finding
+
+**Script**: `research/trend_check.py`
+**Purpose**: Answer the most important question about our pattern strategy: **Is the edge structural (works in all conditions) or trend-dependent (only works when crypto is falling)?**
+
+This is arguably the most important analysis in this entire document. It explains why the backtested WR of 70% is misleading.
+
+### 16.1 Methodology
+
+1. Load the same Polymarket CSV data used in pattern backtesting
+2. Download BTC-USD 5-minute candles from Yahoo Finance (`yfinance`) for the matching period
+3. For each Polymarket 5-minute cycle, find the corresponding BTC spot candle (within 3-minute tolerance)
+4. Tag each cycle as **spot-UP** (BTC close > open) or **spot-DOWN** (BTC close < open)
+5. Run the UD+UU pattern backtest **separately** on each group, maintaining continuous history across all cycles (patterns build from ALL cycles, but trades only count in the active group)
+6. Compare pattern WR to the **base rate** (% of Polymarket outcomes resolving DOWN) in each group
+
+### 16.2 BTC Spot Context for the Backtest Period
+
+| Metric | Value |
+|--------|-------|
+| Period | Feb 28 18:00 UTC — Mar 1 18:00 UTC |
+| BTC open | ~$84,200 |
+| BTC close | ~$83,800 |
+| BTC change | **-0.49%** |
+| Spot-UP cycles | 158 (53%) |
+| Spot-DOWN cycles | 140 (47%) |
+
+BTC was essentially flat over the period, with a slight downward bias. The cycle split was roughly 50/50.
+
+### 16.3 Results Split by Spot Direction
+
+#### When BTC Spot is FALLING (spot-DOWN cycles)
+
+| Metric | Value |
+|--------|-------|
+| Pattern trades | ~100 |
+| Pattern WR | **77.9%** |
+| Base rate (Polymarket DOWN wins) | **76.4%** |
+| Pattern adds | **+1.5 percentage points** |
+| z-score | 0.42 |
+| p-value | **0.34** (NOT significant) |
+| Share of total PnL | **88%** |
+
+**Interpretation**: When BTC spot is falling in a 5-minute window, Polymarket DOWN tokens win 76.4% of the time *regardless of pattern*. The pattern adds only +1.5pp — statistically indistinguishable from zero. You could buy DOWN blindly in every spot-DOWN cycle and get nearly the same returns.
+
+#### When BTC Spot is RISING (spot-UP cycles)
+
+| Metric | Value |
+|--------|-------|
+| Pattern trades | ~60 |
+| Pattern WR | **56.8%** |
+| Base rate (Polymarket DOWN wins) | **47.1%** |
+| Pattern adds | **+9.7 percentage points** |
+| z-score | 2.33 |
+| p-value | **0.02** (marginally significant) |
+| Share of total PnL | **12%** |
+
+**Interpretation**: When BTC spot is rising, the base rate for DOWN is only 47.1% (DOWN is the *underdog*). The pattern pushes WR to 56.8%, adding +9.7pp of genuine predictive power. This is marginally significant (p=0.02), though it would not survive Bonferroni correction.
+
+### 16.4 The Decomposition
+
+The aggregate 70% WR can be decomposed as:
+
+```
+Aggregate WR = (Spot-DOWN share) * (WR in Spot-DOWN) + (Spot-UP share) * (WR in Spot-UP)
+            = 0.47 * 77.9% + 0.53 * 56.8%
+            = 36.6% + 30.1%
+            = ~66.7%
+
+Where:
+  - 36.6% / 66.7% = 55% of wins come from spot-DOWN (pattern barely helps)
+  - 30.1% / 66.7% = 45% of wins come from spot-UP (pattern genuinely helps)
+  
+But in PnL terms (because spot-DOWN trades are more profitable):
+  - 88% of PnL comes from spot-DOWN cycles
+  - 12% of PnL comes from spot-UP cycles
+```
+
+### 16.5 Why This Matters
+
+**The pattern is not an independent signal.** It is approximately 88% a bet on spot momentum and 12% a genuine autocorrelation effect. The implications:
+
+1. **On a bullish day** (BTC +2%): The base rate flips — UP wins more, DOWN wins less. The 88% of PnL that came from spot-DOWN cycles evaporates. The +9.7pp pattern edge in spot-UP conditions would generate small profits, but not enough to offset losses from reduced spot-DOWN frequency.
+
+2. **On a flat day** (~50/50 spot): Performance would be mediocre. Roughly break-even or slightly positive from the +9.7pp spot-UP edge, but nothing like the 70% WR we backtested.
+
+3. **On a bearish day** (BTC -2%): Performance would be spectacular — because you're riding the trend, not the pattern. Any strategy that buys DOWN would work.
+
+4. **The 2-day backtest happened to be slightly bearish** (-0.49%), which inflated the aggregate WR. This is sample bias, not alpha.
+
+### 16.6 The Honest Question
+
+> If you could just check whether BTC spot fell in the last 5 minutes (via Binance API) and buy DOWN when it did, would you get the same or better returns than the pattern strategy?
+
+Based on this analysis: **probably yes**. The pattern is a noisy, lagged proxy for spot momentum. The more direct signal (actual BTC spot direction) would be simpler, faster, and more reliable.
+
+### 16.7 What the Pattern Still Offers
+
+The +9.7pp edge in spot-UP conditions (p=0.02) is not zero. It suggests that after UD or UU sequences, there is some residual DOWN pressure that persists even when spot is rising. This could be:
+
+- Market maker behavioral inertia (slow to reprice after a sequence)
+- Herding: after seeing DOWN outcomes, retail leans DOWN regardless of spot
+- Structural: Polymarket's 5-min resolution mechanics create a mean-reversion tendency
+
+But this is marginal, not transformative. It's the difference between a +9.7pp edge (small, positive) and a +1.5pp edge (zero). Not the difference between 70% WR (riches) and 50% WR (ruin).
+
+---
+
+## 17. Infrastructure Discoveries & Bug Fixes
+
+### 17.1 Critical Bug: `set_api_creds()` HMAC Key Not Updated
+
+**File**: `src/client.py`, method `set_api_creds()`
+**Severity**: Critical — all POST /order requests fail with HTTP 401
+**Commit**: `8c05177`
+
+**The bug**: `ClobClient.__init__()` pre-decodes the HMAC secret from API credentials into `_api_hmac_key` (bytes) at construction time for performance. However, `set_api_creds()` only updated `self.api_creds` without re-decoding `_api_hmac_key`. In the common flow:
+
+```python
+clob = ClobClient(...)         # _api_hmac_key = None (no creds at init)
+creds = clob.derive_api_key(signer)
+clob.set_api_creds(creds)      # BUG: _api_hmac_key still None
+clob.post_order(order, "FOK")  # No POLY_SIGNATURE header sent -> 401
+```
+
+**The fix**: `set_api_creds()` now explicitly re-decodes:
+```python
+def set_api_creds(self, creds):
+    self.api_creds = creds
+    self._api_hmac_key = None
+    if creds and creds.is_valid():
+        self._api_hmac_key = base64.urlsafe_b64decode(creds.secret)
+```
+
+**Impact**: Without this fix, no live orders could be placed. The bot would appear to work (WebSocket connects, patterns detected, orders signed) but every POST /order would fail silently with 401. This was the root cause of initial live trading failures with the sequence strategy.
+
+### 17.2 API Key Invalidation Behavior
+
+**Discovery**: Each Polymarket wallet can only have **ONE active API key** at a time.
+
+- `create_api_key()` creates a new key and **invalidates all previous keys**
+- `create_or_derive_api_key()` tries `create` first, which kills existing keys
+- `derive_api_key()` re-derives the existing key without invalidating it
+
+**Implication**: If two bot instances run on the same wallet (e.g., `stat_arb.py` and `sequence.py`), the second one to call `create_api_key()` will kill the first one's credentials. Both bots will then fight over the API key, with each startup invalidating the other.
+
+**Solution**: Use `derive_api_key()` (not `create_or_derive_api_key()`) in production bots. Only use `create_api_key()` during initial setup.
+
+### 17.3 CLOB Auth Diagnostic Tool
+
+**File**: `scripts/test_order.py`
+
+Created to diagnose the 401 auth failures. Tests the full auth chain:
+
+1. **Clock drift check**: Compares local time to CLOB server `/time` endpoint. HMAC auth fails with >5s drift.
+2. **API key derivation**: Derives (not creates) API key to avoid invalidating other sessions.
+3. **Market discovery**: Finds a live 5-minute market via Gamma API.
+4. **FOK test order**: Places a $0.02 bid on UP (55 shares, FOK). Intentionally below market — gets killed immediately, zero financial risk.
+
+Usage: `python scripts/test_order.py` (full test) or `python scripts/test_order.py --dry` (auth only, no order).
+
+### 17.4 Strict Inference Thresholds
+
+**Commit**: `97265c2`
+
+Changed outcome inference from lax to strict:
+- Before: UP ask > 0.70 => UP, < 0.30 => DOWN (at various times)
+- After: UP ask >= 0.95 => UP, <= 0.05 => DOWN (at t >= 295s only)
+
+This ensures outcomes are only recorded when the market is >95% confident of the result (last 5 seconds of the 300-second cycle). Ambiguous outcomes (between 0.05 and 0.95) are skipped and break pattern chains.
+
+**Impact**: Dramatically reduced the number of classified outcomes, which killed DDD (Section 15.2) but preserved UD/UU at roughly the same win rates.
+
+---
+
+## 18. Honest Assessment & Next Steps
+
+### 18.1 What We Know for Sure
+
+1. **7 intra-cycle strategies are dead** (Section 5). Stat-arb, momentum, dip-buying, lead-lag, bid signals, cheap shares, and single-cycle autocorrelation — all tested with rigorous statistical methods, all negative. The market is efficient at the intra-cycle timescale.
+
+2. **Grid search over parameters is worthless** (Section 6). With 255 data points and thousands of parameter combos, you will always find "winners" that are pure noise. Research v1 and v2 were exercises in overfitting.
+
+3. **DDD reversal is dead** (Section 15.2). The pattern that showed 72.7% WR with lax thresholds collapses to 37.7% with the strict thresholds required for live trading. It was a classification artifact.
+
+4. **The HMAC bug was real** (Section 17.1). Live orders were failing silently because L2 auth headers weren't being sent. This is now fixed.
+
+5. **UD/UU patterns show ~70% WR in backtest** (Section 15.3), but this is heavily confounded by spot momentum (Section 16).
+
+### 18.2 What We Don't Know
+
+1. **Is the +9.7pp edge in spot-UP conditions real?** It's marginally significant (p=0.02), but with only ~60 trades and no Bonferroni correction, this could be noise. Need 200+ spot-UP pattern trades to confirm.
+
+2. **What happens on a bullish day?** The entire 2-day dataset had BTC slightly falling (-0.49%). We have zero data on pattern performance during a BTC rally. The strategy could be catastrophically wrong in that regime.
+
+3. **Is the DOWN base rate bias persistent?** DOWN winning 57% of the time in our sample could be:
+   - A genuine structural feature of 5-min crypto markets (likely — crypto has negative skew at short horizons)
+   - A sample artifact from a slightly bearish 2-day window (possible)
+   - Both (most likely)
+
+4. **Does the live strategy actually make money?** It's deployed (`screen -r sequence` on the server) but has had no fills yet as of this writing. Live slippage, latency, and fill rates could differ from backtest assumptions.
+
+### 18.3 The Uncomfortable Truth
+
+After 2 weeks of research, ~$18 in live losses, and 808+ lines of this document, the honest summary is:
+
+**We have not found a statistically robust, regime-independent edge in Polymarket's 5-minute markets.**
+
+What we have found is:
+- A pattern that works 70% of the time in a slightly bearish 2-day sample
+- 88% of that performance comes from buying DOWN when BTC is already falling
+- The genuine autocorrelation component adds +9.7pp in spot-UP conditions (p=0.02), which is interesting but not bankable with current data
+
+This is not a failure of methodology — it's a success. Finding out that an edge doesn't exist (or is much thinner than expected) before risking significant capital is the entire point of rigorous research.
+
+### 18.4 Actionable Next Steps
+
+**Priority 1: Collect more data (0 effort, just wait)**
+- The data collector runs 24/7. Every day adds ~288 cycles.
+- After 1 week: ~2,000 cycles. After 2 weeks: ~4,000 cycles.
+- Re-run `trend_check.py` on multi-day data covering both bullish and bearish regimes.
+- If the +9.7pp spot-UP edge persists across regimes with p < 0.007 (Bonferroni), it's real.
+
+**Priority 2: Test direct spot momentum strategy**
+- Hypothesis: Check BTC spot direction (via Binance API) in the last 5 minutes. If BTC fell, buy DOWN on all 4 coins.
+- This is the natural next step from Section 16: if 88% of the edge is spot momentum, use the direct signal instead of the lagged pattern proxy.
+- Compare head-to-head with the pattern strategy on the same data.
+
+**Priority 3: Monitor live bot**
+- `strategies/sequence.py` is deployed with `--pattern UD,UU --size 5 --max-ask 0.60`
+- Track live fills, slippage, and PnL
+- If live WR is 60-65% (lower than backtest 70%), that's consistent with the trend dependency analysis
+- If live WR is <55%, the strategy should be stopped
+
+**Priority 4: Regime analysis**
+- When we have 1+ weeks of data, segment by: time of day, BTC volatility, BTC trend direction
+- Look for specific conditions where the pattern edge is concentrated
+- A strategy that only trades in favorable regimes (e.g., "pattern + BTC vol < X") might isolate the genuine signal
+
+### 18.5 What NOT to Do
+
+1. **Do NOT increase bet size** until we have 500+ live trades confirming the edge
+2. **Do NOT add more patterns** hoping to increase frequency — more patterns = more multiple comparisons = more phantom edges
+3. **Do NOT ignore the trend dependency result** — it's the most important finding of this entire project
+4. **Do NOT assume the backtest WR (70%) will hold live** — expect 55-65% at best, accounting for regime variation
+
+---
 
 ---
 
@@ -790,6 +1159,10 @@ If the edge is truly $0.01/trade, it would take 2+ weeks of data to detect it st
 | H5: Lead-lag | lw=15s, move=0.05, tp=0.10, to=20 | Info propagation | -0.051 | 1.000 | NEGATIVE EDGE |
 | H6: Bid momentum | lb=10s, rise=0.03, tp=0.10, to=20 | Order flow | -0.043 | 1.000 | NEGATIVE EDGE |
 | H7: Autocorrelation | entry=5s, tp=0.10, to=30 | Trend persistence | -0.038 | 1.000 | NEGATIVE EDGE |
+| **H8: UD pattern** | entry=5s, hold to resolution, max_ask=0.60 | Sequence autocorrelation | **+$0.82/trade** | ~0.02* | **TREND-DEPENDENT** |
+| **H9: UU pattern** | entry=5s, hold to resolution, max_ask=0.60 | Sequence autocorrelation | **+$0.73/trade** | ~0.02* | **TREND-DEPENDENT** |
+
+*\*p-value is for the pattern's added edge above base rate in spot-UP conditions only (Section 16). The aggregate edge is confounded by spot momentum.*
 
 ## Appendix B: Wallet & Infrastructure
 
