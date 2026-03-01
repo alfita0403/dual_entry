@@ -171,11 +171,11 @@ def find_signals_cheap(cycles, outcomes, max_price, max_entry_t):
 
 # ── Trade simulation ─────────────────────────────────────────
 
-def simulate(signals, tp, timeout, fee=0.01, entry_delay=0):
+def simulate(signals, tp, timeout, fee=0.01, entry_delay=0, slippage=0.0):
     expire_mode = timeout >= 300  # TP-or-expire: no forced sell
     trades = []
     for sig in signals:
-        entry = sig["entry_ask"]
+        entry = sig["entry_ask"] + slippage  # Worst-case: FOK fills above ask
         ft, fb = sig["future_t"], sig["future_bid"]
         max_t = min(sig["t"] + timeout, 300)
 
@@ -186,7 +186,7 @@ def simulate(signals, tp, timeout, fee=0.01, entry_delay=0):
         tp_idx = np.argmax(tp_mask) if tp_mask.any() else -1
 
         if tp_idx >= 0 and tp_mask[tp_idx]:
-            pnl = float(fb[tp_idx]) - entry - fee
+            pnl = tp - fee  # Conservative: fill at limit price, no price improvement
             hold = int(ft[tp_idx]) - sig["t"]
             etype = "TP"
         elif expire_mode:
@@ -285,10 +285,11 @@ def build_folds(cycles, outcomes):
 # ── Main sweep ───────────────────────────────────────────────
 
 def main():
-    FEE = 0.01
+    FEE = 0.02        # Worst-case: buy fee (~1.5%) + trading friction
+    SLIPPAGE = 0.01   # FOK fills above displayed ask (1-2 ticks)
     START = 100.0
     BET = 10.0
-    ENTRY_DELAY = 5  # seconds: on-chain settlement before GTC is placed
+    ENTRY_DELAY = 5   # seconds: on-chain settlement before GTC is placed
 
     csv_files = sorted(str(f) for f in Path("data").glob("prices_*.csv"))
     if not csv_files:
@@ -300,7 +301,7 @@ def main():
     outcomes = [determine_outcomes(c) for c in cycles]
     n_res = sum(1 for o in outcomes if any(v is not None for v in o.values()))
     print(f"{len(df):,} rows | {len(cycles)} cycles | {n_res} resolved")
-    print(f"Fee={FEE}/$ RT | ${START} start | ${BET}/trade")
+    print(f"Fee={FEE} | Slippage={SLIPPAGE} | Delay={ENTRY_DELAY}s | ${START} start | ${BET}/trade")
 
     folds = build_folds(cycles, outcomes)
     fold_names = list(folds.keys())
@@ -346,7 +347,7 @@ def main():
             sigs = cache[key]
             if not sigs:
                 continue
-            trades = simulate(sigs, p["tp"], p["to"], FEE, ENTRY_DELAY)
+            trades = simulate(sigs, p["tp"], p["to"], FEE, ENTRY_DELAY, SLIPPAGE)
             if len(trades) < 3:
                 continue
             pnls = [t["pnl"] for t in trades]
@@ -370,7 +371,7 @@ def main():
             sigs = cache[key]
             if not sigs:
                 continue
-            trades = simulate(sigs, p["tp"], p["to"], FEE, ENTRY_DELAY)
+            trades = simulate(sigs, p["tp"], p["to"], FEE, ENTRY_DELAY, SLIPPAGE)
             if len(trades) < 3:
                 continue
             pnls = [t["pnl"] for t in trades]
@@ -394,7 +395,7 @@ def main():
             sigs = cache[key]
             if not sigs:
                 continue
-            trades = simulate(sigs, p["tp"], p["to"], FEE, ENTRY_DELAY)
+            trades = simulate(sigs, p["tp"], p["to"], FEE, ENTRY_DELAY, SLIPPAGE)
             if len(trades) < 3:
                 continue
             pnls = [t["pnl"] for t in trades]

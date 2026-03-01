@@ -43,7 +43,7 @@ credentials/
 *.log
 data/
 reports/
-nul
+research/reports/
 
 # Claude Code
 .claude/

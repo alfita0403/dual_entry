@@ -4,7 +4,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A beginner-friendly Python trading bot for Polymarket with gasless transactions via Builder Program. Uses EIP-712 signing for orders, encrypted private key storage, and supports both the CLOB API and Relayer API.
+A Python trading bot for Polymarket's 5-minute Up/Down binary crypto markets (BTC, ETH, SOL, XRP). Uses the Builder Program for gasless transactions via EIP-712 signing. Includes a full research pipeline for strategy development with statistical rigor.
+
+## Project Structure
+
+```
+dual_entry/
+├── src/                  # Core library (client, signer, config, websocket)
+├── lib/                  # Shared strategy libraries (market_manager, console)
+├── strategies/           # Live trading strategies (run in production/dry-run)
+├── research/             # Research analysis scripts and findings
+│   └── FINDINGS.md       # Comprehensive research results
+├── scripts/              # Utility scripts (data collector, stress tests, setup)
+├── tests/                # Unit tests (pytest)
+├── apps/                 # Interactive tools (TUI, WS streams)
+├── examples/             # Beginner examples
+├── docs/                 # Polymarket API documentation
+└── data/                 # Price data CSVs (gitignored, collected 24/7)
+```
 
 ## Common Commands
 
@@ -24,12 +41,19 @@ python scripts/full_test.py
 python scripts/run_bot.py              # Quick demo
 python scripts/run_bot.py --interactive # Interactive mode
 
+# Run a live strategy
+python strategies/stat_arb.py --spread 0.15 --target 0.15 --timeout 20 --size 10
+python strategies/stat_arb.py --dry-run --name "test_config"
+
+# Run research analysis
+python research/autocorrelation.py     # Outcome sequence analysis
+python research/research_v3.py         # Hypothesis-driven strategy tests
+
+# Data collection (runs 24/7 on server)
+python scripts/data_collector.py
+
 # Testing
-pytest tests/ -v                        # Run all tests (89 tests)
-pytest tests/test_utils.py -v           # Test utility functions
-pytest tests/test_bot.py -v             # Test bot module
-pytest tests/test_crypto.py -v          # Test encryption
-pytest tests/test_signer.py -v          # Test EIP-712 signing
+pytest tests/ -v                        # Run all tests
 ```
 
 ## Architecture

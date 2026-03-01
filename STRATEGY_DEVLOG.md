@@ -313,19 +313,27 @@ At `--price 0.80`, followers are often already expensive (0.70-0.76). Edge is th
 
 ## Key Files Reference
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `strategies/stat_arb.py` | ~2357 | Stat-Arb Divergence strategy (ACTIVE) |
-| `strategies/btc_signal.py` | ~1960 | Signal Hunter strategy (PRIMARY) |
-| `strategies/cheap_quote.py` | ~1797 | Cheap Quote strategy |
-| `strategies/correlation.py` | ~1771 | Correlation Hunter (DO NOT MODIFY) |
-| `strategies/research.py` | ~521 | Cross-validated parameter optimizer |
-| `strategies/analyze_prices.py` | — | Analysis + 6 plots + TP backtest |
-| `strategies/data_collector.py` | — | 24/7 price data collection (1 sample/s) |
-| `src/signer.py` | ~334 | EIP-712 signing with cached signer/builder |
-| `src/client.py` | ~893 | CLOB + Relayer API client |
-| `src/websocket_client.py` | ~786 | WS client, OrderbookSnapshot |
-| `lib/market_manager.py` | ~571 | MarketManager, market discovery |
-| `CLAUDE.md` | — | Claude Code instructions and project context |
-| `signal_trades.txt` | — | Signal Hunter trade log (server only) |
-| `stat_arb_trades.txt` | — | Stat-Arb trade log (server only) |
+| File | Purpose |
+|------|---------|
+| **Strategies (live trading)** | |
+| `strategies/stat_arb.py` | Stat-Arb Divergence strategy (ACTIVE) |
+| `strategies/btc_signal.py` | Signal Hunter strategy (DO NOT MODIFY) |
+| `strategies/cheap_quote.py` | Cheap Quote strategy |
+| `strategies/correlation.py` | Correlation Hunter (DO NOT MODIFY) |
+| **Research (analysis)** | |
+| `research/FINDINGS.md` | Comprehensive research results |
+| `research/autocorrelation.py` | Outcome sequence dependence analysis |
+| `research/research_v3.py` | Hypothesis-driven strategy tests |
+| `research/research_v2.py` | Multi-family grid search |
+| `research/research_v1.py` | Original grid search |
+| `research/walkforward.py` | Walk-forward OOS test |
+| `research/analyze_prices.py` | Analysis + 6 plots + TP backtest |
+| **Scripts (utilities)** | |
+| `scripts/data_collector.py` | 24/7 price data collection (1 sample/s) |
+| `scripts/stress_test.py` | Stress test v1 |
+| `scripts/stress_test_v2.py` | Stress test v2 |
+| **Core** | |
+| `src/signer.py` | EIP-712 signing with cached signer/builder |
+| `src/client.py` | CLOB + Relayer API client |
+| `src/websocket_client.py` | WS client, OrderbookSnapshot |
+| `lib/market_manager.py` | MarketManager, market discovery |
