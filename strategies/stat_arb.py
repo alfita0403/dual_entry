@@ -1299,16 +1299,16 @@ class StatArbStrategy:
     async def _query_wallet_balance(self, token_id: str) -> None:
         """Query exact on-chain token balance via CTF balanceOf.
 
-        On-chain settlement takes ~3s after CLOB fill confirmation,
-        so we retry with 1-second delays until the balance appears.
+        On-chain settlement takes ~2-4s after CLOB fill confirmation.
+        Polls every 0.5s to minimize delay before placing GTC sell.
         """
         pos = self._position
         if not pos or self.cfg.dry_run:
             return
-        # Retry: on-chain settlement takes ~3s after CLOB confirms fill
-        for attempt in range(6):  # 0, 1, 2, 3, 4, 5 seconds
+        t0 = time.monotonic()
+        for attempt in range(12):  # 12 * 0.5s = 6s max
             if attempt > 0:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
             try:
                 raw = await asyncio.to_thread(
                     self._ctf.functions.balanceOf(
@@ -1317,18 +1317,19 @@ class StatArbStrategy:
                 )
                 balance = raw / 1e6  # CTF tokens use 6 decimals
                 if balance > 0:
+                    elapsed = time.monotonic() - t0
                     pos.wallet_size = balance
                     log(
                         f"On-chain balance: {balance:.6f} shares"
                         f" (fill_size={pos.fill_size:.6f},"
                         f" fee={pos.fill_size - balance:+.6f},"
-                        f" settled in {attempt}s)",
+                        f" settled in {elapsed:.1f}s)",
                         "info",
                     )
                     return
             except Exception as exc:
                 log(f"On-chain query err (attempt {attempt}): {exc}", "warning")
-        log("On-chain balance still 0 after 5s — retry sell will find size", "warning")
+        log("On-chain balance still 0 after 6s — sell will retry with decreasing sizes", "warning")
 
     # ------------------------------------------------------------------
     # GTC limit sell at TP price (maker = 0% fee)
@@ -1601,46 +1602,11 @@ class StatArbStrategy:
             if result:
                 # Enter holding state for TP/timeout monitoring
                 self._holding_position = True
-
-                # 1. Provisional GTC immediately (conservative 2% fee buffer)
-                #    Truncate to 2 decimals — CLOB truncates sizes anyway.
-                conservative_size = math.floor(result.fill_size * 0.98 * 100) / 100
-                await self._place_tp_gtc_sell(
-                    token_id, market, size_override=conservative_size,
-                )
-
-                # 2. Wait for on-chain settlement (4-8s)
+                # Wait for on-chain settlement then place GTC immediately.
+                # CLOB validates on-chain balance for sells — cannot place
+                # before settlement (HTTP 400 "not enough balance").
                 await self._query_wallet_balance(token_id)
-
-                # 3. Replace GTC with exact balance if still active
-                pos = self._position
-                if (pos and pos.wallet_size
-                        and self._tp_gtc_active
-                        and pos.wallet_size > conservative_size + 0.001):
-                    old_id = self._tp_order_id or ""
-                    log(
-                        f"Replacing provisional GTC ({conservative_size:.2f})"
-                        f" with exact ({pos.wallet_size:.6f})",
-                        "info",
-                    )
-                    # Cancel provisional
-                    try:
-                        await asyncio.to_thread(
-                            self.clob.cancel_order, old_id,
-                        )
-                    except Exception:
-                        # Might already be filled — poll will detect
-                        filled = await self._poll_tp_order()
-                        if filled and pos:
-                            await self._record_gtc_tp_fill(pos, filled)
-                            # GTC filled during settlement — done
-                        else:
-                            log("GTC cancel failed, not filled either", "warning")
-                        # Either way, skip replacement
-                    else:
-                        self._tp_order_id = None
-                        self._tp_gtc_active = False
-                        await self._place_tp_gtc_sell(token_id, market)
+                await self._place_tp_gtc_sell(token_id, market)
             else:
                 # FOK missed -- mark cycle as attempted
                 self._trade_executed = True
