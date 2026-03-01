@@ -376,6 +376,7 @@ class StatArbStrategy:
         self.total_resolved: int = 0
         self.session_pnl: float = 0.0
         self.total_spent: float = 0.0
+        self.total_received: float = 0.0   # sell proceeds + win payouts
         self.total_shares: float = 0.0
         self.total_tp: int = 0
         self.total_timeout: int = 0
@@ -464,6 +465,10 @@ class StatArbStrategy:
                     # Early exit (TP or TIMEOUT)
                     pnl_val = _to_float(pnl_str)
                     self.session_pnl += pnl_val
+                    # Restore sell proceeds
+                    exit_price_val = _to_float(fields.get("exit", "0"))
+                    if exit_price_val > 0 and size > 0:
+                        self.total_received += exit_price_val * size
                     if exit_type == "TP":
                         self.total_tp += 1
                         self.total_wins += 1
@@ -490,6 +495,7 @@ class StatArbStrategy:
                         self.coin_resolved[coin] += 1
                     profit_str = outcome.replace("WIN +$", "").replace("WIN +", "")
                     self.session_pnl += _to_float(profit_str)
+                    self.total_received += size  # payout = size * 1.0
 
                 elif outcome.startswith("LOSS"):
                     self.total_losses += 1
@@ -601,6 +607,7 @@ class StatArbStrategy:
             # Invalidate stale orderbook data from old market
             self._best_asks[coin] = {"up": 1.0, "down": 1.0}
             self._best_bids[coin] = {"up": 0.0, "down": 0.0}
+            self._book_pm_ts[coin] = {"up": 0.0, "down": 0.0}
             log(f"{coin} -> {new_slug}", "info")
             self._maybe_enter_cycle(coin, market)
 
@@ -615,6 +622,16 @@ class StatArbStrategy:
         market = self._coin_markets.get(coin)
         if not market:
             return
+
+        # Reject stale data from previous cycle's market.
+        # After a new cycle starts, _cycle_ts is set to the new market's
+        # start timestamp.  Any coin whose _coin_markets still points to
+        # the old market will have a different start_timestamp and be
+        # rejected here — preventing stale prices from leaking through.
+        if self._cycle_ts is not None:
+            ms = market.start_timestamp()
+            if ms is not None and ms != self._cycle_ts:
+                return
 
         try:
             asset_id = snapshot.asset_id
@@ -791,11 +808,10 @@ class StatArbStrategy:
 
             now = time.time()
 
-            # Window expired check
-            if now >= self._cycle_deadline:
-                continue
-
-            # If we have a position, monitor for TP/timeout
+            # If we have a position, monitor TP/timeout REGARDLESS of
+            # whether the entry window has expired.  The window only
+            # controls when NEW entries are allowed — once we're in a
+            # position, TP/timeout monitoring must continue until exit.
             if self._holding_position:
                 await self._check_tp_exit(now)
                 continue
@@ -804,12 +820,16 @@ class StatArbStrategy:
             if self._trade_executed:
                 continue
 
+            # Window expired — no more entries allowed
+            if now >= self._cycle_deadline:
+                continue
+
             # --- Signal detection: group mean divergence ---
             asks: Dict[str, float] = {}
             for coin in COINS:
                 ask = self._best_asks[coin]["up"]
-                if ask >= 1.0:  # sentinel = no data yet
-                    continue
+                if ask >= 1.0 or ask < 0.02:
+                    continue  # sentinel (1.0) or stale from resolved market (<0.02)
                 asks[coin] = ask
 
             if len(asks) < 4:
@@ -919,6 +939,7 @@ class StatArbStrategy:
             # Update stats
             self.total_resolved += 1
             self.session_pnl += sim_pnl
+            self.total_received += sim_exit * pos.fill_size
             if exit_type == "TP":
                 self.total_tp += 1
                 if sim_pnl >= 0:
@@ -992,6 +1013,7 @@ class StatArbStrategy:
                 # Update stats
                 self.total_resolved += 1
                 self.session_pnl += actual_pnl
+                self.total_received += actual_exit_price * sell_result.fill_size
                 if exit_type == "TP":
                     self.total_tp += 1
                     self.total_wins += 1
@@ -1642,6 +1664,7 @@ class StatArbStrategy:
                 if coin_key in self.coin_wins:
                     self.coin_wins[coin_key] += 1
                 self.session_pnl += profit
+                self.total_received += pos.payout
                 outcome_str = f"WIN +${profit:.4f}"
                 log(
                     f"WIN  {pos.coin}-{pos.side.upper()} "
@@ -1780,6 +1803,7 @@ class StatArbStrategy:
                             if coin_key in self.coin_wins:
                                 self.coin_wins[coin_key] += 1
                             self.session_pnl += profit
+                            self.total_received += payout
                             log(
                                 f"[sweep-orphan] WIN  {coin}-{side.upper()} "
                                 f"@${entry_price:.2f} "
@@ -2107,12 +2131,13 @@ class StatArbStrategy:
             f"{(self.total_wins / self.total_resolved) * 100:.0f}%"
             if self.total_resolved > 0 else "--"
         )
+        net_deployed = self.total_spent - self.total_received
         lines.append(
             f"  {B}{self.total_fills}{X} fills"
             f"   {G}{self.total_wins}W{X}/{R}{self.total_losses}L{X}"
             f"   win:{B}{wr}{X}"
             f"   pnl:{pnl_c}{B}${self.session_pnl:+.2f}{X}"
-            f"   spent:{D}${self.total_spent:.2f}{X}"
+            f"   net:{D}${net_deployed:.2f}{X}"
         )
 
         # Exit type breakdown
@@ -2145,7 +2170,8 @@ class StatArbStrategy:
                     if p.exit_type == "TP":
                         pnl_val = p.pnl or 0.0
                         hold = int(p.exit_time - p.fill_time) if p.exit_time else 0
-                        tag = f"{G}{B}TP{X} {G}+${pnl_val:.2f}{X} ({hold}s)"
+                        pnl_c_tag = G if pnl_val >= 0 else R
+                        tag = f"{G}{B}TP{X} {pnl_c_tag}${pnl_val:+.2f}{X} ({hold}s)"
                     elif p.exit_type == "TIMEOUT":
                         pnl_val = p.pnl or 0.0
                         hold = int(p.exit_time - p.fill_time) if p.exit_time else 0
@@ -2237,6 +2263,8 @@ class StatArbStrategy:
             f"  EXPIRY={self.total_resolved - self.total_tp - self.total_timeout}"
         )
         print(f"  Total spent:   ${self.total_spent:.4f}")
+        print(f"  Total received:${self.total_received:.4f}")
+        print(f"  Net deployed:  ${self.total_spent - self.total_received:.4f}")
         print(f"  Session PnL:   ${self.session_pnl:+.4f}")
 
         if self.total_fills > 0:
