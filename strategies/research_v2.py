@@ -172,6 +172,7 @@ def find_signals_cheap(cycles, outcomes, max_price, max_entry_t):
 # ── Trade simulation ─────────────────────────────────────────
 
 def simulate(signals, tp, timeout, fee=0.01, entry_delay=0):
+    expire_mode = timeout >= 300  # TP-or-expire: no forced sell
     trades = []
     for sig in signals:
         entry = sig["entry_ask"]
@@ -188,7 +189,19 @@ def simulate(signals, tp, timeout, fee=0.01, entry_delay=0):
             pnl = float(fb[tp_idx]) - entry - fee
             hold = int(ft[tp_idx]) - sig["t"]
             etype = "TP"
+        elif expire_mode:
+            # TP-or-expire: shares resolve at cycle end ($1 or $0)
+            oc = sig["outcome"]
+            if oc == "UP" or oc == "DOWN_WIN":
+                pnl = 1.0 - entry - fee   # shares resolve at $1
+            elif oc == "DOWN" or oc == "DOWN_LOSS":
+                pnl = -entry - fee         # shares resolve at $0
+            else:
+                continue
+            hold = 300 - sig["t"]
+            etype = "EX"
         else:
+            # Forced sell at timeout (FOK at last bid)
             to_mask = ft <= max_t
             if to_mask.any():
                 last_i = np.where(to_mask)[0][-1]
@@ -196,7 +209,6 @@ def simulate(signals, tp, timeout, fee=0.01, entry_delay=0):
                 hold = int(ft[last_i]) - sig["t"]
                 etype = "TO"
             else:
-                # Expiry fallback
                 oc = sig["outcome"]
                 if oc == "UP" or oc == "DOWN_WIN":
                     pnl = 1.0 - entry - fee
