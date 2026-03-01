@@ -45,11 +45,11 @@ from research_v2 import load_data, get_cycles, COINS, UP_ASK
 # No fee on win payout (settlement), full loss on loss.
 FEE_RATE = 0.015
 
-# Slippage: we buy at ask + SLIPPAGE (simulates FOK fill worse than displayed ask)
-SLIPPAGE = 0.01
+# Slippage: matches live strategy --slippage 0.03 (FOK limit above best ask)
+SLIPPAGE = 0.03
 
-# Entry timing: we buy at ~t=8s into cycle (first reliable quotes after open)
-ENTRY_TIME = 8
+# Entry timing: matches live strategy ENTRY_WINDOW_START = 5
+ENTRY_TIME = 5
 
 # Max ask price: don't enter when ask is too expensive (bad risk/reward)
 DEFAULT_MAX_ASK = 0.60
@@ -150,19 +150,22 @@ class BacktestResult:
 # Core backtest logic
 # ---------------------------------------------------------------------------
 def get_entry_price(cycle: pd.DataFrame, coin: str, side: str) -> Optional[float]:
-    """Get the ask price for a coin/side at entry time (~8s into cycle).
+    """Get the ask price for a coin/side at entry time (t=5-8s into cycle).
+
+    Matches live strategy: ENTRY_WINDOW_START=5, bot enters on first tick.
+    Uses a tight 3-second window around ENTRY_TIME to get realistic fill price.
 
     For UP: reads {coin}_up_ask directly.
     For DOWN: derives from UP bid -> DOWN ask = 1 - UP bid.
     """
-    # Find rows near entry time
+    # Tight window: t=5 to t=8 (matches live bot entering at first opportunity)
     entry_rows = cycle[
-        (cycle["seconds_elapsed"] >= ENTRY_TIME - 2) &
+        (cycle["seconds_elapsed"] >= ENTRY_TIME) &
         (cycle["seconds_elapsed"] <= ENTRY_TIME + 3)
     ]
     if entry_rows.empty:
-        # Fallback: first 15 seconds
-        entry_rows = cycle[cycle["seconds_elapsed"] <= 15]
+        # Fallback: first 10 seconds
+        entry_rows = cycle[cycle["seconds_elapsed"] <= 10]
     if entry_rows.empty:
         return None
 
