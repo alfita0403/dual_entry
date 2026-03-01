@@ -58,7 +58,7 @@ def find_signals(cycles, outcomes, min_spread, max_entry_t):
             best_c, best_d = None, 0.0
             for c in COINS:
                 ask = row[f"{c.lower()}_up_ask"]
-                if ask < 0.02 or ask > 0.98:
+                if ask < 0.10 or ask > 0.90:
                     continue
                 d = gm - ask
                 if d > best_d:

@@ -71,7 +71,7 @@ def find_signals_statarb_up(cycles, outcomes, min_spread, max_entry_t):
             best_c, best_d = None, 0.0
             for c in COINS:
                 ask = row[f"{c.lower()}_up_ask"]
-                if ask < 0.02 or ask > 0.98:
+                if ask < 0.10 or ask > 0.90:
                     continue
                 d = gm - ask
                 if d > best_d:
@@ -109,7 +109,7 @@ def find_signals_statarb_dn(cycles, outcomes, min_spread, max_entry_t):
             best_c, best_d = None, 0.0
             for c in COINS:
                 ask = row[f"{c.lower()}_dn_ask"]
-                if ask < 0.02 or ask > 0.98:
+                if ask < 0.10 or ask > 0.90:
                     continue
                 d = gm - ask
                 if d > best_d:
@@ -151,7 +151,7 @@ def find_signals_cheap(cycles, outcomes, max_price, max_entry_t):
             best_c, best_ask = None, max_price
             for c in COINS:
                 ask = row[f"{c.lower()}_up_ask"]
-                if ask < 0.02:
+                if ask < 0.10:
                     continue
                 if ask < best_ask:
                     best_c, best_ask = c, ask

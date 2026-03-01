@@ -829,12 +829,12 @@ class StatArbStrategy:
             asks: Dict[str, float] = {}
             for coin in COINS:
                 ask = self._best_asks[coin]["up"]
-                if ask >= 1.0 or ask < 0.02:
-                    continue  # sentinel (1.0) or stale from resolved market (<0.02)
+                if ask > 0.90 or ask < 0.10:
+                    continue  # stale / extreme — no legit price is <0.10 or >0.90 in first 30s
                 asks[coin] = ask
 
             if len(asks) < 4:
-                continue  # need all 4 coins
+                continue  # need all 4 coins for group mean
 
             group_mean = sum(asks.values()) / len(asks)
 
