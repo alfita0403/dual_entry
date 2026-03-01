@@ -458,6 +458,13 @@ class ClobClient(ApiClient):
     def set_api_creds(self, creds: ApiCredentials) -> None:
         """Set API credentials for authenticated requests."""
         self.api_creds = creds
+        # Update pre-decoded HMAC key so _build_headers uses L2 auth
+        self._api_hmac_key = None
+        if creds and creds.is_valid():
+            try:
+                self._api_hmac_key = base64.urlsafe_b64decode(creds.secret)
+            except Exception:
+                pass
 
     def get_order_book(self, token_id: str) -> Dict[str, Any]:
         """
