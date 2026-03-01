@@ -40,6 +40,7 @@ import asyncio
 import enum
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -1334,6 +1335,7 @@ class StatArbStrategy:
     # ------------------------------------------------------------------
     async def _place_tp_gtc_sell(
         self, token_id: str, market: MarketInfo,
+        size_override: Optional[float] = None,
     ) -> None:
         """Place a resting GTC limit sell at fill_price + target.
 
@@ -1341,8 +1343,9 @@ class StatArbStrategy:
         we get the TP exit for free.  If timeout expires first, we
         cancel and FOK sell at market.
 
-        Uses wallet_size (from balance API) for exact sell size — no
-        residual shares left behind.
+        Args:
+            size_override: If set, use this exact size (for provisional
+                orders before on-chain balance is known).
         """
         pos = self._position
         if not pos:
@@ -1359,8 +1362,9 @@ class StatArbStrategy:
                 )
                 self._fee_rate_cache[token_id] = fee_rate_bps
 
-            # Use wallet_size if known, else retry with decreasing sizes
-            if pos.wallet_size:
+            if size_override:
+                size_attempts = [size_override]
+            elif pos.wallet_size:
                 size_attempts = [pos.wallet_size]
             else:
                 size_attempts = [pos.fill_size * f for f in
@@ -1440,8 +1444,21 @@ class StatArbStrategy:
                     order_data.get("size_matched")
                     or order_data.get("sizeMatched") or 0
                 )
+                # Try to extract actual execution price from order data
+                making = _to_float(
+                    order_data.get("associate_trades_making")
+                    or order_data.get("makingAmount") or 0
+                )
+                taking = _to_float(
+                    order_data.get("associate_trades_taking")
+                    or order_data.get("takingAmount") or 0
+                )
+                # For a SELL: making = shares given, taking = USDC received
+                # exec_price = taking / making (USDC per share)
+                exec_price = (taking / making) if making > 0 else 0.0
                 return {
                     "size": size_matched if size_matched > 0 else 0,
+                    "exec_price": exec_price,
                     "order_data": order_data,
                 }
             return None
@@ -1455,11 +1472,18 @@ class StatArbStrategy:
         """Record a successful GTC TP fill (maker = 0% fee)."""
         tp_price = round(pos.fill_price + self.cfg.target, 2)
         fill_size = fill_info.get("size", 0) or pos.fill_size
+        # Use actual execution price if available (price improvement),
+        # otherwise fall back to TP limit price.
+        exec_price = fill_info.get("exec_price", 0)
+        if exec_price > 0:
+            exit_price = exec_price
+        else:
+            exit_price = tp_price
         # Maker order: no taker fee on exit
-        pnl = (tp_price - pos.fill_price) * fill_size
+        pnl = (exit_price - pos.fill_price) * fill_size
         hold_secs = int(time.time() - pos.fill_time)
 
-        pos.exit_price = tp_price
+        pos.exit_price = exit_price
         pos.exit_type = "TP"
         pos.exit_time = time.time()
         pos.pnl = pnl
@@ -1474,7 +1498,7 @@ class StatArbStrategy:
 
         self.total_resolved += 1
         self.session_pnl += pnl
-        self.total_received += tp_price * fill_size
+        self.total_received += exit_price * fill_size
         self.total_tp += 1
         if pnl >= 0:
             self.total_wins += 1
@@ -1489,14 +1513,17 @@ class StatArbStrategy:
         elif pnl < 0 and coin_key in self.coin_losses:
             self.coin_losses[coin_key] += 1
 
+        price_note = ""
+        if exec_price > 0 and abs(exec_price - tp_price) > 0.005:
+            price_note = f" (limit={tp_price:.2f} exec={exit_price:.4f})"
         log(
-            f"GTC TP FILLED {pos.coin}-UP @{tp_price:.4f}"
-            f" pnl=${pnl:+.4f} hold={hold_secs}s (maker 0% fee)",
+            f"GTC TP FILLED {pos.coin}-UP @{exit_price:.4f}"
+            f" pnl=${pnl:+.4f} hold={hold_secs}s (maker 0% fee){price_note}",
             "success" if pnl >= 0 else "warning",
         )
 
         _update_trade_log_exit(
-            pos.order_id, tp_price, "TP", pnl, hold_secs,
+            pos.order_id, exit_price, "TP", pnl, hold_secs,
             log_file=self.log_file,
         )
 
@@ -1574,10 +1601,46 @@ class StatArbStrategy:
             if result:
                 # Enter holding state for TP/timeout monitoring
                 self._holding_position = True
-                # Query exact wallet balance (like Polymarket MAX button)
+
+                # 1. Provisional GTC immediately (conservative 2% fee buffer)
+                #    Truncate to 2 decimals — CLOB truncates sizes anyway.
+                conservative_size = math.floor(result.fill_size * 0.98 * 100) / 100
+                await self._place_tp_gtc_sell(
+                    token_id, market, size_override=conservative_size,
+                )
+
+                # 2. Wait for on-chain settlement (4-8s)
                 await self._query_wallet_balance(token_id)
-                # Immediately place GTC limit sell at TP price (maker = 0% fee)
-                await self._place_tp_gtc_sell(token_id, market)
+
+                # 3. Replace GTC with exact balance if still active
+                pos = self._position
+                if (pos and pos.wallet_size
+                        and self._tp_gtc_active
+                        and pos.wallet_size > conservative_size + 0.001):
+                    old_id = self._tp_order_id or ""
+                    log(
+                        f"Replacing provisional GTC ({conservative_size:.2f})"
+                        f" with exact ({pos.wallet_size:.6f})",
+                        "info",
+                    )
+                    # Cancel provisional
+                    try:
+                        await asyncio.to_thread(
+                            self.clob.cancel_order, old_id,
+                        )
+                    except Exception:
+                        # Might already be filled — poll will detect
+                        filled = await self._poll_tp_order()
+                        if filled and pos:
+                            await self._record_gtc_tp_fill(pos, filled)
+                            # GTC filled during settlement — done
+                        else:
+                            log("GTC cancel failed, not filled either", "warning")
+                        # Either way, skip replacement
+                    else:
+                        self._tp_order_id = None
+                        self._tp_gtc_active = False
+                        await self._place_tp_gtc_sell(token_id, market)
             else:
                 # FOK missed -- mark cycle as attempted
                 self._trade_executed = True
