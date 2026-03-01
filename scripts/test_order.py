@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -107,9 +108,10 @@ def main():
         print("No active 5m markets found")
         return
     slug = market.get("slug", "?")
-    tokens = market.get("clobTokenIds", [])
+    raw_tokens = market.get("clobTokenIds", "[]")
+    tokens = json.loads(raw_tokens) if isinstance(raw_tokens, str) else raw_tokens
     print(f"Market: {slug}")
-    print(f"Tokens: {tokens}")
+    print(f"Tokens: {tokens[0][:20]}... , {tokens[1][:20]}...")
     if len(tokens) < 2:
         print("Not enough tokens")
         return
