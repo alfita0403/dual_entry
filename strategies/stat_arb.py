@@ -1068,7 +1068,12 @@ class StatArbStrategy:
         market: MarketInfo,
         sell_price: float,
     ) -> Optional[OrderTracker]:
-        """Submit a FOK SELL order to the CLOB."""
+        """Submit a FOK SELL order to the CLOB.
+
+        Tries fill_size first.  If the CLOB rejects with "not enough
+        balance", retries with progressively smaller sizes (99%, 98%, …,
+        92%) to auto-discover the actual wallet balance after fees.
+        """
         label = f"{pos.coin}-UP-SELL"
         try:
             fee_rate_bps = self._fee_rate_cache.get(token_id)
@@ -1078,49 +1083,56 @@ class StatArbStrategy:
                 )
                 self._fee_rate_cache[token_id] = fee_rate_bps
 
-            # pos.fill_size is size_matched (shares ORDERED), but the wallet
-            # holds fewer shares due to the taker fee on the buy side.
-            # Sell only what we actually have: fill_size * (1 - fee_rate).
-            fee_rate = (fee_rate_bps or 0) / 10_000
-            actual_shares = pos.fill_size * (1.0 - fee_rate)
-            # Round DOWN to tick size to avoid dust overshoot
+            # Try selling full fill_size first, then reduce if wallet
+            # has fewer shares (due to taker fee on buy side).
+            size_attempts = [pos.fill_size * f for f in
+                             [1.00, 0.99, 0.98, 0.97, 0.96, 0.95, 0.94, 0.93, 0.92]]
             tick = float(market.tick_size) if market.tick_size else 0.01
-            sell_size = max(round(int(actual_shares / tick) * tick, 6), tick)
 
-            log(
-                f"SELL sizing: matched={pos.fill_size:.4f}"
-                f" fee={fee_rate:.4f} actual={sell_size:.4f}",
-                "info",
-            )
+            for attempt_i, raw_size in enumerate(size_attempts):
+                sell_size = max(round(int(raw_size / tick) * tick, 6), tick)
 
-            order = Order(
-                token_id=token_id,
-                price=sell_price,
-                size=sell_size,
-                side="SELL",
-                funder=self.bot_config.safe_address,
-                fee_rate_bps=fee_rate_bps,
-                signature_type=self.bot_config.clob.signature_type,
-                neg_risk=market.neg_risk,
-                tick_size=market.tick_size,
-            )
-            signed = self.signer.sign_order(order)
+                if attempt_i > 0:
+                    log(f"SELL retry #{attempt_i}: size={sell_size:.4f}", "info")
 
-            # Tight timeout for FOK
-            prev_timeout, prev_retry = self.clob.timeout, self.clob.retry_count
-            self.clob.timeout = 5
-            self.clob.retry_count = 1
-            try:
-                response = await asyncio.to_thread(
-                    self.clob.post_order, signed, "FOK"
+                order = Order(
+                    token_id=token_id,
+                    price=sell_price,
+                    size=sell_size,
+                    side="SELL",
+                    funder=self.bot_config.safe_address,
+                    fee_rate_bps=fee_rate_bps,
+                    signature_type=self.bot_config.clob.signature_type,
+                    neg_risk=market.neg_risk,
+                    tick_size=market.tick_size,
                 )
-            finally:
-                self.clob.timeout = prev_timeout
-                self.clob.retry_count = prev_retry
+                signed = self.signer.sign_order(order)
 
-            if not response.get("success", False):
-                error = response.get("errorMsg", "unknown")
-                log(f"SELL FOK FAIL {label}: {error}", "error")
+                # Tight timeout for FOK
+                prev_timeout, prev_retry = self.clob.timeout, self.clob.retry_count
+                self.clob.timeout = 5
+                self.clob.retry_count = 1
+                try:
+                    response = await asyncio.to_thread(
+                        self.clob.post_order, signed, "FOK"
+                    )
+                finally:
+                    self.clob.timeout = prev_timeout
+                    self.clob.retry_count = prev_retry
+
+                if not response.get("success", False):
+                    error = response.get("errorMsg", "unknown")
+                    if "balance" in error.lower() and attempt_i < len(size_attempts) - 1:
+                        log(f"SELL {label}: balance issue, reducing size", "warning")
+                        continue  # retry with smaller size
+                    log(f"SELL FOK FAIL {label}: {error}", "error")
+                    return None
+
+                # Success — break out of retry loop
+                break
+            else:
+                # All size attempts exhausted
+                log(f"SELL {label}: all size attempts failed", "error")
                 return None
 
             order_id = (
