@@ -69,9 +69,13 @@ COINS: List[str] = ["BTC", "ETH", "SOL", "XRP"]
 TRADE_LOG_FILE = Path(__file__).resolve().parent.parent / "sequence_trades.txt"
 
 # Outcome inference thresholds (applied at t >= INFERENCE_TIME)
-INFERENCE_TIME = 280       # seconds into cycle to read outcome
-UP_THRESHOLD = 0.85        # UP ask > this => outcome is UP
-DOWN_THRESHOLD = 0.15      # UP ask < this => outcome is DOWN
+# Last 5 seconds of the 300s cycle — prices are near-settled by then
+INFERENCE_TIME = 295       # seconds into cycle to read outcome
+UP_THRESHOLD = 0.95        # UP ask > this => outcome is UP (near-certain)
+DOWN_THRESHOLD = 0.05      # UP ask < this => outcome is DOWN (near-certain)
+
+# Max ask price filter — don't buy when ask is too expensive (bad risk/reward)
+DEFAULT_MAX_ASK = 0.60     # only enter if ask <= this
 
 # How long after cycle start to look for pattern-match entries
 ENTRY_WINDOW_START = 5     # seconds after cycle start
@@ -90,6 +94,7 @@ SIM_FEE_RATE = 0.015       # 1.5% one-way taker fee
 BUILTIN_PATTERNS: Dict[str, Tuple[str, str]] = {
     "DDD":  ("DDD",  "UP"),     # 3 consecutive DOWN => buy UP (reversal)
     "UD":   ("UD",   "DOWN"),   # UP then DOWN => buy DOWN (continuation)
+    "UU":   ("UU",   "DOWN"),   # 2 consecutive UP => buy DOWN (reversal)
     "UUU":  ("UUU",  "DOWN"),   # 3 consecutive UP => buy DOWN (reversal)
     "DU":   ("DU",   "UP"),     # DOWN then UP => buy UP (continuation)
 }
@@ -225,6 +230,7 @@ class SequenceConfig:
     rules: List[PatternRule]
     size: float = 5.0
     slippage: float = 0.03
+    max_ask: float = DEFAULT_MAX_ASK  # max ask price to enter
     max_trades_per_cycle: int = 4   # one per coin
     dry_run: bool = False
     market_check_interval: float = 5.0
@@ -233,6 +239,8 @@ class SequenceConfig:
     def validate(self) -> None:
         if self.size < 5:
             raise ValueError(f"size must be >= 5, got {self.size}")
+        if not 0.30 <= self.max_ask <= 0.90:
+            raise ValueError(f"max_ask must be 0.30-0.90, got {self.max_ask}")
         if not self.rules:
             raise ValueError("At least one pattern rule is required")
         for rule in self.rules:
@@ -441,10 +449,12 @@ class SequenceStrategy:
         global _tui_active
 
         log("Sequence Pattern Strategy started (4-coin WebSocket)", "success")
-        log(f"  rules:  {', '.join(f'{r.pattern}->BUY {r.buy_side.upper()}' for r in self.cfg.rules)}")
-        log(f"  size:   {self.cfg.size} shares")
-        log(f"  dry_run: {self.cfg.dry_run}")
-        log(f"  log:    {self.log_file}")
+        log(f"  rules:    {', '.join(f'{r.pattern}->BUY {r.buy_side.upper()}' for r in self.cfg.rules)}")
+        log(f"  size:     {self.cfg.size} shares")
+        log(f"  max_ask:  {self.cfg.max_ask:.2f}")
+        log(f"  infer:    t>={INFERENCE_TIME}s, UP>{UP_THRESHOLD}, DOWN<{DOWN_THRESHOLD}")
+        log(f"  dry_run:  {self.cfg.dry_run}")
+        log(f"  log:      {self.log_file}")
         print()
 
         try:
@@ -726,8 +736,12 @@ class SequenceStrategy:
                 continue
 
             buy_price = self._best_asks[coin][buy_side]
-            if buy_price >= 0.90 or buy_price <= 0.01:
-                log(f"Skip {coin}: {buy_side} ask={buy_price:.3f} out of range", "warning")
+            if buy_price <= 0.01 or buy_price > self.cfg.max_ask:
+                log(
+                    f"Skip {coin}: {buy_side} ask={buy_price:.3f} "
+                    f"(max_ask={self.cfg.max_ask:.2f})",
+                    "warning",
+                )
                 continue
 
             # Add slippage for FOK
@@ -1326,7 +1340,7 @@ class SequenceStrategy:
         )
         lines.append(
             f"  {D}rules: {rules_str}  size={self.cfg.size}  "
-            f"cycle #{self.cycles_seen}{X}"
+            f"max_ask={self.cfg.max_ask:.2f}  cycle #{self.cycles_seen}{X}"
         )
         hsep()
 
@@ -1599,6 +1613,10 @@ def main() -> None:
         help="FOK slippage buffer (default: 0.03)",
     )
     parser.add_argument(
+        "--max-ask", type=float, default=DEFAULT_MAX_ASK,
+        help=f"Max ask price to enter (default: {DEFAULT_MAX_ASK}). Rejects expensive entries with bad risk/reward.",
+    )
+    parser.add_argument(
         "--max-trades", type=int, default=4,
         help="Max trades per cycle (default: 4 = one per coin)",
     )
@@ -1647,6 +1665,7 @@ def main() -> None:
         rules=rules,
         size=args.size,
         slippage=args.slippage,
+        max_ask=args.max_ask,
         max_trades_per_cycle=args.max_trades,
         dry_run=args.dry_run,
         market_check_interval=args.market_check_interval,
