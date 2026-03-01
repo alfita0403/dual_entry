@@ -41,8 +41,12 @@ credentials/
 
 # Logs and local data
 *.log
-data/prices_*.csv
+data/
 reports/
+nul
+
+# Claude Code
+.claude/
 
 # Node / frontend artifacts (docs examples)
 node_modules/

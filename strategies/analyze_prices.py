@@ -178,6 +178,118 @@ def compute_correlation(df: pd.DataFrame) -> pd.DataFrame:
     return changes.corr()
 
 
+# ── Trade Simulation (TP + Timeout) ──────────────────────────
+
+
+def simulate_exit(
+    cycle: pd.DataFrame, t_entry: int, coin: str,
+    ask_entry: float, target: float, timeout: int,
+    coin_outcome: Optional[str],
+) -> Dict:
+    """Simulate a single trade exit using bid data.
+
+    Priority: Take Profit > Timeout exit > Hold to expiry.
+    """
+    bid_col = f"{coin.lower()}_up_bid"
+    max_t = min(t_entry + timeout, 300)
+
+    # Look for take profit (vectorized: first bid >= entry + target)
+    future = cycle[(cycle["seconds_elapsed"] > t_entry) &
+                   (cycle["seconds_elapsed"] <= max_t)]
+    if len(future) > 0:
+        tp_mask = future[bid_col] >= ask_entry + target
+        tp_hits = future[tp_mask]
+        if len(tp_hits) > 0:
+            first = tp_hits.iloc[0]
+            return {
+                "exit_type": "TP",
+                "exit_price": float(first[bid_col]),
+                "pnl": float(first[bid_col]) - ask_entry,
+                "hold_time": int(first["seconds_elapsed"]) - t_entry,
+            }
+
+    # Timeout: sell at last available bid before max_t
+    if max_t < 300 and len(future) > 0:
+        bid = float(future[bid_col].iloc[-1])
+        return {
+            "exit_type": "TIMEOUT",
+            "exit_price": bid,
+            "pnl": bid - ask_entry,
+            "hold_time": timeout,
+        }
+
+    # Hold to expiry
+    if coin_outcome == "UP":
+        return {"exit_type": "EXPIRY_WIN", "exit_price": 1.0,
+                "pnl": 1.0 - ask_entry, "hold_time": 300 - t_entry}
+    elif coin_outcome == "DOWN":
+        return {"exit_type": "EXPIRY_LOSS", "exit_price": 0.0,
+                "pnl": -ask_entry, "hold_time": 300 - t_entry}
+    return {"exit_type": "UNKNOWN", "exit_price": None,
+            "pnl": None, "hold_time": None}
+
+
+def sweep_parameters(
+    cycles: List[pd.DataFrame],
+    all_outcomes: List[Dict[str, Optional[str]]],
+    cooldown: int = 10,
+) -> pd.DataFrame:
+    """Test all parameter combinations and return ranked results."""
+    SPREADS = [0.05, 0.06, 0.08, 0.10, 0.12, 0.15]
+    TARGETS = [0.01, 0.02, 0.03, 0.05, 0.08]
+    TIMEOUTS = [20, 30, 45, 60, 90, 120]
+
+    results = []
+
+    for min_spread in SPREADS:
+        # Find signals once per min_spread
+        all_signals = []
+        for i, (cycle, outcomes) in enumerate(zip(cycles, all_outcomes)):
+            sigs = find_divergence_signals(cycle, outcomes, min_spread, cooldown)
+            for sig in sigs:
+                sig["_cycle_idx"] = i
+            all_signals.extend(sigs)
+
+        if not all_signals:
+            continue
+
+        for target in TARGETS:
+            for timeout in TIMEOUTS:
+                trades = []
+                for sig in all_signals:
+                    cycle = cycles[sig["_cycle_idx"]]
+                    result = simulate_exit(
+                        cycle, sig["seconds_elapsed"], sig["coin"],
+                        sig["coin_ask"], target, timeout, sig["coin_outcome"],
+                    )
+                    if result["pnl"] is not None:
+                        trades.append(result)
+
+                if len(trades) < 3:
+                    continue
+
+                pnls = [t["pnl"] for t in trades]
+                wins = [p for p in pnls if p > 0]
+                tp_n = sum(1 for t in trades if t["exit_type"] == "TP")
+                to_n = sum(1 for t in trades if t["exit_type"] == "TIMEOUT")
+
+                results.append({
+                    "min_spread": min_spread,
+                    "target": target,
+                    "timeout": timeout,
+                    "trades": len(trades),
+                    "win_rate": len(wins) / len(trades),
+                    "avg_pnl": float(np.mean(pnls)),
+                    "total_pnl": float(np.sum(pnls)),
+                    "avg_hold": float(np.mean([t["hold_time"] for t in trades])),
+                    "tp_pct": tp_n / len(trades),
+                    "timeout_pct": to_n / len(trades),
+                    "expiry_pct": 1 - (tp_n + to_n) / len(trades),
+                })
+
+    return pd.DataFrame(results)
+
+
 # ── Aggregation helpers (vectorized, no iterrows) ────────────
 
 
@@ -538,69 +650,125 @@ def plot_time_of_day(df: pd.DataFrame, signals: List[Dict],
     plt.savefig(os.path.join(save_dir, "5_time_of_day.png"), dpi=150)
 
 
-def plot_pnl_analysis(signals: List[Dict], save_dir: str) -> None:
-    """Detailed P&L analysis: by deviation bin, by coin, cumulative."""
-    if not signals:
+def plot_backtest(sweep_df: pd.DataFrame, save_dir: str) -> None:
+    """Plot parameter sweep results: heatmaps + best combo cumulative P&L."""
+    if len(sweep_df) == 0:
         return
 
-    sig_df = pd.DataFrame(signals)
-    has_pnl = sig_df.dropna(subset=["pnl"])
-    if len(has_pnl) < 5:
-        return
+    profitable = sweep_df[sweep_df["avg_pnl"] > 0]
+    best = sweep_df.loc[sweep_df["total_pnl"].idxmax()] if len(sweep_df) > 0 else None
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle(f"P&L Backtest ({len(has_pnl)} signals with known outcome)",
-                 fontsize=14, fontweight="bold")
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle("Take-Profit Backtest - Parameter Sweep", fontsize=14,
+                 fontweight="bold")
 
-    # Left: expected P&L by deviation bin
-    ax1 = axes[0]
-    has_pnl = has_pnl.copy()
-    has_pnl["dev_bin"] = pd.cut(has_pnl["deviation"], bins=5)
-    binned = has_pnl.groupby("dev_bin", observed=True)["pnl"].agg(["mean", "count", "std"])
-    binned = binned[binned["count"] >= 2]
-    if len(binned) > 0:
-        labels = [f"{iv.mid:.2f}" for iv in binned.index]
-        colors = ["#2ecc71" if m > 0 else "#e74c3c" for m in binned["mean"]]
-        bars = ax1.bar(range(len(binned)), binned["mean"], color=colors, alpha=0.7)
-        ax1.set_xticks(range(len(binned)))
-        ax1.set_xticklabels(labels, fontsize=8)
-        for i, (_, row) in enumerate(binned.iterrows()):
-            ax1.text(i, row["mean"] + 0.01, f"n={int(row['count'])}",
-                     ha="center", fontsize=7)
-    ax1.axhline(y=0, color="black", linewidth=0.5)
-    ax1.set_xlabel("deviation (bin midpoint)")
-    ax1.set_ylabel("avg P&L per $1")
-    ax1.set_title("P&L by Deviation Size")
-    ax1.grid(True, alpha=0.3)
+    # Top-left: heatmap target vs timeout (best min_spread)
+    ax = axes[0][0]
+    if best is not None:
+        best_spread = best["min_spread"]
+        subset = sweep_df[sweep_df["min_spread"] == best_spread]
+        pivot = subset.pivot_table(values="avg_pnl", index="target",
+                                   columns="timeout", aggfunc="first")
+        if len(pivot) > 0:
+            im = ax.imshow(pivot.values, cmap="RdYlGn", aspect="auto",
+                           vmin=-0.1, vmax=0.1)
+            ax.set_xticks(range(len(pivot.columns)))
+            ax.set_xticklabels([f"{int(c)}s" for c in pivot.columns], fontsize=8)
+            ax.set_yticks(range(len(pivot.index)))
+            ax.set_yticklabels([f"{v:.2f}" for v in pivot.index], fontsize=8)
+            for i in range(len(pivot.index)):
+                for j in range(len(pivot.columns)):
+                    val = pivot.values[i, j]
+                    if not np.isnan(val):
+                        color = "white" if abs(val) > 0.05 else "black"
+                        ax.text(j, i, f"{val:+.3f}", ha="center", va="center",
+                                fontsize=7, color=color)
+            plt.colorbar(im, ax=ax, shrink=0.8)
+    ax.set_xlabel("timeout")
+    ax.set_ylabel("target")
+    ax.set_title(f"Avg P&L (min_spread={best_spread:.2f})" if best is not None else "")
 
-    # Center: P&L by coin
-    ax2 = axes[1]
-    coin_pnl = has_pnl.groupby("coin")["pnl"].agg(["mean", "count", "sum"])
-    if len(coin_pnl) > 0:
-        colors = [COIN_COLORS.get(c, "gray") for c in coin_pnl.index]
-        ax2.bar(coin_pnl.index, coin_pnl["mean"], color=colors, alpha=0.7)
-        for i, (coin, row) in enumerate(coin_pnl.iterrows()):
-            ax2.text(i, row["mean"] + 0.01,
-                     f"n={int(row['count'])}\nsum={row['sum']:+.2f}",
-                     ha="center", fontsize=7)
-    ax2.axhline(y=0, color="black", linewidth=0.5)
-    ax2.set_ylabel("avg P&L per $1")
-    ax2.set_title("P&L by Coin")
-    ax2.grid(True, alpha=0.3)
+    # Top-center: avg_pnl by min_spread (aggregated)
+    ax = axes[0][1]
+    by_spread = sweep_df.groupby("min_spread")["avg_pnl"].agg(["mean", "max", "count"])
+    if len(by_spread) > 0:
+        colors = ["#2ecc71" if m > 0 else "#e74c3c" for m in by_spread["max"]]
+        ax.bar(range(len(by_spread)), by_spread["max"], color=colors, alpha=0.7)
+        ax.set_xticks(range(len(by_spread)))
+        ax.set_xticklabels([f"{s:.2f}" for s in by_spread.index], fontsize=8)
+        for i, (_, row) in enumerate(by_spread.iterrows()):
+            ax.text(i, row["max"] + 0.002, f"best:{row['max']:+.3f}",
+                    ha="center", fontsize=6)
+    ax.axhline(y=0, color="black", linewidth=0.5)
+    ax.set_xlabel("min_spread")
+    ax.set_ylabel("best avg P&L")
+    ax.set_title("Best P&L per Spread Threshold")
+    ax.grid(True, alpha=0.3)
 
-    # Right: cumulative P&L
-    ax3 = axes[2]
-    cum_pnl = has_pnl.sort_values("cycle_start")["pnl"].cumsum()
-    ax3.plot(range(len(cum_pnl)), cum_pnl.values, color="steelblue", linewidth=1.5)
-    ax3.axhline(y=0, color="black", linewidth=0.5)
-    ax3.set_xlabel("signal #")
-    ax3.set_ylabel("cumulative P&L per $1")
-    final = cum_pnl.iloc[-1]
-    ax3.set_title(f"Cumulative P&L ({final:+.2f} after {len(cum_pnl)} trades)")
-    ax3.grid(True, alpha=0.3)
+    # Top-right: trades count by min_spread
+    ax = axes[0][2]
+    by_spread_trades = sweep_df.groupby("min_spread")["trades"].first()
+    if len(by_spread_trades) > 0:
+        ax.bar(range(len(by_spread_trades)), by_spread_trades.values,
+               color="steelblue", alpha=0.7)
+        ax.set_xticks(range(len(by_spread_trades)))
+        ax.set_xticklabels([f"{s:.2f}" for s in by_spread_trades.index], fontsize=8)
+        for i, v in enumerate(by_spread_trades.values):
+            ax.text(i, v + 0.5, str(int(v)), ha="center", fontsize=7)
+    ax.set_xlabel("min_spread")
+    ax.set_ylabel("# trades")
+    ax.set_title("Trade Count by Spread Threshold")
+    ax.grid(True, alpha=0.3)
+
+    # Bottom-left: exit type breakdown for best combo
+    ax = axes[1][0]
+    if best is not None:
+        labels = ["Take Profit", "Timeout", "Expiry"]
+        sizes = [best["tp_pct"], best["timeout_pct"], best["expiry_pct"]]
+        colors_pie = ["#2ecc71", "#f39c12", "#e74c3c"]
+        wedges, texts, autotexts = ax.pie(
+            sizes, labels=labels, colors=colors_pie, autopct="%1.0f%%",
+            startangle=90, textprops={"fontsize": 9})
+        ax.set_title(f"Exit Types (best combo, n={int(best['trades'])})", fontsize=10)
+
+    # Bottom-center: win rate vs avg_pnl scatter (all combos)
+    ax = axes[1][1]
+    if len(sweep_df) > 0:
+        sc = ax.scatter(sweep_df["win_rate"], sweep_df["avg_pnl"],
+                        c=sweep_df["min_spread"], cmap="viridis",
+                        s=30, alpha=0.6, edgecolors="none")
+        ax.axhline(y=0, color="black", linewidth=0.5)
+        if best is not None:
+            ax.scatter([best["win_rate"]], [best["avg_pnl"]],
+                       c="red", s=120, marker="*", zorder=5, label="Best")
+            ax.legend(fontsize=8)
+        plt.colorbar(sc, ax=ax, label="min_spread", shrink=0.8)
+    ax.set_xlabel("win rate")
+    ax.set_ylabel("avg P&L per $1")
+    ax.set_title("All Combos: Win Rate vs P&L")
+    ax.grid(True, alpha=0.3)
+
+    # Bottom-right: top 10 combos bar chart
+    ax = axes[1][2]
+    top10 = sweep_df.nlargest(10, "total_pnl")
+    if len(top10) > 0:
+        labels = [f"s{r['min_spread']:.2f}\nt{r['target']:.2f}\n{int(r['timeout'])}s"
+                  for _, r in top10.iterrows()]
+        colors = ["#2ecc71" if p > 0 else "#e74c3c" for p in top10["total_pnl"]]
+        ax.barh(range(len(top10)), top10["total_pnl"], color=colors, alpha=0.7)
+        ax.set_yticks(range(len(top10)))
+        ax.set_yticklabels(labels, fontsize=6)
+        for i, (_, row) in enumerate(top10.iterrows()):
+            ax.text(row["total_pnl"] + 0.05, i,
+                    f"{row['total_pnl']:+.2f} ({int(row['trades'])}t)",
+                    va="center", fontsize=7)
+    ax.axvline(x=0, color="black", linewidth=0.5)
+    ax.set_xlabel("total P&L")
+    ax.set_title("Top 10 Combos by Total P&L")
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "6_pnl_analysis.png"), dpi=150)
+    plt.savefig(os.path.join(save_dir, "6_backtest.png"), dpi=150)
 
 
 # ── Console Report ───────────────────────────────────────────
@@ -612,6 +780,7 @@ def print_report(
     all_outcomes: List[Dict[str, Optional[str]]],
     signals: List[Dict],
     corr: pd.DataFrame,
+    sweep_df: Optional[pd.DataFrame] = None,
 ) -> None:
     """Print comprehensive summary to console."""
     print("\n" + "=" * 70)
@@ -744,6 +913,58 @@ def print_report(
     else:
         print(f"\n  P&L: No resolved signals (need cycles with t>=280 data)")
 
+    # ── Sweep results (TP backtest) ──
+    if sweep_df is not None and len(sweep_df) > 0:
+        profitable = sweep_df[sweep_df["avg_pnl"] > 0]
+        best = sweep_df.loc[sweep_df["total_pnl"].idxmax()]
+
+        print(f"\n  {'='*50}")
+        print(f"  TAKE-PROFIT BACKTEST (parameter sweep)")
+        print(f"  {'='*50}")
+        print(f"  Combos tested:  {len(sweep_df)}")
+        print(f"  Profitable:     {len(profitable)}")
+
+        # Best combo details
+        print(f"\n  BEST COMBO (by total P&L):")
+        print(f"    min_spread:   {best['min_spread']:.2f}")
+        print(f"    TP target:    {best['target']:.2f}")
+        print(f"    timeout:      {int(best['timeout'])}s")
+        print(f"    trades:       {int(best['trades'])}")
+        print(f"    win rate:     {100*best['win_rate']:.1f}%")
+        print(f"    avg P&L:      {best['avg_pnl']:+.4f} per $1")
+        print(f"    total P&L:    {best['total_pnl']:+.2f}")
+        print(f"    avg hold:     {best['avg_hold']:.0f}s")
+        print(f"    exit types:   TP {100*best['tp_pct']:.0f}% | "
+              f"Timeout {100*best['timeout_pct']:.0f}% | "
+              f"Expiry {100*best['expiry_pct']:.0f}%")
+
+        # Top 10 combos table
+        top10 = sweep_df.nlargest(10, "total_pnl")
+        print(f"\n  Top 10 combos by total P&L:")
+        print(f"  {'Spread':>6} {'Target':>6} {'T/O':>5} "
+              f"{'Trades':>6} {'WR':>6} {'AvgPnL':>8} {'TotPnL':>8} "
+              f"{'TP%':>5} {'Hold':>5}")
+        print(f"  {'-'*6} {'-'*6} {'-'*5} "
+              f"{'-'*6} {'-'*6} {'-'*8} {'-'*8} "
+              f"{'-'*5} {'-'*5}")
+        for _, row in top10.iterrows():
+            print(f"  {row['min_spread']:>6.2f} {row['target']:>6.2f} "
+                  f"{int(row['timeout']):>4}s "
+                  f"{int(row['trades']):>6} {100*row['win_rate']:>5.1f}% "
+                  f"{row['avg_pnl']:>+8.4f} {row['total_pnl']:>+8.2f} "
+                  f"{100*row['tp_pct']:>4.0f}% {row['avg_hold']:>4.0f}s")
+
+        # Also show if ANY combo beats hold-to-expiry
+        sig_df_local = pd.DataFrame(signals) if signals else pd.DataFrame()
+        has_pnl_local = sig_df_local.dropna(subset=["pnl"]) if len(sig_df_local) > 0 else pd.DataFrame()
+        if len(has_pnl_local) > 0:
+            hold_avg = has_pnl_local["pnl"].mean()
+            tp_improvement = best["avg_pnl"] - hold_avg
+            print(f"\n  vs Hold-to-Expiry:")
+            print(f"    Hold avg P&L:   {hold_avg:+.4f}")
+            print(f"    Best TP avg:    {best['avg_pnl']:+.4f}")
+            print(f"    Improvement:    {tp_improvement:+.4f} per trade")
+
     # Top signals table (limit to 20)
     show_n = min(len(signals), 20)
     if show_n > 0 and len(signals) > 20:
@@ -842,11 +1063,21 @@ def main():
         all_signals.extend(sigs)
     print(f"Detected {len(all_signals)} divergence signals")
 
+    # Parameter sweep (TP backtest)
+    print("Running parameter sweep (TP backtest)...")
+    sweep_df = sweep_parameters(cycles, all_outcomes, cooldown=args.cooldown)
+    if len(sweep_df) > 0:
+        profitable = sweep_df[sweep_df["avg_pnl"] > 0]
+        print(f"Tested {len(sweep_df)} combos | "
+              f"{len(profitable)} profitable")
+    else:
+        print("No parameter combos produced enough trades")
+
     # Correlation
     corr = compute_correlation(df)
 
     # Console report
-    print_report(df, cycles, all_outcomes, all_signals, corr)
+    print_report(df, cycles, all_outcomes, all_signals, corr, sweep_df)
 
     # Plots
     save_dir = args.output_dir
@@ -858,10 +1089,9 @@ def main():
     plot_correlation(corr, save_dir)
     plot_signals(all_signals, save_dir)
     plot_time_of_day(df, all_signals, all_outcomes, cycles, save_dir)
-    plot_pnl_analysis(all_signals, save_dir)
+    plot_backtest(sweep_df, save_dir)
 
-    n_plots = 6 if len(all_signals) >= 5 else 5
-    print(f"Saved {n_plots} plots to {save_dir}/")
+    print(f"Saved 6 plots to {save_dir}/")
 
     if not args.no_show:
         plt.show()

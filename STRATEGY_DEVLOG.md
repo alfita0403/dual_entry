@@ -48,6 +48,41 @@ Buys the cheapest available quote across all coins/sides. Simpler strategy, less
 
 Cross-coin correlation strategy. **DO NOT MODIFY** — kept as reference.
 
+### 4. Stat-Arb Divergence (`strategies/stat_arb.py`) — ACTIVE DEVELOPMENT
+
+**Thesis:** When one coin's UP ask diverges significantly below the group mean of all 4 coins, buy it and take profit when the price reverts. The edge is in capturing short-term mean reversion, NOT in holding to resolution (hold-to-expiry has ~30% win rate, avg -0.097/trade).
+
+**Mechanism:**
+- Computes group mean of all 4 UP asks every WS tick
+- Signal: coin whose UP ask is furthest below group mean, by >= `--spread` threshold
+- Entry: FOK BUY on the divergent coin's UP token
+- Exit path 1 (TP): SELL when UP bid >= entry_price + `--target` (take-profit)
+- Exit path 2 (Timeout): SELL at current bid after `--timeout` seconds
+- Exit path 3 (Expiry): Hold to resolution as fallback (worst case)
+- Tracks `_best_bids` in addition to `_best_asks` (bids needed for TP/timeout monitoring)
+- Sell execution: FOK SELL order on same token_id with slippage below bid
+- One position at a time per cycle
+
+**CLI:**
+```bash
+python strategies/stat_arb.py --spread 0.12 --target 0.15 --timeout 30 --window 60 --size 5
+python strategies/stat_arb.py --dry-run --name "s12_tp15_to30" --spread 0.12 --target 0.15 --timeout 30
+```
+
+**Flags:** `--window` (1-300s, default 60), `--spread` (0.03-0.50, default 0.12), `--target` (0.01-0.50, default 0.15), `--timeout` (5-300s, default 30), `--size` (min 5), `--slippage` (0.01-0.20, default 0.03), `--cooldown` (1-300s, default 10), `--dry-run`, `--name`, `--market-check-interval`
+
+**Research backing (cross-validated, fees included):**
+- Data: `data/prices_2026-02-28.csv` — 16K rows, 57 cycles, 4.7h
+- 4,536 parameter combos tested across 6 CV fold schemes
+- 119 strategies survive ALL 6 folds with 1c/$ fee
+- Best balance: `s=0.12, me=60, tp=0.15, to=30s` → $100→$114.85, 39 trades, PF=3.83
+- Most robust: `s=0.15, tp=0.02, to=90s` → $100→$108.10, 78 trades, WR=90%
+
+**Supporting scripts:**
+- `strategies/research.py` — Cross-validated parameter optimizer with bankroll simulation
+- `strategies/analyze_prices.py` — Full analysis with 6 plots + console report
+- `strategies/data_collector.py` — Running 24/7 on server, 1 sample/second
+
 ---
 
 ## Signal Hunter Development History
@@ -280,12 +315,17 @@ At `--price 0.80`, followers are often already expensive (0.70-0.76). Edge is th
 
 | File | Lines | Purpose |
 |------|-------|---------|
+| `strategies/stat_arb.py` | ~2357 | Stat-Arb Divergence strategy (ACTIVE) |
 | `strategies/btc_signal.py` | ~1960 | Signal Hunter strategy (PRIMARY) |
 | `strategies/cheap_quote.py` | ~1797 | Cheap Quote strategy |
 | `strategies/correlation.py` | ~1771 | Correlation Hunter (DO NOT MODIFY) |
+| `strategies/research.py` | ~521 | Cross-validated parameter optimizer |
+| `strategies/analyze_prices.py` | — | Analysis + 6 plots + TP backtest |
+| `strategies/data_collector.py` | — | 24/7 price data collection (1 sample/s) |
 | `src/signer.py` | ~334 | EIP-712 signing with cached signer/builder |
 | `src/client.py` | ~893 | CLOB + Relayer API client |
 | `src/websocket_client.py` | ~786 | WS client, OrderbookSnapshot |
 | `lib/market_manager.py` | ~571 | MarketManager, market discovery |
 | `CLAUDE.md` | — | Claude Code instructions and project context |
-| `signal_trades.txt` | — | Persistent trade log (server only) |
+| `signal_trades.txt` | — | Signal Hunter trade log (server only) |
+| `stat_arb_trades.txt` | — | Stat-Arb trade log (server only) |
