@@ -304,6 +304,7 @@ class PositionRecord:
     won: Optional[bool] = None
     payout: float = 0.0
     sell_failed: bool = False  # True after sell attempt fails (hold to expiry)
+    wallet_size: Optional[float] = None  # Exact shares in wallet (from balance API)
 
 
 # ===================================================================
@@ -361,6 +362,11 @@ class StatArbStrategy:
         self._position: Optional[PositionRecord] = None
         self._holding_position: bool = False
         self._trade_executed: bool = False
+
+        # GTC TP limit sell tracking
+        self._tp_order_id: Optional[str] = None
+        self._tp_gtc_active: bool = False
+        self._last_tp_poll: float = 0.0
 
         # Signal state
         self._last_signal_t: float = 0.0
@@ -701,6 +707,9 @@ class StatArbStrategy:
         self._trade_executed = False
         self._holding_position = False
         self._position = None
+        self._tp_order_id = None
+        self._tp_gtc_active = False
+        self._last_tp_poll = 0.0
         self._last_signal_t = 0.0
         self._last_signal_coin = None
         self._last_signal_dev = 0.0
@@ -752,6 +761,16 @@ class StatArbStrategy:
     def _transition_to_done(self) -> None:
         """Transition to DONE and schedule resolution."""
         self.cycle_state = CycleState.DONE
+
+        # Cancel any resting GTC TP order (fire-and-forget)
+        if self._tp_gtc_active and self._tp_order_id:
+            try:
+                loop = asyncio.get_event_loop()
+                loop.create_task(self._cancel_tp_order())
+            except RuntimeError:
+                pass  # no running loop — best-effort
+        self._tp_order_id = None
+        self._tp_gtc_active = False
 
         # Stop watcher
         if self._fill_watcher_task and not self._fill_watcher_task.done():
@@ -884,22 +903,44 @@ class StatArbStrategy:
         # If sell already failed, stop trying — hold to expiry
         if pos.sell_failed:
             return
+
         bid = self._best_bids[pos.coin]["up"]
         elapsed = now - pos.fill_time
-
-        # Take profit: bid >= entry + target
         tp_price = pos.fill_price + self.cfg.target
-        if bid >= tp_price:
-            log(
-                f"$ TP HIT: {pos.coin}-UP bid={bid:.4f} >= {tp_price:.4f}"
-                f" (+${(bid - pos.fill_price) * pos.fill_size:.4f},"
-                f" {int(elapsed)}s)",
-                "trade",
-            )
-            await self._execute_exit(pos, bid, "TP")
-            return
 
-        # Timeout: elapsed >= timeout
+        # --- TP detection ---
+        if not self.cfg.dry_run and self._tp_gtc_active:
+            # Live with GTC: poll order status every 3s
+            if (now - self._last_tp_poll) >= 3.0:
+                self._last_tp_poll = now
+                filled = await self._poll_tp_order()
+                if filled:
+                    await self._record_gtc_tp_fill(pos, filled)
+                    return
+        elif not self.cfg.dry_run and not self._tp_gtc_active:
+            # Live without GTC (placement failed): fall back to FOK on bid
+            if bid >= tp_price:
+                log(
+                    f"$ TP HIT: {pos.coin}-UP bid={bid:.4f} >= {tp_price:.4f}"
+                    f" (+${(bid - pos.fill_price) * pos.fill_size:.4f},"
+                    f" {int(elapsed)}s)",
+                    "trade",
+                )
+                await self._execute_exit(pos, bid, "TP")
+                return
+        else:
+            # Dry-run: simulate TP when bid >= target
+            if bid >= tp_price:
+                log(
+                    f"$ TP HIT: {pos.coin}-UP bid={bid:.4f} >= {tp_price:.4f}"
+                    f" (+${(bid - pos.fill_price) * pos.fill_size:.4f},"
+                    f" {int(elapsed)}s)",
+                    "trade",
+                )
+                await self._execute_exit(pos, bid, "TP")
+                return
+
+        # --- Timeout ---
         if elapsed >= self.cfg.timeout:
             pnl = (bid - pos.fill_price) * pos.fill_size
             log(
@@ -907,6 +948,9 @@ class StatArbStrategy:
                 f" ({'+' if pnl >= 0 else ''}{pnl:.4f})",
                 "trade",
             )
+            # Cancel resting GTC before timeout sell
+            if self._tp_gtc_active:
+                await self._cancel_tp_order()
             await self._execute_exit(pos, bid, "TIMEOUT")
             return
 
@@ -1059,6 +1103,49 @@ class StatArbStrategy:
                 )
 
     # ------------------------------------------------------------------
+    # Low-level FOK sell (single attempt)
+    # ------------------------------------------------------------------
+    async def _try_sell_fok(
+        self,
+        token_id: str,
+        market: MarketInfo,
+        sell_price: float,
+        sell_size: float,
+        fee_rate_bps: int,
+        label: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Send one FOK SELL to the CLOB. Returns the raw response or None."""
+        try:
+            order = Order(
+                token_id=token_id,
+                price=sell_price,
+                size=sell_size,
+                side="SELL",
+                funder=self.bot_config.safe_address,
+                fee_rate_bps=fee_rate_bps,
+                signature_type=self.bot_config.clob.signature_type,
+                neg_risk=market.neg_risk,
+                tick_size=market.tick_size,
+            )
+            signed = self.signer.sign_order(order)
+
+            prev_timeout, prev_retry = self.clob.timeout, self.clob.retry_count
+            self.clob.timeout = 5
+            self.clob.retry_count = 1
+            try:
+                response = await asyncio.to_thread(
+                    self.clob.post_order, signed, "FOK"
+                )
+            finally:
+                self.clob.timeout = prev_timeout
+                self.clob.retry_count = prev_retry
+
+            return response
+        except Exception as exc:
+            log(f"SELL FOK ERR {label}: {exc}", "error")
+            return None
+
+    # ------------------------------------------------------------------
     # Sell order submission (FOK)
     # ------------------------------------------------------------------
     async def _submit_sell_order(
@@ -1070,9 +1157,9 @@ class StatArbStrategy:
     ) -> Optional[OrderTracker]:
         """Submit a FOK SELL order to the CLOB.
 
-        Tries fill_size first.  If the CLOB rejects with "not enough
-        balance", retries with progressively smaller sizes (99%, 98%, …,
-        92%) to auto-discover the actual wallet balance after fees.
+        Uses wallet_size (exact balance from API) when available.
+        Falls back to re-querying balance, then to fill_size if all
+        else fails.
         """
         label = f"{pos.coin}-UP-SELL"
         try:
@@ -1083,56 +1170,28 @@ class StatArbStrategy:
                 )
                 self._fee_rate_cache[token_id] = fee_rate_bps
 
-            # Try selling full fill_size first, then reduce if wallet
-            # has fewer shares (due to taker fee on buy side).
-            size_attempts = [pos.fill_size * f for f in
-                             [1.00, 0.99, 0.98, 0.97, 0.96, 0.95, 0.94, 0.93, 0.92]]
             tick = float(market.tick_size) if market.tick_size else 0.01
 
-            for attempt_i, raw_size in enumerate(size_attempts):
-                sell_size = max(round(int(raw_size / tick) * tick, 6), tick)
+            # Best source: wallet_size from balance API (queried after buy)
+            # Fallback: re-query balance now, then fill_size as last resort
+            raw_size = pos.wallet_size
+            if not raw_size:
+                await self._query_wallet_balance(token_id)
+                raw_size = pos.wallet_size or pos.fill_size
 
-                if attempt_i > 0:
-                    log(f"SELL retry #{attempt_i}: size={sell_size:.4f}", "info")
+            sell_size = max(round(int(raw_size / tick) * tick, 6), tick)
 
-                order = Order(
-                    token_id=token_id,
-                    price=sell_price,
-                    size=sell_size,
-                    side="SELL",
-                    funder=self.bot_config.safe_address,
-                    fee_rate_bps=fee_rate_bps,
-                    signature_type=self.bot_config.clob.signature_type,
-                    neg_risk=market.neg_risk,
-                    tick_size=market.tick_size,
-                )
-                signed = self.signer.sign_order(order)
+            response = await self._try_sell_fok(
+                token_id, market, sell_price, sell_size, fee_rate_bps, label,
+            )
 
-                # Tight timeout for FOK
-                prev_timeout, prev_retry = self.clob.timeout, self.clob.retry_count
-                self.clob.timeout = 5
-                self.clob.retry_count = 1
-                try:
-                    response = await asyncio.to_thread(
-                        self.clob.post_order, signed, "FOK"
-                    )
-                finally:
-                    self.clob.timeout = prev_timeout
-                    self.clob.retry_count = prev_retry
+            if response is None:
+                # _try_sell_fok returned None = exception/error
+                return None
 
-                if not response.get("success", False):
-                    error = response.get("errorMsg", "unknown")
-                    if "balance" in error.lower() and attempt_i < len(size_attempts) - 1:
-                        log(f"SELL {label}: balance issue, reducing size", "warning")
-                        continue  # retry with smaller size
-                    log(f"SELL FOK FAIL {label}: {error}", "error")
-                    return None
-
-                # Success — break out of retry loop
-                break
-            else:
-                # All size attempts exhausted
-                log(f"SELL {label}: all size attempts failed", "error")
+            if not response.get("success", False):
+                error = response.get("errorMsg", "unknown")
+                log(f"SELL FOK FAIL {label}: {error}", "error")
                 return None
 
             order_id = (
@@ -1186,6 +1245,210 @@ class StatArbStrategy:
         except Exception as exc:
             log(f"SELL FOK ERR {label}: {exc}", "error")
             return None
+
+    # ------------------------------------------------------------------
+    # Wallet balance query (exact shares — like Polymarket MAX button)
+    # ------------------------------------------------------------------
+    async def _query_wallet_balance(self, token_id: str) -> None:
+        """Query exact token balance after buy fill.
+
+        Stores the result in pos.wallet_size so sell orders use the
+        exact amount — no residual shares left behind.
+        """
+        pos = self._position
+        if not pos or self.cfg.dry_run:
+            return
+        try:
+            result = await asyncio.to_thread(
+                self.clob.get_balance_allowance, token_id,
+            )
+            balance = float(result.get("balance", 0))
+            if balance > 0:
+                pos.wallet_size = balance
+                log(
+                    f"Wallet balance: {balance:.6f} shares"
+                    f" (API fill_size={pos.fill_size:.6f},"
+                    f" diff={pos.fill_size - balance:+.6f})",
+                    "info",
+                )
+            else:
+                log(
+                    f"Wallet balance query returned 0 — using fill_size",
+                    "warning",
+                )
+        except Exception as exc:
+            log(f"Wallet balance query failed: {exc} — using fill_size", "warning")
+
+    # ------------------------------------------------------------------
+    # GTC limit sell at TP price (maker = 0% fee)
+    # ------------------------------------------------------------------
+    async def _place_tp_gtc_sell(
+        self, token_id: str, market: MarketInfo,
+    ) -> None:
+        """Place a resting GTC limit sell at fill_price + target.
+
+        This sits on the book as a maker order (0% fee).  If it fills,
+        we get the TP exit for free.  If timeout expires first, we
+        cancel and FOK sell at market.
+
+        Uses wallet_size (from balance API) for exact sell size — no
+        residual shares left behind.
+        """
+        pos = self._position
+        if not pos:
+            return
+
+        tp_price = round(pos.fill_price + self.cfg.target, 2)
+        sell_size_raw = pos.wallet_size if pos.wallet_size else pos.fill_size
+        label = f"{pos.coin}-UP-GTC-TP"
+
+        try:
+            fee_rate_bps = self._fee_rate_cache.get(token_id)
+            if fee_rate_bps is None:
+                fee_rate_bps = await asyncio.to_thread(
+                    self.clob.get_fee_rate_bps, token_id
+                )
+                self._fee_rate_cache[token_id] = fee_rate_bps
+
+            tick = float(market.tick_size) if market.tick_size else 0.01
+            sell_size = max(round(int(sell_size_raw / tick) * tick, 6), tick)
+
+            order = Order(
+                token_id=token_id,
+                price=tp_price,
+                size=sell_size,
+                side="SELL",
+                funder=self.bot_config.safe_address,
+                fee_rate_bps=fee_rate_bps,
+                signature_type=self.bot_config.clob.signature_type,
+                neg_risk=market.neg_risk,
+                tick_size=market.tick_size,
+            )
+            signed = self.signer.sign_order(order)
+
+            response = await asyncio.to_thread(
+                self.clob.post_order, signed, "GTC"
+            )
+
+            if response.get("success", False):
+                oid = (response.get("orderID")
+                       or response.get("orderId")
+                       or response.get("order_id") or "")
+                self._tp_order_id = oid
+                self._tp_gtc_active = True
+                self._last_tp_poll = time.time()
+                log(
+                    f"GTC TP placed: {label} @{tp_price:.2f}"
+                    f" x{sell_size:.6f} id={oid[:12]}",
+                    "success",
+                )
+                return
+
+            error = response.get("errorMsg", "unknown")
+            log(f"GTC TP FAIL {label}: {error}", "warning")
+
+            # GTC placement failed — will fall back to FOK on bid detection
+            log(f"GTC TP not placed — using FOK fallback", "warning")
+
+        except Exception as exc:
+            log(f"GTC TP ERR {label}: {exc}", "warning")
+
+    async def _poll_tp_order(self) -> Optional[Dict[str, Any]]:
+        """Check if the resting GTC TP order has filled."""
+        if not self._tp_order_id:
+            return None
+        try:
+            order_data = await asyncio.to_thread(
+                self.clob.get_order, self._tp_order_id
+            )
+            if not order_data:
+                return None
+            if isinstance(order_data, dict) and "order" in order_data:
+                order_data = order_data["order"]
+
+            status = str(order_data.get("status", "")).lower()
+            if status in ("matched", "filled", "executed", "complete", "completed"):
+                size_matched = _to_float(
+                    order_data.get("size_matched")
+                    or order_data.get("sizeMatched") or 0
+                )
+                return {
+                    "size": size_matched if size_matched > 0 else 0,
+                    "order_data": order_data,
+                }
+            return None
+        except Exception as exc:
+            log(f"GTC poll err: {exc}", "warning")
+            return None
+
+    async def _record_gtc_tp_fill(
+        self, pos: PositionRecord, fill_info: Dict[str, Any],
+    ) -> None:
+        """Record a successful GTC TP fill (maker = 0% fee)."""
+        tp_price = round(pos.fill_price + self.cfg.target, 2)
+        fill_size = fill_info.get("size", 0) or pos.fill_size
+        # Maker order: no taker fee on exit
+        pnl = (tp_price - pos.fill_price) * fill_size
+        hold_secs = int(time.time() - pos.fill_time)
+
+        pos.exit_price = tp_price
+        pos.exit_type = "TP"
+        pos.exit_time = time.time()
+        pos.pnl = pnl
+        pos.resolved = True
+        pos.won = pnl >= 0
+
+        self._holding_position = False
+        self._trade_executed = True
+        self._position = None
+        self._tp_order_id = None
+        self._tp_gtc_active = False
+
+        self.total_resolved += 1
+        self.session_pnl += pnl
+        self.total_received += tp_price * fill_size
+        self.total_tp += 1
+        if pnl >= 0:
+            self.total_wins += 1
+        else:
+            self.total_losses += 1
+
+        coin_key = pos.coin.upper()
+        if coin_key in self.coin_resolved:
+            self.coin_resolved[coin_key] += 1
+        if pnl >= 0 and coin_key in self.coin_wins:
+            self.coin_wins[coin_key] += 1
+        elif pnl < 0 and coin_key in self.coin_losses:
+            self.coin_losses[coin_key] += 1
+
+        log(
+            f"GTC TP FILLED {pos.coin}-UP @{tp_price:.4f}"
+            f" pnl=${pnl:+.4f} hold={hold_secs}s (maker 0% fee)",
+            "success" if pnl >= 0 else "warning",
+        )
+
+        _update_trade_log_exit(
+            pos.order_id, tp_price, "TP", pnl, hold_secs,
+            log_file=self.log_file,
+        )
+
+    async def _cancel_tp_order(self) -> None:
+        """Cancel the resting GTC TP order."""
+        if not self._tp_order_id:
+            return
+        try:
+            await asyncio.to_thread(
+                self.clob.cancel_order, self._tp_order_id
+            )
+            log(f"GTC TP cancelled: {self._tp_order_id[:12]}", "info")
+        except Exception as exc:
+            # Cancel might fail if already filled — check status
+            log(f"GTC cancel err: {exc}", "warning")
+            filled = await self._poll_tp_order()
+            if filled and self._position:
+                await self._record_gtc_tp_fill(self._position, filled)
+        self._tp_order_id = None
+        self._tp_gtc_active = False
 
     # ------------------------------------------------------------------
     # Buy trade execution
@@ -1243,6 +1506,10 @@ class StatArbStrategy:
             if result:
                 # Enter holding state for TP/timeout monitoring
                 self._holding_position = True
+                # Query exact wallet balance (like Polymarket MAX button)
+                await self._query_wallet_balance(token_id)
+                # Immediately place GTC limit sell at TP price (maker = 0% fee)
+                await self._place_tp_gtc_sell(token_id, market)
             else:
                 # FOK missed -- mark cycle as attempted
                 self._trade_executed = True
@@ -2152,7 +2419,7 @@ class StatArbStrategy:
                 f" @{pos.fill_price:.2f}"
                 f"  bid={C}{bid:.4f}{X}"
                 f"  pnl:{pnl_c}${current_pnl:+.2f}{X}"
-                f"  TP@{tp_price:.2f}"
+                f"  {'GTC' if self._tp_gtc_active else 'TP'}@{tp_price:.2f}"
                 f"  hold={int(elapsed)}s/{self.cfg.timeout}s"
             )
         else:
@@ -2257,6 +2524,12 @@ class StatArbStrategy:
     # Cleanup & summary
     # ------------------------------------------------------------------
     async def _cleanup(self) -> None:
+        # Cancel any resting GTC TP order
+        if self._tp_gtc_active and self._tp_order_id:
+            try:
+                await self._cancel_tp_order()
+            except Exception as exc:
+                log(f"Cleanup GTC cancel err: {exc}", "warning")
         if self._fill_watcher_task and not self._fill_watcher_task.done():
             self._fill_watcher_task.cancel()
         for task in self._resolution_tasks:

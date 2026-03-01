@@ -509,6 +509,28 @@ class ClobClient(ApiClient):
         except Exception:
             return 0
 
+    def get_balance_allowance(
+        self, token_id: str, asset_type: str = "CONDITIONAL",
+    ) -> Dict[str, str]:
+        """
+        Get wallet balance and allowance for a specific token.
+
+        This queries the exact number of shares in the wallet,
+        equivalent to Polymarket's MAX button.
+
+        Args:
+            token_id: ERC-1155 token ID
+            asset_type: "CONDITIONAL" for outcome tokens,
+                        "COLLATERAL" for USDC
+
+        Returns:
+            Dict with 'balance' and 'allowance' as strings
+        """
+        endpoint = "/balance-allowance"
+        params = {"asset_type": asset_type, "token_id": token_id}
+        headers = self._build_headers("GET", endpoint)
+        return self._request("GET", endpoint, headers=headers, params=params)
+
     def get_open_orders(self) -> List[Dict[str, Any]]:
         """
         Get all open orders for the funder.
