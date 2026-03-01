@@ -37,6 +37,7 @@ Usage:
 
 import argparse
 import asyncio
+import concurrent.futures
 import enum
 import json
 import logging
@@ -105,7 +106,7 @@ _tui_active = False
 
 
 def ts_now() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
 
 
 def log(msg: str, level: str = "info") -> None:
@@ -430,6 +431,13 @@ class StatArbStrategy:
 
         # Fee cache
         self._fee_rate_cache: Dict[str, int] = {}
+
+        # Dedicated single-thread executor for CLOB API calls.
+        # Guarantees: 1) session/TCP reuse (same thread = same keep-alive),
+        #             2) sign + POST in one call (zero event-loop blocking).
+        self._clob_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="clob-hot"
+        )
 
         # Event-driven: WS callback signals this when any book updates
         self._book_event: asyncio.Event = asyncio.Event()
@@ -768,6 +776,10 @@ class StatArbStrategy:
                 tid = m.token_ids.get(s, "")
                 if tid and tid not in self._fee_rate_cache:
                     loop.create_task(self._prefetch_fee(tid))
+
+        # Pre-warm HTTPS connection on dedicated CLOB thread
+        # (TCP + TLS handshake done BEFORE first hot-path BUY)
+        loop.create_task(self._prewarm_clob())
 
         # Start the watcher
         if self._fill_watcher_task and not self._fill_watcher_task.done():
@@ -1763,6 +1775,52 @@ class StatArbStrategy:
             return None
 
     # ------------------------------------------------------------------
+    # Hot-path: sign + POST in a single thread call (zero event-loop block)
+    # ------------------------------------------------------------------
+    def _sync_sign_and_post(
+        self, order: Order, order_type: str = "FOK"
+    ) -> Tuple[Dict[str, Any], float, float]:
+        """Sign an order and POST it to the CLOB in one synchronous call.
+
+        Runs on the dedicated ``_clob_executor`` thread so the asyncio
+        event loop is NEVER blocked by ECDSA signing or HMAC computation.
+
+        Returns:
+            (response_dict, sign_microseconds, post_microseconds)
+        """
+        prev_t, prev_r = self.clob.timeout, self.clob.retry_count
+        self.clob.timeout = 5
+        self.clob.retry_count = 1
+        try:
+            t0 = time.perf_counter()
+            signed = self.signer.sign_order(order)
+            t_sign = (time.perf_counter() - t0) * 1_000_000
+
+            t1 = time.perf_counter()
+            response = self.clob.post_order(signed, order_type)
+            t_post = (time.perf_counter() - t1) * 1_000_000
+
+            return response, t_sign, t_post
+        finally:
+            self.clob.timeout = prev_t
+            self.clob.retry_count = prev_r
+
+    async def _prewarm_clob(self) -> None:
+        """Pre-warm the HTTPS connection on the dedicated CLOB thread.
+
+        Makes a lightweight GET /time so the TCP + TLS handshake is
+        already done before the first hot-path BUY of the cycle.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                self._clob_executor,
+                lambda: self.clob._request("GET", "/time"),
+            )
+        except Exception:
+            pass  # best-effort warm-up
+
+    # ------------------------------------------------------------------
     # Live BUY order submission (FOK)
     # ------------------------------------------------------------------
     async def _submit_live_buy(
@@ -1787,7 +1845,6 @@ class StatArbStrategy:
                 self._fee_rate_cache[token_id] = fee_rate_bps
             t_fee_us = (time.perf_counter() - t_fee_start) * 1_000_000
 
-            t_sign_start = time.perf_counter()
             order = Order(
                 token_id=token_id,
                 price=buy_price,
@@ -1799,27 +1856,22 @@ class StatArbStrategy:
                 neg_risk=market.neg_risk,
                 tick_size=market.tick_size,
             )
-            signed = self.signer.sign_order(order)
-            t_sign_us = (time.perf_counter() - t_sign_start) * 1_000_000
 
-            # Tight timeout for FOK
-            prev_timeout, prev_retry = self.clob.timeout, self.clob.retry_count
-            self.clob.timeout = 5
-            self.clob.retry_count = 1
-            t_post_start = time.perf_counter()
-            try:
-                response = await asyncio.to_thread(
-                    self.clob.post_order, signed, "FOK"
-                )
-            finally:
-                self.clob.timeout = prev_timeout
-                self.clob.retry_count = prev_retry
-            t_post_us = (time.perf_counter() - t_post_start) * 1_000_000
+            # Hot path: sign + POST in a single thread call on the
+            # dedicated executor.  Event loop stays unblocked the whole time.
+            t_hot_start = time.perf_counter()
+            loop = asyncio.get_running_loop()
+            response, t_sign_us, t_post_us = await loop.run_in_executor(
+                self._clob_executor,
+                self._sync_sign_and_post, order, "FOK",
+            )
+            t_hot_us = (time.perf_counter() - t_hot_start) * 1_000_000
 
             timing = (
                 f"[fee={'hit' if fee_cached else 'MISS'}={t_fee_us:.0f}us"
                 f" sign={t_sign_us:.0f}us"
-                f" post={t_post_us:.0f}us]"
+                f" post={t_post_us:.0f}us"
+                f" hot={t_hot_us:.0f}us]"
             )
 
             if not response.get("success", False):

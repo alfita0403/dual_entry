@@ -170,9 +170,12 @@ class ApiClient(ThreadLocalSessionMixin):
         # Pre-serialize body as compact JSON bytes to match HMAC signature
         body_bytes = None
         if data is not None:
-            body_bytes = json.dumps(
-                data, separators=(",", ":"), ensure_ascii=False
-            ).encode("utf-8")
+            if isinstance(data, bytes):
+                body_bytes = data  # Already serialized (fast path)
+            else:
+                body_bytes = json.dumps(
+                    data, separators=(",", ":"), ensure_ascii=False
+                ).encode("utf-8")
 
         last_error = None
         for attempt in range(self.retry_count):
@@ -294,6 +297,22 @@ class ClobClient(ApiClient):
         self.api_creds = api_creds
         self.builder_creds = builder_creds
 
+        # Pre-decode HMAC secrets at init (avoid base64 decode on every call)
+        self._builder_hmac_key: Optional[bytes] = None
+        self._api_hmac_key: Optional[bytes] = None
+        if builder_creds and builder_creds.is_configured():
+            try:
+                self._builder_hmac_key = base64.urlsafe_b64decode(
+                    builder_creds.api_secret
+                )
+            except Exception:
+                pass
+        if api_creds and api_creds.is_valid():
+            try:
+                self._api_hmac_key = base64.urlsafe_b64decode(api_creds.secret)
+            except Exception:
+                pass
+
     def _build_headers(self, method: str, path: str, body: str = "") -> Dict[str, str]:
         """
         Build authentication headers.
@@ -311,17 +330,12 @@ class ClobClient(ApiClient):
         headers = {}
 
         # Builder HMAC authentication (matches official py-builder-signing-sdk)
-        if self.builder_creds and self.builder_creds.is_configured():
+        if self._builder_hmac_key is not None and self.builder_creds:
             timestamp = str(int(time.time()))
-
-            # Build message: timestamp + method + path + body
             message = f"{timestamp}{method}{path}"
             if body:
                 message += body
-
-            # Decode base64 secret, create HMAC-SHA256, encode result as base64
-            base64_secret = base64.urlsafe_b64decode(self.builder_creds.api_secret)
-            h = hmac.new(base64_secret, message.encode("utf-8"), hashlib.sha256)
+            h = hmac.new(self._builder_hmac_key, message.encode("utf-8"), hashlib.sha256)
             signature = base64.urlsafe_b64encode(h.digest()).decode("utf-8")
 
             headers.update(
@@ -334,24 +348,13 @@ class ClobClient(ApiClient):
             )
 
         # User API credentials (L2 authentication)
-        if self.api_creds and self.api_creds.is_valid():
+        if self._api_hmac_key is not None and self.api_creds:
             timestamp = str(int(time.time()))
-
-            # Build message: timestamp + method + path + body
             message = f"{timestamp}{method}{path}"
             if body:
                 message += body
-
-            # Decode base64 secret and create HMAC signature
-            try:
-                base64_secret = base64.urlsafe_b64decode(self.api_creds.secret)
-                h = hmac.new(base64_secret, message.encode("utf-8"), hashlib.sha256)
-                signature = base64.urlsafe_b64encode(h.digest()).decode("utf-8")
-            except Exception:
-                # Fallback: use secret directly if not base64 encoded
-                signature = hmac.new(
-                    self.api_creds.secret.encode(), message.encode(), hashlib.sha256
-                ).hexdigest()
+            h = hmac.new(self._api_hmac_key, message.encode("utf-8"), hashlib.sha256)
+            signature = base64.urlsafe_b64encode(h.digest()).decode("utf-8")
 
             headers.update(
                 {
@@ -705,7 +708,8 @@ class ClobClient(ApiClient):
         body_json = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
         headers = self._build_headers("POST", endpoint, body_json)
 
-        return self._request("POST", endpoint, data=body, headers=headers)
+        # Pass pre-serialized bytes to skip double JSON serialization
+        return self._request("POST", endpoint, data=body_json.encode("utf-8"), headers=headers)
 
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """
