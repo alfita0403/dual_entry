@@ -93,21 +93,25 @@ def main():
     # Step 3: Find an active market and try a tiny order
     print("--- Finding active market ---")
     gamma = GammaClient()
-    try:
-        markets = gamma.get_active_5min_markets()
-        if not markets:
-            print("No active 5m markets found")
-            return
-        market = markets[0]
-        slug = market.get("slug", "?")
-        tokens = market.get("clobTokenIds", [])
-        print(f"Market: {slug}")
-        print(f"Tokens: {tokens}")
-        if len(tokens) < 2:
-            print("Not enough tokens")
-            return
-    except Exception as e:
-        print(f"Gamma error: {e}")
+    market = None
+    for coin in ["BTC", "ETH", "SOL", "XRP"]:
+        try:
+            m = gamma.get_current_5m_market(coin)
+            if m:
+                market = m
+                print(f"Found: {coin} -> {m.get('slug', '?')}")
+                break
+        except Exception as e:
+            print(f"  {coin}: {e}")
+    if not market:
+        print("No active 5m markets found")
+        return
+    slug = market.get("slug", "?")
+    tokens = market.get("clobTokenIds", [])
+    print(f"Market: {slug}")
+    print(f"Tokens: {tokens}")
+    if len(tokens) < 2:
+        print("Not enough tokens")
         return
     print()
 
