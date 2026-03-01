@@ -118,9 +118,9 @@ def main():
     print()
 
     # Step 4: Place a tiny FOK order (will likely be killed = no risk)
-    # Buy UP at $0.01 (way below market) so FOK is guaranteed to be killed
+    # Buy UP at $0.02 — way below market so FOK will be killed, but above min size ($1)
     token_id = tokens[0]  # UP token
-    print(f"--- Submitting test FOK order (UP @ $0.01 x5, will be killed) ---")
+    print(f"--- Submitting test FOK order (UP @ $0.02 x55, will be killed) ---")
     try:
         neg_risk = market.get("negRisk", False)
         fee_rate = clob.get_fee_rate_bps(token_id)
@@ -128,8 +128,8 @@ def main():
 
         order = Order(
             token_id=token_id,
-            price=0.01,
-            size=5.0,
+            price=0.02,
+            size=55.0,
             side="BUY",
             funder=config.safe_address,
             fee_rate_bps=fee_rate,
