@@ -65,6 +65,15 @@ from src.config import Config  # noqa: E402
 from src.gamma_client import GammaClient  # noqa: E402
 from src.signer import Order, OrderSigner  # noqa: E402
 from src.websocket_client import OrderbookSnapshot  # noqa: E402
+from web3 import Web3  # noqa: E402
+
+# CTF (Conditional Token Framework) contract on Polygon — holds ERC-1155 shares
+_CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+_CTF_BALANCE_ABI = [{"inputs": [{"name": "account", "type": "address"},
+                                 {"name": "id", "type": "uint256"}],
+                      "name": "balanceOf",
+                      "outputs": [{"name": "", "type": "uint256"}],
+                      "stateMutability": "view", "type": "function"}]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -367,6 +376,14 @@ class StatArbStrategy:
         self._tp_order_id: Optional[str] = None
         self._tp_gtc_active: bool = False
         self._last_tp_poll: float = 0.0
+
+        # On-chain balance query (CTF balanceOf)
+        rpc_url = os.environ.get("POLY_RPC_URL", "https://polygon.publicnode.com")
+        self._w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 5}))
+        self._ctf = self._w3.eth.contract(
+            address=Web3.to_checksum_address(_CTF_ADDRESS), abi=_CTF_BALANCE_ABI,
+        )
+        self._safe_checksum = Web3.to_checksum_address(bot_config.safe_address)
 
         # Signal state
         self._last_signal_t: float = 0.0
@@ -1278,38 +1295,37 @@ class StatArbStrategy:
             return None
 
     # ------------------------------------------------------------------
-    # Wallet balance query (exact shares — like Polymarket MAX button)
+    # Wallet balance query — on-chain CTF balanceOf (ground truth)
     # ------------------------------------------------------------------
     async def _query_wallet_balance(self, token_id: str) -> None:
-        """Query exact token balance after buy fill.
+        """Query exact on-chain token balance via CTF balanceOf.
 
+        This is the same source Polymarket uses for the MAX button.
         Stores the result in pos.wallet_size so sell orders use the
-        exact amount — no residual shares left behind.
+        exact amount — zero residual shares.
         """
         pos = self._position
         if not pos or self.cfg.dry_run:
             return
         try:
-            result = await asyncio.to_thread(
-                self.clob.get_balance_allowance, token_id,
+            raw = await asyncio.to_thread(
+                self._ctf.functions.balanceOf(
+                    self._safe_checksum, int(token_id),
+                ).call,
             )
-            log(f"Balance API raw response: {result}", "info")
-            balance = float(result.get("balance", 0))
+            balance = raw / 1e6  # CTF tokens use 6 decimals
             if balance > 0:
                 pos.wallet_size = balance
                 log(
-                    f"Wallet balance: {balance:.6f} shares"
-                    f" (API fill_size={pos.fill_size:.6f},"
-                    f" diff={pos.fill_size - balance:+.6f})",
+                    f"On-chain balance: {balance:.6f} shares"
+                    f" (fill_size={pos.fill_size:.6f},"
+                    f" fee={pos.fill_size - balance:+.6f})",
                     "info",
                 )
             else:
-                log(
-                    f"Wallet balance returned 0 — retry sell will find correct size",
-                    "warning",
-                )
+                log("On-chain balance is 0 — retry sell will find correct size", "warning")
         except Exception as exc:
-            log(f"Wallet balance query failed: {exc}", "warning")
+            log(f"On-chain balance query failed: {exc}", "warning")
 
     # ------------------------------------------------------------------
     # GTC limit sell at TP price (maker = 0% fee)
