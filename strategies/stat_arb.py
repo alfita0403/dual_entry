@@ -76,15 +76,15 @@ TRADE_LOG_FILE = Path(__file__).resolve().parent.parent / "stat_arb_trades.txt"
 # ---------------------------------------------------------------------------
 # Dry-run simulation realism
 # ---------------------------------------------------------------------------
-# These penalties make the dry-run CONSERVATIVE relative to live trading.
-# Without them, the sim overstates per-trade profit by ~40%.
+# These penalties match the stress-test "Realistic" scenario so the dry-run
+# PnL closely approximates what we'd see in live trading.
 #
-# Entry:  simulates worse fill due to ~360ms latency + orderbook depth.
-# Exit:   simulates worse fill on sell side (latency + matching).
-# Fee:    taker fee per side (Polymarket ~0.5-1.5% depending on market).
+# Entry:  +1c  — simulates worse fill due to ~360ms latency + orderbook depth.
+# Exit:   +2c  — exit slippage is worse (TP race, expiry crowd, thinner bids).
+# Fee:    1%/side (~2% RT) — conservative estimate for Polymarket taker fees.
 SIM_ENTRY_SLIP = 0.01   # 1 cent worse than best ask
-SIM_EXIT_SLIP  = 0.01   # 1 cent worse than best bid
-SIM_FEE_RATE   = 0.005  # 0.5% per side (~1% round-trip)
+SIM_EXIT_SLIP  = 0.02   # 2 cents worse than best bid (matches stress-test "Realistic")
+SIM_FEE_RATE   = 0.01   # 1% per side (~2% round-trip, matches stress-test "Realistic")
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +303,7 @@ class PositionRecord:
     resolved: bool = False
     won: Optional[bool] = None
     payout: float = 0.0
+    sell_failed: bool = False  # True after sell attempt fails (hold to expiry)
 
 
 # ===================================================================
@@ -880,6 +881,9 @@ class StatArbStrategy:
             return
 
         pos = self._position
+        # If sell already failed, stop trying — hold to expiry
+        if pos.sell_failed:
+            return
         bid = self._best_bids[pos.coin]["up"]
         elapsed = now - pos.fill_time
 
@@ -1045,7 +1049,10 @@ class StatArbStrategy:
                     actual_pnl, hold_secs, log_file=self.log_file,
                 )
             else:
-                # Sell failed -- position still held, will go to resolution
+                # Sell failed -- stop retrying, hold to expiry for resolution
+                pos.sell_failed = True
+                self._holding_position = False
+                self._trade_executed = True
                 log(
                     f"SELL FAILED {pos.coin}-UP -- holding to expiry",
                     "error",
@@ -1071,10 +1078,25 @@ class StatArbStrategy:
                 )
                 self._fee_rate_cache[token_id] = fee_rate_bps
 
+            # pos.fill_size is size_matched (shares ORDERED), but the wallet
+            # holds fewer shares due to the taker fee on the buy side.
+            # Sell only what we actually have: fill_size * (1 - fee_rate).
+            fee_rate = (fee_rate_bps or 0) / 10_000
+            actual_shares = pos.fill_size * (1.0 - fee_rate)
+            # Round DOWN to tick size to avoid dust overshoot
+            tick = float(market.tick_size) if market.tick_size else 0.01
+            sell_size = max(round(int(actual_shares / tick) * tick, 6), tick)
+
+            log(
+                f"SELL sizing: matched={pos.fill_size:.4f}"
+                f" fee={fee_rate:.4f} actual={sell_size:.4f}",
+                "info",
+            )
+
             order = Order(
                 token_id=token_id,
                 price=sell_price,
-                size=pos.fill_size,
+                size=sell_size,
                 side="SELL",
                 funder=self.bot_config.safe_address,
                 fee_rate_bps=fee_rate_bps,
@@ -1115,7 +1137,7 @@ class StatArbStrategy:
                 token_id=token_id,
                 order_id=order_id,
                 price=sell_price,
-                size=pos.fill_size,
+                size=sell_size,
                 placed_at=time.time(),
                 market_slug=market.slug,
             )
@@ -1138,7 +1160,7 @@ class StatArbStrategy:
                 fp = making / max(taking, 1e-12) if taking > 0 else sell_price
                 tracker.filled = True
                 tracker.fill_price = fp
-                tracker.fill_size = taking if taking > 0 else pos.fill_size
+                tracker.fill_size = taking if taking > 0 else sell_size
                 tracker.fill_time = time.time()
                 self._orders[order_id] = tracker
                 return tracker
