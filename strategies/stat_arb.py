@@ -1173,25 +1173,47 @@ class StatArbStrategy:
             tick = float(market.tick_size) if market.tick_size else 0.01
 
             # Best source: wallet_size from balance API (queried after buy)
-            # Fallback: re-query balance now, then fill_size as last resort
+            # Fallback: re-query balance now, then retry with decreasing %
             raw_size = pos.wallet_size
             if not raw_size:
                 await self._query_wallet_balance(token_id)
-                raw_size = pos.wallet_size or pos.fill_size
+                raw_size = pos.wallet_size
 
-            sell_size = max(round(int(raw_size / tick) * tick, 6), tick)
+            if raw_size:
+                # Exact balance known — single attempt
+                size_attempts = [raw_size]
+            else:
+                # Balance unknown — retry with decreasing sizes
+                size_attempts = [pos.fill_size * f for f in
+                                 [1.00, 0.99, 0.98, 0.97, 0.96, 0.95, 0.94, 0.93, 0.92]]
 
-            response = await self._try_sell_fok(
-                token_id, market, sell_price, sell_size, fee_rate_bps, label,
-            )
+            response = None
+            sell_size = 0.0
+            for attempt_i, attempt_raw in enumerate(size_attempts):
+                sell_size = max(round(int(attempt_raw / tick) * tick, 6), tick)
+                if attempt_i > 0:
+                    log(f"SELL retry #{attempt_i}: size={sell_size:.4f}", "info")
 
-            if response is None:
-                # _try_sell_fok returned None = exception/error
+                response = await self._try_sell_fok(
+                    token_id, market, sell_price, sell_size, fee_rate_bps, label,
+                )
+
+                if response is None:
+                    return None  # exception
+
+                if response.get("success", False):
+                    break  # success
+
+                error = response.get("errorMsg", "unknown")
+                if "balance" in error.lower() and attempt_i < len(size_attempts) - 1:
+                    continue  # retry smaller
+                log(f"SELL FOK FAIL {label}: {error}", "error")
+                return None
+            else:
+                log(f"SELL {label}: all size attempts failed", "error")
                 return None
 
-            if not response.get("success", False):
-                error = response.get("errorMsg", "unknown")
-                log(f"SELL FOK FAIL {label}: {error}", "error")
+            if not response or not response.get("success", False):
                 return None
 
             order_id = (
@@ -1262,6 +1284,7 @@ class StatArbStrategy:
             result = await asyncio.to_thread(
                 self.clob.get_balance_allowance, token_id,
             )
+            log(f"Balance API raw response: {result}", "info")
             balance = float(result.get("balance", 0))
             if balance > 0:
                 pos.wallet_size = balance
@@ -1273,11 +1296,11 @@ class StatArbStrategy:
                 )
             else:
                 log(
-                    f"Wallet balance query returned 0 — using fill_size",
+                    f"Wallet balance returned 0 — retry sell will find correct size",
                     "warning",
                 )
         except Exception as exc:
-            log(f"Wallet balance query failed: {exc} — using fill_size", "warning")
+            log(f"Wallet balance query failed: {exc}", "warning")
 
     # ------------------------------------------------------------------
     # GTC limit sell at TP price (maker = 0% fee)
@@ -1299,7 +1322,6 @@ class StatArbStrategy:
             return
 
         tp_price = round(pos.fill_price + self.cfg.target, 2)
-        sell_size_raw = pos.wallet_size if pos.wallet_size else pos.fill_size
         label = f"{pos.coin}-UP-GTC-TP"
 
         try:
@@ -1311,41 +1333,53 @@ class StatArbStrategy:
                 self._fee_rate_cache[token_id] = fee_rate_bps
 
             tick = float(market.tick_size) if market.tick_size else 0.01
-            sell_size = max(round(int(sell_size_raw / tick) * tick, 6), tick)
 
-            order = Order(
-                token_id=token_id,
-                price=tp_price,
-                size=sell_size,
-                side="SELL",
-                funder=self.bot_config.safe_address,
-                fee_rate_bps=fee_rate_bps,
-                signature_type=self.bot_config.clob.signature_type,
-                neg_risk=market.neg_risk,
-                tick_size=market.tick_size,
-            )
-            signed = self.signer.sign_order(order)
+            # Use wallet_size if known, else retry with decreasing sizes
+            if pos.wallet_size:
+                size_attempts = [pos.wallet_size]
+            else:
+                size_attempts = [pos.fill_size * f for f in
+                                 [1.00, 0.99, 0.98, 0.97, 0.96, 0.95, 0.94, 0.93, 0.92]]
 
-            response = await asyncio.to_thread(
-                self.clob.post_order, signed, "GTC"
-            )
+            for attempt_i, raw_size in enumerate(size_attempts):
+                sell_size = max(round(int(raw_size / tick) * tick, 6), tick)
 
-            if response.get("success", False):
-                oid = (response.get("orderID")
-                       or response.get("orderId")
-                       or response.get("order_id") or "")
-                self._tp_order_id = oid
-                self._tp_gtc_active = True
-                self._last_tp_poll = time.time()
-                log(
-                    f"GTC TP placed: {label} @{tp_price:.2f}"
-                    f" x{sell_size:.6f} id={oid[:12]}",
-                    "success",
+                order = Order(
+                    token_id=token_id,
+                    price=tp_price,
+                    size=sell_size,
+                    side="SELL",
+                    funder=self.bot_config.safe_address,
+                    fee_rate_bps=fee_rate_bps,
+                    signature_type=self.bot_config.clob.signature_type,
+                    neg_risk=market.neg_risk,
+                    tick_size=market.tick_size,
                 )
-                return
+                signed = self.signer.sign_order(order)
 
-            error = response.get("errorMsg", "unknown")
-            log(f"GTC TP FAIL {label}: {error}", "warning")
+                response = await asyncio.to_thread(
+                    self.clob.post_order, signed, "GTC"
+                )
+
+                if response.get("success", False):
+                    oid = (response.get("orderID")
+                           or response.get("orderId")
+                           or response.get("order_id") or "")
+                    self._tp_order_id = oid
+                    self._tp_gtc_active = True
+                    self._last_tp_poll = time.time()
+                    log(
+                        f"GTC TP placed: {label} @{tp_price:.2f}"
+                        f" x{sell_size:.6f} id={oid[:12]}",
+                        "success",
+                    )
+                    return
+
+                error = response.get("errorMsg", "unknown")
+                if "balance" in error.lower() and attempt_i < len(size_attempts) - 1:
+                    continue  # retry smaller
+                log(f"GTC TP FAIL {label}: {error}", "warning")
+                break
 
             # GTC placement failed — will fall back to FOK on bid detection
             log(f"GTC TP not placed — using FOK fallback", "warning")
