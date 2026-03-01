@@ -171,14 +171,17 @@ def find_signals_cheap(cycles, outcomes, max_price, max_entry_t):
 
 # ── Trade simulation ─────────────────────────────────────────
 
-def simulate(signals, tp, timeout, fee=0.01):
+def simulate(signals, tp, timeout, fee=0.01, entry_delay=0):
     trades = []
     for sig in signals:
         entry = sig["entry_ask"]
         ft, fb = sig["future_t"], sig["future_bid"]
         max_t = min(sig["t"] + timeout, 300)
 
-        tp_mask = (fb >= entry + tp) & (ft <= max_t)
+        # GTC isn't placed until entry_delay seconds after signal
+        # (on-chain settlement ~3-5s). TP can only fill after that.
+        tp_min_t = sig["t"] + entry_delay
+        tp_mask = (fb >= entry + tp) & (ft <= max_t) & (ft >= tp_min_t)
         tp_idx = np.argmax(tp_mask) if tp_mask.any() else -1
 
         if tp_idx >= 0 and tp_mask[tp_idx]:
@@ -272,7 +275,8 @@ def build_folds(cycles, outcomes):
 def main():
     FEE = 0.01
     START = 100.0
-    BET = 5.0
+    BET = 10.0
+    ENTRY_DELAY = 5  # seconds: on-chain settlement before GTC is placed
 
     csv_files = sorted(str(f) for f in Path("data").glob("prices_*.csv"))
     if not csv_files:
@@ -294,10 +298,10 @@ def main():
     # ── Parameter grids ──────────────────────────────────────
     # Strategy 1: Stat-arb UP
     up_grid = []
-    for sp in [0.10, 0.12, 0.14, 0.15, 0.16, 0.18, 0.20, 0.22, 0.25]:
-        for w in [30, 45, 60, 90, 120, 150]:
-            for tp in [0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.12, 0.15]:
-                for to in [15, 20, 30, 45, 60, 90]:
+    for sp in [0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20]:
+        for w in [30, 45, 60, 90, 120, 150, 180]:
+            for tp in [0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.12, 0.15]:
+                for to in [15, 20, 30, 45, 60, 90, 300]:
                     up_grid.append({"sp": sp, "w": w, "tp": tp, "to": to})
 
     # Strategy 2: Stat-arb DOWN
@@ -330,7 +334,7 @@ def main():
             sigs = cache[key]
             if not sigs:
                 continue
-            trades = simulate(sigs, p["tp"], p["to"], FEE)
+            trades = simulate(sigs, p["tp"], p["to"], FEE, ENTRY_DELAY)
             if len(trades) < 3:
                 continue
             pnls = [t["pnl"] for t in trades]
@@ -354,7 +358,7 @@ def main():
             sigs = cache[key]
             if not sigs:
                 continue
-            trades = simulate(sigs, p["tp"], p["to"], FEE)
+            trades = simulate(sigs, p["tp"], p["to"], FEE, ENTRY_DELAY)
             if len(trades) < 3:
                 continue
             pnls = [t["pnl"] for t in trades]
@@ -378,7 +382,7 @@ def main():
             sigs = cache[key]
             if not sigs:
                 continue
-            trades = simulate(sigs, p["tp"], p["to"], FEE)
+            trades = simulate(sigs, p["tp"], p["to"], FEE, ENTRY_DELAY)
             if len(trades) < 3:
                 continue
             pnls = [t["pnl"] for t in trades]
