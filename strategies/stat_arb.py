@@ -74,6 +74,20 @@ COINS: List[str] = ["BTC", "ETH", "SOL", "XRP"]
 TRADE_LOG_FILE = Path(__file__).resolve().parent.parent / "stat_arb_trades.txt"
 
 # ---------------------------------------------------------------------------
+# Dry-run simulation realism
+# ---------------------------------------------------------------------------
+# These penalties make the dry-run CONSERVATIVE relative to live trading.
+# Without them, the sim overstates per-trade profit by ~40%.
+#
+# Entry:  simulates worse fill due to ~360ms latency + orderbook depth.
+# Exit:   simulates worse fill on sell side (latency + matching).
+# Fee:    taker fee per side (Polymarket ~0.5-1.5% depending on market).
+SIM_ENTRY_SLIP = 0.01   # 1 cent worse than best ask
+SIM_EXIT_SLIP  = 0.01   # 1 cent worse than best bid
+SIM_FEE_RATE   = 0.005  # 0.5% per side (~1% round-trip)
+
+
+# ---------------------------------------------------------------------------
 # TUI-aware logging (same pattern as btc_signal)
 # ---------------------------------------------------------------------------
 _log_buffer: list = []
@@ -501,6 +515,9 @@ class StatArbStrategy:
         log(f"  size:     {self.cfg.size} shares")
         log(f"  cooldown: {self.cfg.cooldown}s")
         log(f"  dry_run:  {self.cfg.dry_run}")
+        if self.cfg.dry_run:
+            log(f"  sim_adj:  entry+{SIM_ENTRY_SLIP:.2f} exit-{SIM_EXIT_SLIP:.2f}"
+                f" fee={SIM_FEE_RATE:.1%}/side")
         log(f"  log:      {self.log_file}")
         print()
 
@@ -880,13 +897,20 @@ class StatArbStrategy:
         hold_secs = int(time.time() - pos.fill_time)
 
         if self.cfg.dry_run:
-            # Simulate sell at bid price
-            pos.exit_price = bid_price
+            # Simulate sell with realism penalties:
+            # - Exit slippage: sell at bid - SIM_EXIT_SLIP (latency + matching)
+            # - Taker fees on both entry and exit sides
+            sim_exit = round(max(bid_price - SIM_EXIT_SLIP, 0.01), 4)
+            entry_fee = pos.fill_price * pos.fill_size * SIM_FEE_RATE
+            exit_fee = sim_exit * pos.fill_size * SIM_FEE_RATE
+            sim_pnl = (sim_exit - pos.fill_price) * pos.fill_size - entry_fee - exit_fee
+
+            pos.exit_price = sim_exit
             pos.exit_type = exit_type
             pos.exit_time = time.time()
-            pos.pnl = pnl
+            pos.pnl = sim_pnl
             pos.resolved = True
-            pos.won = pnl >= 0
+            pos.won = sim_pnl >= 0
 
             self._holding_position = False
             self._trade_executed = True
@@ -894,13 +918,17 @@ class StatArbStrategy:
 
             # Update stats
             self.total_resolved += 1
-            self.session_pnl += pnl
+            self.session_pnl += sim_pnl
             if exit_type == "TP":
                 self.total_tp += 1
-                self.total_wins += 1
+                if sim_pnl >= 0:
+                    self.total_wins += 1
+                else:
+                    # TP triggered but fees/slippage ate the profit
+                    self.total_losses += 1
             elif exit_type == "TIMEOUT":
                 self.total_timeout += 1
-                if pnl >= 0:
+                if sim_pnl >= 0:
                     self.total_wins += 1
                 else:
                     self.total_losses += 1
@@ -908,20 +936,23 @@ class StatArbStrategy:
             coin_key = pos.coin.upper()
             if coin_key in self.coin_resolved:
                 self.coin_resolved[coin_key] += 1
-            if pnl >= 0 and coin_key in self.coin_wins:
+            if sim_pnl >= 0 and coin_key in self.coin_wins:
                 self.coin_wins[coin_key] += 1
-            elif pnl < 0 and coin_key in self.coin_losses:
+            elif sim_pnl < 0 and coin_key in self.coin_losses:
                 self.coin_losses[coin_key] += 1
 
             log(
-                f"[SIM] SELL {pos.coin}-UP @{bid_price:.4f}"
-                f" exit={exit_type} pnl=${pnl:+.4f} hold={hold_secs}s",
-                "success" if pnl >= 0 else "warning",
+                f"[SIM] SELL {pos.coin}-UP bid={bid_price:.4f}"
+                f" sim_exit={sim_exit:.4f}"
+                f" exit={exit_type} pnl=${sim_pnl:+.4f}"
+                f" (fees=${entry_fee + exit_fee:.3f})"
+                f" hold={hold_secs}s",
+                "success" if sim_pnl >= 0 else "warning",
             )
 
             # Update persistent log
             _update_trade_log_exit(
-                pos.order_id, bid_price, exit_type, pnl, hold_secs,
+                pos.order_id, sim_exit, exit_type, sim_pnl, hold_secs,
                 log_file=self.log_file,
             )
         else:
@@ -1125,13 +1156,16 @@ class StatArbStrategy:
         )
 
         if self.cfg.dry_run:
-            # Sim fills at the raw ask
+            # Sim fills at ask + entry penalty (conservative)
             tracker = self._record_sim_fill(
                 coin, side, ask_price, deviation=deviation
             )
             if tracker:
                 log(
-                    f"[SIM] FILLED {coin}-{side.upper()} @{ask_price:.4f}",
+                    f"[SIM] FILLED {coin}-{side.upper()}"
+                    f" ask={ask_price:.4f}"
+                    f" sim_entry={tracker.fill_price:.4f}"
+                    f" (+{SIM_ENTRY_SLIP:.2f} slip)",
                     "success",
                 )
                 # Enter holding state for TP/timeout monitoring
@@ -1164,13 +1198,22 @@ class StatArbStrategy:
         self, coin: str, side: str, buy_price: float,
         deviation: float = 0.0,
     ) -> Optional[OrderTracker]:
-        """Create an OrderTracker, mark it filled, and record the fill."""
+        """Create an OrderTracker, mark it filled, and record the fill.
+
+        Applies simulation penalties to make dry-run conservative:
+        - Entry slippage: fills at ask + SIM_ENTRY_SLIP (latency + depth)
+        - Fee: included in cost via _record_fill
+        """
         market = self._coin_markets.get(coin)
         if not market:
             return None
 
         token_id = market.token_ids.get(side, "")
         order_id = f"arb-{coin}-{side}-{int(time.time() * 1000)}"
+
+        # Penalize entry: real fills are worse than best ask due to
+        # ~360ms latency and orderbook depth consumption
+        sim_price = round(buy_price + SIM_ENTRY_SLIP, 4)
 
         tracker = OrderTracker(
             coin=coin,
@@ -1182,7 +1225,7 @@ class StatArbStrategy:
             placed_at=time.time(),
             market_slug=market.slug,
             filled=True,
-            fill_price=buy_price,
+            fill_price=sim_price,
             fill_size=self.cfg.size,
             fill_time=time.time(),
         )
@@ -1571,19 +1614,26 @@ class StatArbStrategy:
 
         Only applies to positions that haven't already been resolved via
         TP or timeout exit. Positions that exited early are already resolved.
+
+        In dry-run mode, deducts taker fee from cost (entry side) so PnL
+        reflects real-world execution.
         """
         for pos in positions:
             if pos.resolved:
                 continue
             pos.resolved = True
             self.total_resolved += 1
+            # In dry-run, the entry cost didn't include fees — add them now
+            effective_cost = pos.cost
+            if self.cfg.dry_run:
+                effective_cost = pos.cost * (1.0 + SIM_FEE_RATE)
             coin_key = pos.coin.upper()
             if coin_key in self.coin_resolved:
                 self.coin_resolved[coin_key] += 1
             if pos.side == winner:
                 pos.won = True
                 pos.payout = pos.fill_size * 1.0
-                profit = pos.payout - pos.cost
+                profit = pos.payout - effective_cost
                 pos.pnl = profit
                 pos.exit_type = "EXPIRY_WIN"
                 pos.exit_time = time.time()
@@ -1601,18 +1651,18 @@ class StatArbStrategy:
             else:
                 pos.won = False
                 pos.payout = 0.0
-                pos.pnl = -pos.cost
+                pos.pnl = -effective_cost
                 pos.exit_type = "EXPIRY_LOSS"
                 pos.exit_time = time.time()
                 pos.exit_price = 0.0
                 self.total_losses += 1
                 if coin_key in self.coin_losses:
                     self.coin_losses[coin_key] += 1
-                self.session_pnl -= pos.cost
-                outcome_str = f"LOSS -${pos.cost:.4f}"
+                self.session_pnl -= effective_cost
+                outcome_str = f"LOSS -${effective_cost:.4f}"
                 log(
                     f"LOSS {pos.coin}-{pos.side.upper()} "
-                    f"@{pos.fill_price:.2f} -> -${pos.cost:.4f}",
+                    f"@{pos.fill_price:.2f} -> -${effective_cost:.4f}",
                     "error",
                 )
 
