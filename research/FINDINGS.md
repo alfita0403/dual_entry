@@ -1,7 +1,7 @@
 # Research Findings — Polymarket 5-Min Up/Down Markets
 
-> **Last updated**: 2026-03-02 (Session 3 — Regime analysis, edge degradation, Kelly post-mortem)
-> **Data**: ~130,000 rows | 471 cycles | 3 days (Feb 28 + Mar 1 + Mar 2)
+> **Last updated**: 2026-03-03 (Session 4 — Telonex 73-day backtest destroys edge hypothesis)
+> **Data**: ~130,000 rows | 471 cycles | 3 days (self-collected) + **60,605 markets / 74 days (Telonex)**
 > **Coins**: BTC, ETH, SOL, XRP
 > **Market type**: Binary 5-minute Up/Down (ERC-1155 tokens on Polygon)
 > **Live PnL to date**: ~-$63 (stat-arb -$18, pattern bot ~-$45 from Kelly-amplified losses)
@@ -30,8 +30,9 @@
 18. [Honest Assessment & Next Steps](#18-honest-assessment--next-steps)
 19. [Session 3: Edge Degradation & Regime Analysis](#19-session-3-edge-degradation--regime-analysis) **NEW**
 20. [Session 3: Kelly Post-Mortem](#20-session-3-kelly-post-mortem) **NEW**
-21. [Late Entry Calibration Study](#21-late-entry-calibration-study) **NEW**
-22. [Binance Volatility & Time Regime Analysis](#22-binance-volatility--time-regime-analysis) **NEW**
+21. [Late Entry Calibration Study](#21-late-entry-calibration-study)
+22. [Binance Volatility & Time Regime Analysis](#22-binance-volatility--time-regime-analysis)
+23. [Telonex 73-Day Backtest — The Definitive Answer](#23-telonex-73-day-backtest--the-definitive-answer) **NEW — CRITICAL**
 
 ---
 
@@ -450,6 +451,8 @@ Wald-Wolfowitz runs test: fewer runs than expected = clustering/momentum, more =
 
 **Caveat**: BTC's p=0.032 would not survive Bonferroni correction across 5 tests (corrected alpha = 0.01). Marginal at best.
 
+> **UPDATE (Section 23, 16,620 BTC cycles from Telonex)**: BTC runs test p=0.215 — **RANDOM**. The p=0.032 was a Type I error. All 4 coins are IID random sequences.
+
 > **UPDATE (Session 3, 471 cycles)**: ETH initially showed p=0.042 at 440 cycles but decayed to p=0.123 with 31 new cycles -- **lost significance**. BTC held at p=0.032. See Section 19.1 for updated table.
 
 ### 10.2 Conditional Probabilities — P(UP_t | previous outcomes)
@@ -754,10 +757,11 @@ If the edge is truly $0.01/trade, it would take 2+ weeks of data to detect it st
 
 | File | Purpose | Status |
 |------|---------|--------|
+| `research/telonex_backtest.py` | **Definitive** pattern analysis on 73 days of Telonex data | **NEW** — UU->DOWN 52.2% WR (real but unprofitable) |
 | `research/autocorrelation.py` | Outcome sequence dependence, conditional probs, streaks | DDD reversal + UD patterns found (lax thresholds) |
 | `research/backtest_patterns.py` | Pattern backtester with strict thresholds, equity curves | UD/UU validated then UD collapsed at 471 cycles |
 | `research/trend_check.py` | Spot momentum vs pattern edge decomposition | Edge is mostly trend-dependent |
-| `research/regime_analysis.py` | Regime detection: time-of-day, alternation rate, streak length, cross-coin | **NEW** — Choppy regime 84% WR (p=0.009) |
+| `research/regime_analysis.py` | Regime detection: time-of-day, alternation rate, streak length, cross-coin | Choppy regime 84% WR (p=0.009) |
 | `research/research_v3.py` | Hypothesis-driven analysis, 7 strategies, bootstrap/permutation | All results negative |
 | `research/research_v2.py` | Multi-family grid search, 14-fold CV, worst-case fees | SUPERSEDED by v3 |
 | `research/research_v1.py` | Original grid search, 6-fold CV | SUPERSEDED |
@@ -1453,6 +1457,224 @@ If confirmed, the live bot could be modified to: only trade during 00-08 UTC and
 
 ---
 
+## 23. Telonex 73-Day Backtest — The Definitive Answer
+
+> **Date**: 2026-03-03
+> **Script**: `research/telonex_backtest.py`
+> **Data**: Telonex free markets dataset — 60,605 resolved 5-min markets, 74 days (Dec 18, 2025 – Mar 1, 2026)
+> **Sample sizes**: BTC 16,620 | ETH 14,661 | SOL 14,663 | XRP 14,661
+> **Verdict**: UU->DOWN edge is REAL but TINY (52.2% WR). Not profitable after costs.
+
+This is the most important section in this document. Everything before this was based on 471 cycles (3 days) of self-collected data. Telonex provides **35x more data** — enough to settle every open question definitively.
+
+### 23.1 Data Source
+
+Telonex (telonex.io) provides free downloadable datasets of Polymarket market metadata including **resolution outcomes**. The free dataset contains no price/quote data — only which side won each market. This is sufficient for:
+- Runs tests (is the sequence random?)
+- Pattern win rates (UU->DOWN, DDD->UP, etc.)
+- Hour-of-day analysis
+- Temporal stability (weekly WR)
+- Streak length analysis
+
+It is NOT sufficient for:
+- Entry price / max_ask filter analysis
+- Slippage/fees/PnL estimation
+- Intra-cycle price dynamics
+
+File: `data/telonex_updown_5m.parquet` (no API downloads used — free dataset)
+
+### 23.2 Runs Test — The Sequence is RANDOM
+
+Our 471-cycle runs test (Section 10) showed BTC with p=0.032, suggesting mean-reversion. **With 35x more data, this disappears completely.**
+
+| Coin | N | UP% | Runs | z | p-value | 471-cycle result |
+|------|---|-----|------|---|---------|-----------------|
+| **BTC** | **16,620** | **50.1%** | **8,391** | **+1.24** | **0.215** | was p=0.032 |
+| ETH | 14,661 | 49.7% | 7,369 | +0.62 | 0.533 | was p=0.123 |
+| SOL | 14,663 | 49.1% | 7,365 | +0.58 | 0.565 | — |
+| XRP | 14,661 | 49.1% | 7,274 | -0.91 | 0.364 | — |
+
+**ALL FOUR COINS ARE RANDOM.** No mean-reversion, no trending, no structure. The z-scores are all within [-1, +1.3] — pure noise. BTC's original p=0.032 was a Type I error from small N.
+
+**Implication**: The entire theoretical basis for our pattern strategy ("BTC mean-reverts, so after UU, DOWN is more likely") is wrong. The sequence is IID. Any pattern effect must come from a different mechanism than mean-reversion.
+
+### 23.3 Pattern Backtesting — All 10 Patterns (All Coins Combined)
+
+Base rate DOWN (avg across 4 coins): 48.6%. Bonferroni correction for 10 tests: alpha = 0.005.
+
+| Pattern | Side | Trades | Wins | WR | vs base | z | p-val | Verdict |
+|---------|------|--------|------|----|---------|---|-------|---------|
+| **UU** | **DOWN** | **14,803** | **7,733** | **52.2%** | **+3.7pp** | **+8.97** | **<0.0001** | **SIGNIFICANT** |
+| **UUU** | **DOWN** | **7,069** | **3,817** | **54.0%** | **+5.4pp** | **+9.15** | **<0.0001** | **SIGNIFICANT** |
+| **UUUU** | **DOWN** | **3,252** | **1,773** | **54.5%** | **+6.0pp** | **+6.81** | **<0.0001** | **SIGNIFICANT** |
+| **DDD** | **UP** | **6,776** | **3,600** | **53.1%** | **+1.7pp** | **+2.77** | **0.003** | **SIGNIFICANT** |
+| **DDDD** | **UP** | **3,176** | **1,717** | **54.1%** | **+2.6pp** | **+2.95** | **0.002** | **SIGNIFICANT** |
+| DD | UP | 14,219 | 7,443 | 52.3% | +0.9pp | +2.15 | 0.016 | nominal only |
+| UD | DOWN | 15,190 | 7,439 | 49.0% | +0.4pp | +1.03 | 0.153 | NOT significant |
+| DU | UP | 15,195 | 7,735 | 50.9% | -0.5pp | -1.33 | 0.911 | NOT significant |
+| DUD | DOWN | 7,460 | 3,633 | 48.7% | +0.1pp | +0.25 | 0.405 | NOT significant |
+| UDU | UP | 7,751 | 3,925 | 50.6% | -0.8pp | -1.42 | 0.924 | NOT significant |
+
+**Key findings**:
+
+1. **UU->DOWN is real** (p<0.0001, survives Bonferroni). But the edge is only **+3.7pp above base rate** — our 471-cycle backtest showing 69.4% WR was a lucky small sample.
+
+2. **Longer UP streaks have higher WR** (UU: 52.2%, UUU: 54.0%, UUUU: 54.5%) — mean-reversion pressure increases with streak length. But they occur less frequently.
+
+3. **UD->DOWN is DEAD** (p=0.153). Our 471-cycle result of 70.2% WR was entirely noise + spot momentum bias. With 15,190 trades, it's 49.0% — essentially a coin flip.
+
+4. **DDD->UP is alive** (p=0.003) — the opposite direction mean-reversion also works, with 53.1% WR.
+
+5. **DU->UP and UDU->UP are negative** — alternating patterns have no predictive power.
+
+### 23.4 UU->DOWN Per Coin
+
+| Coin | Trades | Wins | WR | Base DOWN% | Delta | p-val |
+|------|--------|------|----|-----------|-------|-------|
+| BTC | 4,123 | 2,151 | 52.2% | 48.2% | +4.0pp | <0.0001 |
+| ETH | 3,607 | 1,909 | 52.9% | 48.2% | +4.7pp | <0.0001 |
+| SOL | 3,517 | 1,857 | 52.8% | 48.9% | +3.9pp | <0.0001 |
+| XRP | 3,556 | 1,816 | 51.1% | 48.9% | +2.1pp | 0.005 |
+
+**All 4 coins show the effect.** BTC, ETH, SOL are statistically significant (p<0.0001). XRP is marginally significant (p=0.005). The consistency across coins suggests a structural market mechanism, not a coin-specific anomaly.
+
+**But the edge is small**: +2.1 to +4.7pp above the base rate. This is the RAW outcome edge — before entry price, slippage, and fees.
+
+### 23.5 Profitability Estimate (Fatal Math)
+
+Even though UU->DOWN is statistically significant, it is likely **not profitable**:
+
+```
+WR = 52.2%
+Assume best-case entry: DOWN ask = $0.48 (base rate implies this)
+Win payout = $1.00 * (1 - 0.015 fee) = $0.985
+Win PnL = $0.985 - $0.48 = +$0.505
+Loss PnL = -$0.48
+
+EV = 0.522 * $0.505 + 0.478 * (-$0.48)
+   = $0.2636 - $0.2294
+   = +$0.034 per $0.48 risked (best case, NO slippage)
+
+With slippage of $0.03 on entry:
+  Entry cost = $0.51
+  Win PnL = $0.985 - $0.51 = +$0.475
+  Loss PnL = -$0.51
+  EV = 0.522 * $0.475 + 0.478 * (-$0.51)
+     = $0.2480 - $0.2438
+     = +$0.004 per trade ≈ BREAK-EVEN
+
+With max_ask = $0.60 (our actual live parameter):
+  Entry cost = $0.60 + $0.03 slippage = $0.63
+  Win PnL = $0.985 - $0.63 = +$0.355
+  Loss PnL = -$0.63
+  EV = 0.522 * $0.355 + 0.478 * (-$0.63)
+     = $0.1853 - $0.3011
+     = -$0.116 per trade ← NEGATIVE EV
+```
+
+**At max_ask=0.60, the strategy loses ~$0.12 per trade.** The only way it could be profitable is if the DOWN ask is consistently near $0.48 when UU occurs — and we don't have entry price data from Telonex to verify this.
+
+### 23.6 Hour-of-Day Analysis (UU->DOWN, All Coins)
+
+Does the Asia morning effect from Section 22 hold with 14,803 trades?
+
+| Hour UTC | Trades | Wins | WR | vs avg 52.2% | p-val |
+|----------|--------|------|----|-------------|-------|
+| 02:00 | 596 | 338 | 56.7% | +4.5pp | 0.030 * |
+| **23:00** | **561** | **324** | **57.8%** | **+5.5pp** | **0.010** |
+| 13:00 | 605 | 330 | 54.5% | +2.3pp | 0.272 |
+| 08:00 | 617 | 295 | 47.8% | -4.4pp | 0.029 * |
+| 01:00 | 640 | 312 | 48.8% | -3.5pp | 0.082 |
+| 03:00 | 655 | 318 | 48.5% | -3.7pp | 0.060 |
+| 15:00 | 655 | 323 | 49.3% | -2.9pp | 0.137 |
+
+**Most hours are within 2-3pp of the 52.2% average.** Two hours show nominal significance:
+
+- **23:00 UTC** (57.8% WR, p=0.010) — best hour. But with 24 tests, Bonferroni alpha = 0.002 — does NOT survive correction.
+- **02:00 UTC** (56.7% WR, p=0.030) — second best. Also does not survive Bonferroni.
+- **08:00 UTC** (47.8% WR, p=0.029) — worst hour, consistent with Section 22's finding that EU morning is worst.
+
+**Does the 04-08 UTC Asia morning effect hold?** Mixed. Hour 04 (51.6%) and 05 (53.1%) are close to average. Hour 06 (52.7%) and 07 (51.8%) are also unremarkable. The dramatic 92% WR from Section 22 (n=12) was small-sample noise. With n=600+ per hour, the reality is much more modest.
+
+**Conclusion**: There is NO hour-of-day filter that would meaningfully improve the strategy. The hourly variation is ~5pp at best, which doesn't change the fundamental profitability calculation.
+
+### 23.7 Temporal Stability (Weekly WR)
+
+| Week | Trades | Wins | WR |
+|------|--------|------|----|
+| 2025-W50 | 1,057 | 533 | 50.4% |
+| 2025-W51 | 1,969 | 1,047 | **53.2%** |
+| 2025-W52 | 866 | 465 | **53.7%** |
+| 2026-W00 | 1,247 | 613 | 49.2% |
+| 2026-W01 | 2,111 | 1,069 | 50.6% |
+| 2026-W02 | 2,014 | 1,059 | **52.6%** |
+| 2026-W03 | 1,879 | 1,021 | **54.3%** |
+| 2026-W04 | 292 | 139 | 47.6% |
+| 2026-W06 | 294 | 150 | 51.0% |
+| 2026-W07 | 1,436 | 752 | 52.4% |
+| 2026-W08 | 1,638 | 885 | **54.0%** |
+
+The WR oscillates between 47.6% and 54.3% across weeks. Several weeks are **below 50%** (W50, W00, W01, W04). The "good" weeks (53-54%) are barely above break-even after costs. There is no consistent regime — the edge is thin and variable.
+
+### 23.8 Streak Length Analysis (All Coins)
+
+After N consecutive UPs, what is P(DOWN next)?
+
+| Streak | Trades | P(DOWN) | Note |
+|--------|--------|---------|------|
+| 2 (UU) | 7,734 | 50.6% | Our entry — barely above 50% |
+| 3 (UUU) | 3,817 | 53.5% | Better, but fewer trades |
+| 4 (UUUU) | 1,773 | 54.4% | Better still, much fewer trades |
+| 5 | 808 | 55.4% | Diminishing frequency |
+| 6 | 360 | 55.8% | ~1.5 per day across 4 coins |
+| 7 | 159 | 56.6% | Rare |
+| 8+ | <70 | Unstable | Too few for inference |
+
+**The streak effect is real but weak.** P(DOWN) increases by ~1pp per additional UP in the streak, from 50.6% at streak=2 to 56.6% at streak=7. But the fundamental problem remains: the edge is only 2-7pp above 50%, and costs are 4-5pp.
+
+**Important note on Section 6 output**: The streak table counts trades where the streak is EXACTLY N (not N+). So streak=2 means "exactly 2 UPs" (preceded by a non-UP). The total UU->DOWN pattern (including UUU, UUUU, etc.) has the full 14,803 trades at 52.2% WR.
+
+### 23.9 Comparison: 471 Cycles vs 16,620 Cycles
+
+| Metric | 471 cycles (ours) | 16,620 cycles (Telonex) | Shrinkage |
+|--------|-------------------|------------------------|-----------|
+| BTC runs test p | 0.032 (significant!) | 0.215 (RANDOM) | Edge was noise |
+| UU->DOWN WR | 69.4% (amazing!) | 52.2% (barely above 50%) | -17.2pp |
+| UD->DOWN WR | 70.2% (amazing!) | 49.0% (coin flip) | -21.2pp |
+| DDD->UP WR | 37.7% (dead) | 53.1% (actually alive!) | +15.4pp |
+| UU trades (BTC) | 85 | 4,123 | 48x more data |
+
+**Every exciting finding from 471 cycles shrank dramatically:**
+- UU->DOWN lost 17pp of win rate
+- UD->DOWN went from "best pattern" to "coin flip"
+- DDD->UP reversed direction (was dead, now alive but thin)
+
+This is **textbook regression to the mean**. Small samples produce extreme estimates; large samples converge to the true (boring) value.
+
+### 23.10 What This Means for the Live Bot
+
+The live bot runs `--pattern UU --side DOWN --size 5 --max-ask 0.60 --coins BTC --kelly 0`.
+
+With the Telonex data, we now know:
+- **True WR ≈ 52.2%** (not 64-70% as we hoped)
+- **At max_ask=0.60, EV is negative** (see Section 23.5)
+- **No hour filter can save it** (Section 23.6)
+- **No streak filter can save it** — even streak=7 (56.6% WR) doesn't overcome 4-5pp of costs at entry prices above $0.50
+
+**The only scenario where UU->DOWN could be profitable** is if the DOWN ask at the time of UU is consistently below $0.50 — meaning we're buying DOWN shares cheaply. This is plausible (the market might slightly overprice UP continuation after UU), but we don't have entry price data from Telonex to verify.
+
+Our self-collected data (84 BTC trades) could answer this, but 84 trades is too few and already shown to be biased by the spot momentum context of those specific days.
+
+### 23.11 Script Reference
+
+| File | Purpose |
+|------|---------|
+| `research/telonex_backtest.py` | Full pattern analysis on Telonex data (6 sections, all coins) |
+| `data/telonex_updown_5m.parquet` | 60,605 market resolutions (Telonex free dataset) |
+| `data/telonex_updown_5m.csv` | Same data as CSV |
+
+---
+
 ---
 
 ## Appendix A: Strategy Parameter Summary
@@ -1468,8 +1690,10 @@ If confirmed, the live bot could be modified to: only trade during 00-08 UTC and
 | H7: Autocorrelation | entry=5s, tp=0.10, to=30 | Trend persistence | -0.038 | 1.000 | NEGATIVE EDGE |
 | **H8: UD pattern** | entry=5s, hold to resolution, max_ask=0.60 | Sequence autocorrelation | **+$0.82/trade** | ~0.02* | **TREND-DEPENDENT** |
 | **H9: UU pattern** | entry=5s, hold to resolution, max_ask=0.60 | Sequence autocorrelation | **+$0.73/trade** | ~0.02* | **TREND-DEPENDENT** |
+| **H8/H9 revised (Telonex)** | outcome-only, no price filter | Sequence autocorrelation | **WR=52.2%** | <0.0001 | **REAL BUT UNPROFITABLE** |
 
 *\*p-value is for the pattern's added edge above base rate in spot-UP conditions only (Section 16). The aggregate edge is confounded by spot momentum.*
+*Section 23 Telonex data (16,620 BTC cycles): UU->DOWN WR=52.2% (p<0.0001), UD->DOWN WR=49.0% (not significant). Edge is real but tiny (~3.7pp), likely not profitable after 4-5pp of costs.*
 
 ## Appendix B: Wallet & Infrastructure
 
