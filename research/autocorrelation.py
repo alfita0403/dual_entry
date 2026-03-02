@@ -12,10 +12,17 @@ Statistical tests:
   - Bootstrap 95% CI on conditional probabilities
   - Fisher exact test for independence (2×2 contingency)
 
+Outcome resolution:
+  Default: Gamma API (ground truth — actual market resolutions)
+  --legacy: Old CSV-based inference (0.70/0.30 thresholds, t>=280) — KNOWN INACCURATE
+
 Usage:
-    python strategies/autocorrelation.py
+    python research/autocorrelation.py data/prices_*.csv
+    python research/autocorrelation.py data/prices_2026-03-01.csv --legacy
 """
 
+import argparse
+import os
 import sys
 from pathlib import Path
 from itertools import product
@@ -24,8 +31,12 @@ import numpy as np
 import pandas as pd
 from scipy import stats as sp_stats
 
-# Reuse data loading from v2
+# Path setup
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from research_v2 import load_data, get_cycles, determine_outcomes, COINS
+from backtest_patterns import resolve_all_outcomes
 
 N_BOOT = 10000
 
@@ -329,15 +340,42 @@ def runs_test(outcomes):
 
 # ── Main ────────────────────────────────────────────────────────
 
-def main():
-    csv_files = sorted(str(f) for f in Path("data").glob("prices_*.csv"))
-    if not csv_files:
-        print("No data files in data/"); sys.exit(1)
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Autocorrelation analysis on 5-min crypto market outcomes."
+    )
+    parser.add_argument(
+        "csv_files", nargs="*",
+        help="CSV data files. If omitted, uses data/prices_*.csv",
+    )
+    parser.add_argument(
+        "--legacy", action="store_true",
+        help="Use old CSV-based inference (0.70/0.30 thresholds). KNOWN INACCURATE.",
+    )
+    return parser.parse_args()
 
-    print("Loading data...")
+
+def main():
+    args = parse_args()
+
+    if args.csv_files:
+        csv_files = args.csv_files
+    else:
+        csv_files = sorted(str(f) for f in Path("data").glob("prices_*.csv"))
+    if not csv_files:
+        print("No data files found."); sys.exit(1)
+
+    mode = "LEGACY (CSV 0.70/0.30)" if args.legacy else "GAMMA API (ground truth)"
+    print(f"Loading data...  [Inference: {mode}]")
     df = load_data(csv_files)
     cycles = get_cycles(df)
-    outcomes = [determine_outcomes(c) for c in cycles]
+
+    if args.legacy:
+        outcomes = [determine_outcomes(c) for c in cycles]
+    else:
+        print("  Resolving outcomes via Gamma API (cached after first run)...")
+        outcomes = resolve_all_outcomes(cycles)
+
     n_resolved = sum(1 for o in outcomes if any(v is not None for v in o.values()))
     print(f"  {len(df):,} rows | {len(cycles)} cycles | {n_resolved} resolved\n")
 

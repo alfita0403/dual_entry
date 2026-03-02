@@ -215,6 +215,17 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _streak_length(history, direction: str) -> int:
+    """Count consecutive occurrences of `direction` at the end of history."""
+    count = 0
+    for ch in reversed(history):
+        if ch == direction:
+            count += 1
+        else:
+            break
+    return count
+
+
 # ===================================================================
 # Configuration
 # ===================================================================
@@ -235,6 +246,8 @@ class SequenceConfig:
     dry_run: bool = False
     market_check_interval: float = 5.0
     name: str = ""
+    coins: Optional[List[str]] = None  # None = all coins
+    kelly: float = 0.0  # Kelly-scaled betting (0=flat, 0.5=half-Kelly)
 
     def validate(self) -> None:
         if self.size < 5:
@@ -451,6 +464,8 @@ class SequenceStrategy:
         log("Sequence Pattern Strategy started (4-coin WebSocket)", "success")
         log(f"  rules:    {', '.join(f'{r.pattern}->BUY {r.buy_side.upper()}' for r in self.cfg.rules)}")
         log(f"  size:     {self.cfg.size} shares")
+        if self.cfg.kelly > 0:
+            log(f"  kelly:    {self.cfg.kelly} (streak scaling enabled)")
         log(f"  max_ask:  {self.cfg.max_ask:.2f}")
         log(f"  infer:    t>={INFERENCE_TIME}s, UP>{UP_THRESHOLD}, DOWN<{DOWN_THRESHOLD}")
         log(f"  dry_run:  {self.cfg.dry_run}")
@@ -695,7 +710,8 @@ class SequenceStrategy:
     def _find_pattern_matches(self) -> List[Tuple[str, PatternRule]]:
         """Check all coins against all rules. Return list of (coin, rule) matches."""
         matches = []
-        for coin in COINS:
+        active = self.cfg.coins if self.cfg.coins else COINS
+        for coin in active:
             hist = list(self._outcome_history[coin])
             if not hist:
                 continue
@@ -747,18 +763,28 @@ class SequenceStrategy:
             # Add slippage for FOK
             fok_price = min(buy_price + self.cfg.slippage, 0.99)
 
+            # Kelly scaling: increase size based on streak length
+            trade_size = self.cfg.size
+            if self.cfg.kelly > 0:
+                last_char = rule.pattern[-1]  # 'U' or 'D'
+                streak = _streak_length(self._outcome_history[coin], last_char)
+                pat_len = len(rule.pattern)
+                extra = max(0, streak - pat_len)
+                trade_size = self.cfg.size * (1.0 + self.cfg.kelly * extra)
+
             hist_str = "".join(self._outcome_history[coin])
+            kelly_tag = f" kelly={trade_size/self.cfg.size:.1f}x" if self.cfg.kelly > 0 else ""
             log(
                 f"SIGNAL: {coin} [{hist_str}] -> {rule.pattern} -> BUY {buy_side.upper()} "
-                f"@ {buy_price:.3f} (FOK @ {fok_price:.3f})",
+                f"@ {buy_price:.3f} (FOK @ {fok_price:.3f}){kelly_tag}",
                 "trade",
             )
 
             if self.cfg.dry_run:
-                tracker = self._simulate_buy(coin, buy_side, buy_price, market, rule.pattern)
+                tracker = self._simulate_buy(coin, buy_side, buy_price, market, rule.pattern, trade_size)
             else:
                 tracker = await self._submit_live_buy(
-                    coin, buy_side, token_id, market, fok_price, rule.pattern
+                    coin, buy_side, token_id, market, fok_price, rule.pattern, trade_size
                 )
 
             if tracker:
@@ -766,10 +792,11 @@ class SequenceStrategy:
 
     def _simulate_buy(
         self, coin: str, side: str, ask_price: float, market: MarketInfo, pattern: str,
+        trade_size: Optional[float] = None,
     ) -> Optional[PositionRecord]:
         """Simulate a fill for dry-run mode."""
         sim_price = ask_price + SIM_ENTRY_SLIP
-        sim_size = self.cfg.size
+        sim_size = trade_size if trade_size is not None else self.cfg.size
         cost = sim_price * sim_size
 
         pos = PositionRecord(
@@ -808,8 +835,10 @@ class SequenceStrategy:
         market: MarketInfo,
         buy_price: float,
         pattern: str,
+        trade_size: Optional[float] = None,
     ) -> Optional[PositionRecord]:
         """Submit a FOK limit BUY to the CLOB."""
+        actual_size = trade_size if trade_size is not None else self.cfg.size
         label = f"{coin}-{side.upper()}"
         try:
             # Fee
@@ -823,7 +852,7 @@ class SequenceStrategy:
             order = Order(
                 token_id=token_id,
                 price=buy_price,
-                size=self.cfg.size,
+                size=actual_size,
                 side="BUY",
                 funder=self.bot_config.safe_address,
                 fee_rate_bps=fee_rate_bps,
@@ -861,7 +890,7 @@ class SequenceStrategy:
                 taking = _to_float(response.get("takingAmount", 0))
                 making = _to_float(response.get("makingAmount", 0))
                 fp = making / max(taking, 1e-12) if taking > 0 else buy_price
-                fill_size = taking if taking > 0 else self.cfg.size
+                fill_size = taking if taking > 0 else actual_size
                 cost = fp * fill_size
 
                 pos = PositionRecord(
@@ -1338,9 +1367,10 @@ class SequenceStrategy:
             f"   {sc}{B}{st}{X}"
             f"   {D}{up_str}{X}"
         )
+        kelly_str = f"  kelly={self.cfg.kelly}" if self.cfg.kelly > 0 else ""
         lines.append(
             f"  {D}rules: {rules_str}  size={self.cfg.size}  "
-            f"max_ask={self.cfg.max_ask:.2f}  cycle #{self.cycles_seen}{X}"
+            f"max_ask={self.cfg.max_ask:.2f}{kelly_str}  cycle #{self.cycles_seen}{X}"
         )
         hsep()
 
@@ -1632,6 +1662,21 @@ def main() -> None:
         "--market-check-interval", type=float, default=5.0,
         help="Seconds between market discovery checks (default: 5)",
     )
+    parser.add_argument(
+        "--coins", type=str, default=None,
+        help=(
+            "Comma-separated list of coins to trade (e.g. BTC,ETH). "
+            "If omitted, trades all 4 coins. Still observes all coins for history."
+        ),
+    )
+    parser.add_argument(
+        "--kelly", type=float, default=0.0,
+        help=(
+            "Kelly-scaled betting: increase stake for each extra streak beyond "
+            "pattern length. E.g. --kelly 0.5 with UU: UU=1x, UUU=1.5x, UUUU=2x. "
+            "0=disabled (default)."
+        ),
+    )
     args = parser.parse_args()
 
     # Parse patterns and sides
@@ -1661,6 +1706,16 @@ def main() -> None:
     if not name and args.dry_run:
         name = "_".join(f"{r.pattern}{r.buy_side[0]}" for r in rules)
 
+    # Parse coin filter
+    coins_filter = None
+    if args.coins:
+        coins_filter = [c.strip().upper() for c in args.coins.split(",")]
+        valid = set(COINS)
+        for c in coins_filter:
+            if c not in valid:
+                print(f"ERROR: Unknown coin '{c}'. Valid: {COINS}")
+                raise SystemExit(1)
+
     cfg = SequenceConfig(
         rules=rules,
         size=args.size,
@@ -1670,6 +1725,8 @@ def main() -> None:
         dry_run=args.dry_run,
         market_check_interval=args.market_check_interval,
         name=name,
+        coins=coins_filter,
+        kelly=args.kelly,
     )
     cfg.validate()
 
@@ -1682,6 +1739,11 @@ def main() -> None:
     if cfg.dry_run:
         log(f"  Mode:  SIM [{cfg.name}]", "info")
     print()
+
+    if cfg.coins:
+        log(f"Coins: {', '.join(cfg.coins)} (filtered)", "info")
+    else:
+        log(f"Coins: {', '.join(COINS)} (all)", "info")
 
     log("Rules:", "info")
     for rule in cfg.rules:

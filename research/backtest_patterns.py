@@ -20,8 +20,11 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 import os
+import time
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,17 +57,23 @@ ENTRY_TIME = 5
 # Max ask price: don't enter when ask is too expensive (bad risk/reward)
 DEFAULT_MAX_ASK = 0.60
 
-# Outcome inference: last 5 seconds, strict thresholds (matches live strategy)
+# Outcome inference constants
 INFERENCE_START = 295      # seconds into cycle
 UP_THRESHOLD = 0.95        # UP ask > this => UP
 DOWN_THRESHOLD = 0.05      # UP ask < this => DOWN
 
+# Smart hybrid: prices in this range are "genuinely ambiguous" — both CSV and
+# live WS are unlikely to resolve clearly. Calibrated against live trade log.
+AMBIG_LOW = 0.25           # below this: borderline, use Gamma
+AMBIG_HIGH = 0.75          # above this: borderline, use Gamma
 
-def determine_outcomes(cycle: pd.DataFrame) -> Dict[str, Optional[str]]:
-    """Determine cycle outcomes using strict thresholds on last 5 seconds.
 
-    Matches the live strategy (sequence.py) exactly:
-    t >= 295s, UP ask > 0.95 => UP, UP ask < 0.05 => DOWN, else None.
+def determine_outcomes_legacy(cycle: pd.DataFrame) -> Dict[str, Optional[str]]:
+    """LEGACY: Determine cycle outcomes using strict thresholds on last 5 seconds.
+
+    This method is known to diverge from live execution because CSV snapshots
+    (1/sec) can differ from real-time WebSocket prices at the threshold boundary.
+    Use --legacy-inference to enable.
     """
     late = cycle[cycle["seconds_elapsed"] >= INFERENCE_START]
     if len(late) < 2:
@@ -79,6 +88,145 @@ def determine_outcomes(cycle: pd.DataFrame) -> Dict[str, Optional[str]]:
         else:
             out[c] = None
     return out
+
+
+def determine_history_outcomes(
+    cycle: pd.DataFrame,
+    gamma_outcomes: Dict[str, Optional[str]],
+) -> Dict[str, Optional[str]]:
+    """Smart hybrid: determine which outcomes to record in pattern history.
+
+    Replicates the live bot's behavior:
+      - CSV clearly extreme (>0.95 or <0.05): record from CSV
+      - CSV no data at t>=295: use Gamma (data gap, live WS had data)
+      - CSV borderline (0.05-0.25 or 0.75-0.95): use Gamma (WS likely saw extreme)
+      - CSV genuinely ambiguous (0.25-0.75): DON'T record (live bot also ambiguous)
+
+    This is used ONLY for building pattern history chains. Trade win/loss
+    always uses Gamma resolution (ground truth).
+    """
+    late = cycle[cycle["seconds_elapsed"] >= INFERENCE_START]
+    out: Dict[str, Optional[str]] = {}
+
+    for c in COINS:
+        cl = c.lower()
+
+        if len(late) < 1:
+            # No CSV data at end of cycle -> use Gamma (data gap)
+            out[c] = gamma_outcomes.get(c)
+            continue
+
+        last_val = late[f"{cl}_up_ask"].iloc[-1]
+
+        if last_val > UP_THRESHOLD:
+            out[c] = "UP"
+        elif last_val < DOWN_THRESHOLD:
+            out[c] = "DOWN"
+        elif last_val <= AMBIG_LOW or last_val >= AMBIG_HIGH:
+            # Borderline: WS probably caught extreme -> use Gamma
+            out[c] = gamma_outcomes.get(c)
+        else:
+            # Genuinely ambiguous (0.25-0.75): live bot also couldn't determine
+            out[c] = None
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Gamma API resolution (ground truth — same as live bot)
+# ---------------------------------------------------------------------------
+GAMMA_API = "https://gamma-api.polymarket.com/markets/slug"
+CACHE_FILE = Path(__file__).parent / "resolution_cache.json"
+COIN_SLUG = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "XRP": "xrp"}
+API_DELAY = 0.1  # seconds between API calls (be nice to the server)
+
+
+def _load_cache() -> Dict[str, str]:
+    """Load resolution cache from disk."""
+    if CACHE_FILE.exists():
+        with open(CACHE_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_cache(cache: Dict[str, str]) -> None:
+    """Persist resolution cache to disk."""
+    with open(CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
+
+
+def _ts_to_unix(ts: pd.Timestamp) -> int:
+    """Convert tz-naive UTC Timestamp to Unix seconds."""
+    return int(ts.timestamp())
+
+
+def _resolve_slug(slug: str) -> Optional[str]:
+    """Call Gamma API for one market slug. Returns 'UP', 'DOWN', or None."""
+    url = f"{GAMMA_API}/{slug}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        if not data.get("closed"):
+            return None
+        outcomes = json.loads(data.get("outcomes", "[]"))
+        prices = json.loads(data.get("outcomePrices", "[]"))
+        for i, p in enumerate(prices):
+            if p == "1":
+                return outcomes[i].upper()  # "Up" -> "UP", "Down" -> "DOWN"
+        return None
+    except Exception:
+        return None
+
+
+def resolve_all_outcomes(
+    cycles: list,
+    verbose: bool = True,
+) -> List[Dict[str, Optional[str]]]:
+    """Resolve all cycle outcomes via Gamma API with local caching.
+
+    First run fetches from API (~0.1s per market, ~100s for 255 cycles x 4 coins).
+    Subsequent runs are instant (reads from resolution_cache.json).
+    """
+    cache = _load_cache()
+    all_outcomes: List[Dict[str, Optional[str]]] = []
+    api_calls = 0
+    cache_hits = 0
+
+    for i, cycle in enumerate(cycles):
+        ts = cycle["cycle_start"].iloc[0]
+        unix = _ts_to_unix(ts)
+        outcomes: Dict[str, Optional[str]] = {}
+
+        for coin in COINS:
+            slug = f"{COIN_SLUG[coin]}-updown-5m-{unix}"
+            if slug in cache:
+                val = cache[slug]
+                outcomes[coin] = val if val in ("UP", "DOWN") else None
+                cache_hits += 1
+            else:
+                result = _resolve_slug(slug)
+                cache[slug] = result if result else "UNKNOWN"
+                outcomes[coin] = result
+                api_calls += 1
+                if api_calls % 100 == 0:
+                    _save_cache(cache)  # periodic save
+                time.sleep(API_DELAY)
+
+        all_outcomes.append(outcomes)
+
+        if verbose and api_calls > 0 and (i + 1) % 25 == 0:
+            print(f"    Resolved {i+1}/{len(cycles)} cycles ({api_calls} API calls)...")
+
+    _save_cache(cache)
+    if verbose:
+        total = len(cycles) * len(COINS)
+        print(
+            f"    Resolution: {len(cycles)} cycles | "
+            f"{cache_hits} cached, {api_calls} API calls | "
+            f"{len(cache)} total entries in cache"
+        )
+    return all_outcomes
 
 
 # Built-in pattern defaults
@@ -186,6 +334,20 @@ def get_entry_price(cycle: pd.DataFrame, coin: str, side: str) -> Optional[float
     return price
 
 
+def _streak_length(history: deque, direction: str) -> int:
+    """Count consecutive occurrences of `direction` at the end of history.
+
+    E.g. history = ['D','U','U','U'], direction='U' -> 3
+    """
+    count = 0
+    for ch in reversed(history):
+        if ch == direction:
+            count += 1
+        else:
+            break
+    return count
+
+
 def run_backtest(
     csv_paths: List[str],
     rules: List[PatternRule],
@@ -193,15 +355,41 @@ def run_backtest(
     initial_balance: float = 100.0,
     max_trades_per_cycle: int = 4,
     max_ask: float = DEFAULT_MAX_ASK,
+    use_gamma: bool = True,
+    coins_filter: Optional[List[str]] = None,
+    kelly_scale: float = 0.0,
 ) -> BacktestResult:
-    """Run pattern backtest on historical CSV data."""
+    """Run pattern backtest on historical CSV data.
+
+    Two-phase outcome resolution (when use_gamma=True):
+      1. TRADE OUTCOMES (win/loss): Always Gamma API — ground truth resolution.
+      2. PATTERN HISTORY: Smart hybrid — CSV for clear prices, Gamma for
+         borderline/missing data, skip genuinely ambiguous (0.25-0.75 zone).
+         This replicates the live bot's WS-based inference behavior.
+    """
 
     # Load and process data
     df = load_data(csv_paths)
     cycles = get_cycles(df, min_rows=20)
 
-    # Determine outcomes for all cycles
-    all_outcomes = [determine_outcomes(c) for c in cycles]
+    # Phase 1: Resolve all outcomes via Gamma API (for trade win/loss)
+    if use_gamma:
+        all_outcomes_gamma = resolve_all_outcomes(cycles)
+    else:
+        all_outcomes_gamma = [determine_outcomes_legacy(c) for c in cycles]
+
+    # Phase 2: Determine history outcomes (for pattern chain building)
+    # When use_gamma=True, uses smart hybrid; otherwise uses same as legacy
+    if use_gamma:
+        all_outcomes_history = [
+            determine_history_outcomes(cycle, gamma)
+            for cycle, gamma in zip(cycles, all_outcomes_gamma)
+        ]
+    else:
+        all_outcomes_history = all_outcomes_gamma  # legacy: same for both
+
+    # Coin filter
+    active_coins = [c.upper() for c in coins_filter] if coins_filter else list(COINS)
 
     # State: rolling history per coin
     max_pattern_len = max(len(r.pattern) for r in rules)
@@ -214,13 +402,15 @@ def run_backtest(
     max_dd = 0.0
     cycles_with_signal = 0
 
-    for cycle_idx, (cycle, outcomes) in enumerate(zip(cycles, all_outcomes)):
+    for cycle_idx, (cycle, trade_outcomes, hist_outcomes) in enumerate(
+        zip(cycles, all_outcomes_gamma, all_outcomes_history)
+    ):
         # --- Check for pattern matches BEFORE recording this cycle's outcome ---
         # (We match on history from PREVIOUS cycles, then buy in THIS cycle)
         matched_coins: set = set()
         cycle_trades: List[Tuple[str, PatternRule]] = []
 
-        for coin in COINS:
+        for coin in active_coins:
             hist = list(history[coin])
             if not hist:
                 continue
@@ -243,10 +433,10 @@ def run_backtest(
             if trades_this_cycle >= max_trades_per_cycle:
                 break
 
-            # Get this cycle's outcome for the coin
-            coin_outcome = outcomes.get(coin)
+            # Get this cycle's outcome for the coin (Gamma = ground truth)
+            coin_outcome = trade_outcomes.get(coin)
             if coin_outcome is None:
-                continue  # ambiguous outcome, skip
+                continue  # unresolved market, skip
 
             # Get entry price
             entry_price = get_entry_price(cycle, coin, rule.buy_side)
@@ -257,9 +447,23 @@ def run_backtest(
             if entry_price > max_ask:
                 continue
 
+            # Kelly scaling: increase size based on streak length
+            trade_size = size
+            if kelly_scale > 0:
+                # Detect streak: how many consecutive same-direction outcomes
+                # For UU->DOWN: the pattern ends in 'U', streak of U's matters
+                # For DDD->UP: the pattern ends in 'D', streak of D's matters
+                last_char = rule.pattern[-1]  # 'U' or 'D'
+                streak = _streak_length(history[coin], last_char)
+                pat_len = len(rule.pattern)
+                extra = max(0, streak - pat_len)  # extra beyond pattern
+                # Scale: base * (1 + kelly_scale * extra)
+                # kelly_scale=0.5 -> UU:1x, UUU:1.5x, UUUU:2x, UUUUU:2.5x
+                trade_size = size * (1.0 + kelly_scale * extra)
+
             # Cost calculation
             fill_price = entry_price + SLIPPAGE
-            cost = fill_price * size
+            cost = fill_price * trade_size
 
             # Check if we can afford this trade
             if cost > balance:
@@ -268,13 +472,8 @@ def run_backtest(
             # Determine win/loss
             won = (rule.buy_side == coin_outcome)
             if won:
-                payout = size * 1.0  # binary: win pays $1 per share
                 # Fee is deducted from shares received on entry
-                # Effective shares = size * (1 - FEE_RATE) but payout is per
-                # original size. Actually in Polymarket, fee reduces shares:
-                # you pay cost but receive size * (1-fee) shares.
-                # If won: payout = size * (1-fee) * 1.0
-                effective_shares = size * (1.0 - FEE_RATE)
+                effective_shares = trade_size * (1.0 - FEE_RATE)
                 payout = effective_shares * 1.0
                 pnl = payout - cost
             else:
@@ -290,7 +489,7 @@ def run_backtest(
                 buy_side=rule.buy_side,
                 entry_price=entry_price,
                 cost=cost,
-                size=size,
+                size=trade_size,
                 outcome=coin_outcome,
                 won=won,
                 pnl=pnl,
@@ -308,14 +507,14 @@ def run_backtest(
         if dd > max_dd:
             max_dd = dd
 
-        # --- Record this cycle's outcomes into history ---
+        # --- Record this cycle's outcomes into HISTORY (smart hybrid) ---
         for coin in COINS:
-            outcome = outcomes.get(coin)
+            outcome = hist_outcomes.get(coin)
             if outcome == "UP":
                 history[coin].append("U")
             elif outcome == "DOWN":
                 history[coin].append("D")
-            # None: don't record (breaks chains intentionally)
+            # None: don't record (breaks chains — matches live bot behavior)
 
     # --- Compute stats ---
     total_trades = len(trades)
@@ -399,7 +598,6 @@ def print_results(result: BacktestResult, show_trades: bool = False) -> None:
     print(f"  Max ask:          {result.max_ask:.2f}")
     print(f"  Fee rate:         {FEE_RATE:.1%}")
     print(f"  Slippage:         ${SLIPPAGE:.2f}")
-    print(f"  Inference:        t>={INFERENCE_START}s, UP>{UP_THRESHOLD}, DOWN<{DOWN_THRESHOLD}")
     print(f"  Total cycles:     {result.total_cycles}")
     print(f"  Cycles w/ signal: {result.cycles_with_signal}")
     print()
@@ -582,12 +780,34 @@ def main() -> None:
         help="Print every individual trade",
     )
     parser.add_argument(
+        "--kelly", type=float, default=0.0,
+        help=(
+            "Kelly-scaled betting: increase stake by this factor for each "
+            "extra streak beyond pattern length. E.g. --kelly 0.5 with UU: "
+            "UU=1x, UUU=1.5x, UUUU=2x, UUUUU=2.5x. 0=disabled (default)."
+        ),
+    )
+    parser.add_argument(
         "--no-plot", action="store_true",
         help="Skip equity curve plot",
     )
     parser.add_argument(
         "--output", type=str, default=None,
         help="Output path for equity curve PNG (default: auto-generated)",
+    )
+    parser.add_argument(
+        "--coins", type=str, default=None,
+        help=(
+            "Comma-separated list of coins to trade (e.g. BTC,ETH). "
+            "If omitted, trades all 4 coins."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-inference", action="store_true",
+        help=(
+            "Use CSV-based threshold inference instead of Gamma API resolution. "
+            "WARNING: known to diverge from live execution on borderline cycles."
+        ),
     )
 
     args = parser.parse_args()
@@ -623,6 +843,17 @@ def main() -> None:
 
     print(f"\n  Loading {len(args.csv_files)} CSV file(s)...")
 
+    use_gamma = not args.legacy_inference
+
+    # Parse coin filter
+    coins_filter = None
+    if args.coins:
+        coins_filter = [c.strip().upper() for c in args.coins.split(",")]
+        print(f"  Coin filter: {', '.join(coins_filter)}")
+
+    if args.kelly > 0:
+        print(f"  Kelly scaling: {args.kelly} (UU=1x, UUU={1+args.kelly:.1f}x, UUUU={1+2*args.kelly:.1f}x, ...)")
+
     # Run backtest
     result = run_backtest(
         csv_paths=args.csv_files,
@@ -631,6 +862,9 @@ def main() -> None:
         initial_balance=args.balance,
         max_trades_per_cycle=args.max_trades,
         max_ask=args.max_ask,
+        use_gamma=use_gamma,
+        coins_filter=coins_filter,
+        kelly_scale=args.kelly,
     )
 
     # Print results
