@@ -30,6 +30,8 @@
 18. [Honest Assessment & Next Steps](#18-honest-assessment--next-steps)
 19. [Session 3: Edge Degradation & Regime Analysis](#19-session-3-edge-degradation--regime-analysis) **NEW**
 20. [Session 3: Kelly Post-Mortem](#20-session-3-kelly-post-mortem) **NEW**
+21. [Late Entry Calibration Study](#21-late-entry-calibration-study) **NEW**
+22. [Binance Volatility & Time Regime Analysis](#22-binance-volatility--time-regime-analysis) **NEW**
 
 ---
 
@@ -1326,6 +1328,128 @@ With non-stationary win rates, Kelly becomes an anti-strategy: it bets MORE when
 ### 20.5 Lesson
 
 **Never use Kelly without proving win rate stationarity across the conditions where Kelly would increase size.** In our case, Kelly's condition for increasing size (longer streaks) was ANTI-CORRELATED with higher win rates for ETH. The backtester should have tested Kelly at each streak length separately -- this was the missing analysis.
+
+---
+
+## 21. Late Entry Calibration Study
+
+> **Date**: 2026-03-03
+> **Script**: `research/late_entry.py`
+> **Source**: Medium article by Benjamin-Cup proposing "last-second dynamics" edge in Polymarket 5-min markets
+> **Verdict**: DEAD. Market maker is well-calibrated. No edge after costs.
+
+### 21.1 Hypothesis
+
+Enter late in the 5-minute cycle (t=240-280s) when the outcome is nearly decided. If the market says 80% UP but actual win rate is 90%, there's a 10pp edge buying UP late.
+
+### 21.2 Results
+
+The market maker is well-calibrated at every time point tested:
+
+| Time | Side | Threshold | N | WR | PnL | Miscalibration |
+|------|------|-----------|---|-----|-----|----------------|
+| t=270 | BUY UP | ask>=70% | 536 | 87.9% | **-$193** | -2.9pp |
+| t=270 | BUY DOWN | ask<=30% | 769 | 96.7% | **-$52** | +3.1pp |
+| t=280 | BUY UP | ask>=70% | 476 | 88.7% | **-$178** | -3.1pp |
+| t=280 | BUY DOWN | ask<=30% | 791 | 97.0% | **-$87** | +2.4pp |
+
+**Every simulation loses money** despite 88-97% win rates. The miscalibration (~3pp) does not cover the cost of entry (slippage $0.03 + fees 1.5% = ~4-5pp minimum edge needed).
+
+### 21.3 Systematic Bias Found
+
+The MM consistently **overprices UP** and **underprices DOWN** across all time bins. But this is the same global DOWN bias we already knew about (DOWN wins ~57%). It's not a late-entry edge -- it's the base rate.
+
+### 21.4 Conclusion
+
+The article's core premise ("enter late when the outcome is nearly decided") is correct in direction but the market already prices the near-certainty correctly. You're buying certainty, and certainty is expensive. After slippage and fees, there is no alpha.
+
+---
+
+## 22. Binance Volatility & Time Regime Analysis
+
+> **Date**: 2026-03-03
+> **Script**: `research/regime_vol.py`
+> **Data**: Binance BTCUSDT 1-minute klines (2,479 candles) cross-referenced with 84 BTC UU->DOWN trades
+> **Verdict**: Promising directional signals but NOT statistically significant (n too small). Needs validation with Mar 03+ data.
+
+### 22.1 Hypothesis
+
+UU->DOWN is a mean-reversion strategy. Mean-reversion should work better when:
+- Volatility is low (less fundamental/news noise)
+- Volume is low (fewer directional participants)
+- During Asian session (less institutional activity)
+
+### 22.2 Key Results
+
+#### Realized Volatility (1h rolling, Binance 1m returns)
+
+| Regime | N | WR | PnL | vs avg | p-value |
+|--------|---|-----|------|--------|---------|
+| **Low vol** (< p33) | 28 | **79%** | +$31 | **+14.3pp** | 0.166 |
+| Medium vol | 28 | **46%** | -$12 | **-17.9pp** | 0.074 |
+| High vol (> p67) | 28 | 68% | +$17 | +3.6pp | 0.844 |
+
+Surprising U-shape: both low AND high vol work, but medium vol is catastrophic (46% WR). Low vol has the strongest effect (+14.3pp above average).
+
+#### Session (4-hour blocks)
+
+| Session | N | WR | PnL | vs avg | p-value |
+|---------|---|-----|------|--------|---------|
+| **04-08 UTC (Asia morning)** | 12 | **92%** | +$21 | **+27.4pp** | 0.067 |
+| 00-04 UTC (Asia night) | 16 | 62% | +$7 | -1.8pp | 1.000 |
+| 12-16 UTC (EU afternoon) | 12 | 67% | +$5 | +2.4pp | 1.000 |
+| 20-24 UTC (US evening) | 18 | 61% | +$3 | -3.2pp | 0.808 |
+| 08-12 UTC (EU morning) | 19 | **53%** | -$2 | **-11.7pp** | 0.340 |
+
+**04-08 UTC is the best session** (92% WR, 11W/1L). **08-12 UTC is the worst** (53% WR). This aligns with the hypothesis: Asian morning has less volume and fewer fundamental moves, EU morning brings institutional participation.
+
+#### BTC 1h Trend (Binance)
+
+| Trend | N | WR | PnL | vs avg |
+|-------|---|-----|------|--------|
+| **Mild down (-0.5% to -0.1%)** | 11 | **91%** | +$19 | **+26.6pp** |
+| Strong down (<-0.5%) | 11 | 73% | +$10 | +8.4pp |
+| Mild up (+0.1% to +0.5%) | 21 | 76% | +$20 | +11.9pp |
+| **Flat (-0.1% to +0.1%)** | 15 | **47%** | -$6 | **-17.6pp** |
+| **Strong up (>+0.5%)** | 26 | **50%** | -$7 | **-14.3pp** |
+
+UU->DOWN works best when BTC is mildly moving (either direction) but fails when flat or strongly rising. Mild down + mild up are both good; the pattern seems to need SOME directional context but not too much.
+
+#### Combined: Volatility x Session
+
+| Combination | N | WR | PnL |
+|-------------|---|-----|------|
+| **LowVol + Asia** | 16 | **75%** | +$15 |
+| **LowVol + US** | 7 | **86%** | +$10 |
+| HighVol + EU | 12 | 50% | -$4 |
+| HighVol + US | 18 | 50% | -$5 |
+
+### 22.3 Honest Assessment
+
+**Nothing is statistically significant** (all p > 0.05). With only 84 BTC trades split into bins of 7-28, there is no power to detect anything below ~20pp effects.
+
+However, the directions are economically consistent:
+1. Low vol -> more mean-reversion -> pattern works better (makes sense)
+2. Asia morning -> less noise -> cleaner signal (makes sense)
+3. EU morning -> institutional activity -> breaks mean-reversion (makes sense)
+4. Flat markets -> no directional context -> coin-flip (makes sense)
+
+### 22.4 Next Steps
+
+**Re-run with Mar 03 data** (full day) to roughly double the sample. If:
+- Asia morning 04-08 UTC maintains >80% WR with n>=20 -> implement as time filter
+- Low vol maintains >75% WR with n>=40 -> implement as vol filter
+- EU morning stays <55% WR -> implement as exclusion filter
+
+If confirmed, the live bot could be modified to: only trade during 00-08 UTC and 12-20 UTC (exclude EU morning and late US), and/or only when Binance 1h vol is below median.
+
+### 22.5 File Reference
+
+| File | Purpose |
+|------|---------|
+| `research/regime_vol.py` | Full analysis script (downloads Binance data, caches it, cross-refs with trades) |
+| `research/late_entry.py` | Late-entry calibration study (Section 21) |
+| `research/binance_klines_cache.json` | Cached Binance 1m klines (avoid re-downloading) |
 
 ---
 
