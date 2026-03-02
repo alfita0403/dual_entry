@@ -1,10 +1,10 @@
 # Research Findings — Polymarket 5-Min Up/Down Markets
 
-> **Last updated**: 2026-03-01 (Session 2 — Pattern backtesting + trend dependency analysis)
-> **Data**: 72,613 rows | 255 cycles | 225 resolved | ~2 days (Feb 28 + Mar 1)
+> **Last updated**: 2026-03-02 (Session 3 — Regime analysis, edge degradation, Kelly post-mortem)
+> **Data**: ~130,000 rows | 471 cycles | 3 days (Feb 28 + Mar 1 + Mar 2)
 > **Coins**: BTC, ETH, SOL, XRP
 > **Market type**: Binary 5-minute Up/Down (ERC-1155 tokens on Polygon)
-> **Live PnL to date**: -$18 (stat-arb sessions 1-2). Pattern strategy deployed but no fills yet.
+> **Live PnL to date**: ~-$63 (stat-arb -$18, pattern bot ~-$45 from Kelly-amplified losses)
 
 ---
 
@@ -24,10 +24,12 @@
 12. [Statistical Framework](#12-statistical-framework)
 13. [Data Requirements for Future Research](#13-data-requirements-for-future-research)
 14. [File Reference](#14-file-reference) *(updated)*
-15. [Pattern Backtesting — From Theory to Practice](#15-pattern-backtesting--from-theory-to-practice) **NEW**
-16. [Trend Dependency Analysis — The Critical Finding](#16-trend-dependency-analysis--the-critical-finding) **NEW**
-17. [Infrastructure Discoveries & Bug Fixes](#17-infrastructure-discoveries--bug-fixes) **NEW**
-18. [Honest Assessment & Next Steps](#18-honest-assessment--next-steps) **NEW**
+15. [Pattern Backtesting — From Theory to Practice](#15-pattern-backtesting--from-theory-to-practice)
+16. [Trend Dependency Analysis — The Critical Finding](#16-trend-dependency-analysis--the-critical-finding)
+17. [Infrastructure Discoveries & Bug Fixes](#17-infrastructure-discoveries--bug-fixes)
+18. [Honest Assessment & Next Steps](#18-honest-assessment--next-steps)
+19. [Session 3: Edge Degradation & Regime Analysis](#19-session-3-edge-degradation--regime-analysis) **NEW**
+20. [Session 3: Kelly Post-Mortem](#20-session-3-kelly-post-mortem) **NEW**
 
 ---
 
@@ -446,6 +448,8 @@ Wald-Wolfowitz runs test: fewer runs than expected = clustering/momentum, more =
 
 **Caveat**: BTC's p=0.032 would not survive Bonferroni correction across 5 tests (corrected alpha = 0.01). Marginal at best.
 
+> **UPDATE (Session 3, 471 cycles)**: ETH initially showed p=0.042 at 440 cycles but decayed to p=0.123 with 31 new cycles -- **lost significance**. BTC held at p=0.032. See Section 19.1 for updated table.
+
 ### 10.2 Conditional Probabilities — P(UP_t | previous outcomes)
 
 Two-layer analysis:
@@ -749,8 +753,9 @@ If the edge is truly $0.01/trade, it would take 2+ weeks of data to detect it st
 | File | Purpose | Status |
 |------|---------|--------|
 | `research/autocorrelation.py` | Outcome sequence dependence, conditional probs, streaks | DDD reversal + UD patterns found (lax thresholds) |
-| `research/backtest_patterns.py` | Pattern backtester with strict thresholds, equity curves | **NEW** — UD/UU validated, DDD killed |
-| `research/trend_check.py` | Spot momentum vs pattern edge decomposition | **NEW** — Edge is mostly trend-dependent |
+| `research/backtest_patterns.py` | Pattern backtester with strict thresholds, equity curves | UD/UU validated then UD collapsed at 471 cycles |
+| `research/trend_check.py` | Spot momentum vs pattern edge decomposition | Edge is mostly trend-dependent |
+| `research/regime_analysis.py` | Regime detection: time-of-day, alternation rate, streak length, cross-coin | **NEW** — Choppy regime 84% WR (p=0.009) |
 | `research/research_v3.py` | Hypothesis-driven analysis, 7 strategies, bootstrap/permutation | All results negative |
 | `research/research_v2.py` | Multi-family grid search, 14-fold CV, worst-case fees | SUPERSEDED by v3 |
 | `research/research_v1.py` | Original grid search, 6-fold CV | SUPERSEDED |
@@ -1102,16 +1107,21 @@ This ensures outcomes are only recorded when the market is >95% confident of the
 
 ### 18.3 The Uncomfortable Truth
 
-After 2 weeks of research, ~$18 in live losses, and 808+ lines of this document, the honest summary is:
+After 2+ weeks of research, ~$63 in live losses, and 1000+ lines of this document, the honest summary is:
 
 **We have not found a statistically robust, regime-independent edge in Polymarket's 5-minute markets.**
 
 What we have found is:
-- A pattern that works 70% of the time in a slightly bearish 2-day sample
-- 88% of that performance comes from buying DOWN when BTC is already falling
-- The genuine autocorrelation component adds +9.7pp in spot-UP conditions (p=0.02), which is interesting but not bankable with current data
+- UU->DOWN on BTC+ETH at 60.2% WR over 471 cycles (p=0.004 for WR > 50%)
+- The edge is degrading: 64% at 440 cycles, 60.2% at 471 cycles, with Mar 02 at 52% WR
+- ETH lost statistical significance in the runs test (p=0.042 -> p=0.123 with 31 new cycles)
+- Kelly scaling amplified losses by 3x during an adverse ETH streak
+- The most promising regime filter (choppy markets, 84% WR) has only 31 trades
+- BTC-only is the only statistically defensible configuration (p=0.032 runs test, 64.3% WR, 9.5% MaxDD)
 
-This is not a failure of methodology — it's a success. Finding out that an edge doesn't exist (or is much thinner than expected) before risking significant capital is the entire point of rigorous research.
+This is not a failure of methodology -- it's a success. Finding out that an edge is thinner than expected (and that ETH was a false positive) before losing more capital is the entire point of rigorous research.
+
+> **Session 3 update**: Live bot switched to BTC-only, kelly=0, flat $5. This is the most conservative configuration supported by the data. See Sections 19-20 for full analysis.
 
 ### 18.4 Actionable Next Steps
 
@@ -1143,6 +1153,179 @@ This is not a failure of methodology — it's a success. Finding out that an edg
 2. **Do NOT add more patterns** hoping to increase frequency — more patterns = more multiple comparisons = more phantom edges
 3. **Do NOT ignore the trend dependency result** — it's the most important finding of this entire project
 4. **Do NOT assume the backtest WR (70%) will hold live** — expect 55-65% at best, accounting for regime variation
+
+---
+
+## 19. Session 3: Edge Degradation & Regime Analysis
+
+> **Date**: 2026-03-02
+> **Data**: 471 cycles (3 days: Feb 28, Mar 1, Mar 2)
+> **Key finding**: The edge is degrading with new data. ETH lost statistical significance. Regime analysis reveals one actionable filter (alternation rate) but with small sample.
+
+### 19.1 Updated Runs Test (471 cycles)
+
+| Coin | z | p-value | Was (440 cycles) | Verdict |
+|------|---|---------|-------------------|---------|
+| **BTC** | +2.15 | **0.032** | p=0.018 | Still marginal |
+| **ETH** | +1.54 | **0.123** | p=0.042 | **LOST SIGNIFICANCE** |
+| SOL | +1.13 | 0.258 | 0.258 | Random |
+| XRP | +1.05 | 0.294 | 0.294 | Random |
+
+**ETH's mean-reversion signal disappeared with just 31 new cycles.** This is the hallmark of a false positive decaying toward the null. BTC remains marginal (p=0.032) but would not survive Bonferroni correction across 4 tests.
+
+### 19.2 Updated Backtest Results (UU->DOWN, 471 cycles)
+
+| Config | WR (440) | PnL (440) | MaxDD (440) | WR (471) | PnL (471) | MaxDD (471) |
+|--------|----------|-----------|-------------|----------|-----------|-------------|
+| BTC+ETH flat | 64.0% | +$73 | 7.2% | **60.2%** | **+$46** | **20.4%** |
+| BTC only | 68% | +$45 | - | **64.3%** | **+$36** | 9.5% |
+| ETH only | 61% | +$28 | - | **56.7%** | **+$10** | **17.5%** |
+
+**In the 31 new cycles (Mar 2 morning)**:
+- ETH UU->DOWN: 2W/8L (20% WR) -- catastrophic
+- BTC UU->DOWN: 2W/5L (29% WR) -- poor but less severe
+
+### 19.3 Pattern Ranking (BTC+ETH, 471 cycles, all Bonferroni-tested)
+
+| Pattern | Side | Trades | WR | PnL | Avg/trade | z-score | p-value |
+|---------|------|--------|----|-----|-----------|---------|---------|
+| **UU** | DOWN | 181 | **60.2%** | **+$46** | **$0.26** | **2.87** | **0.004** |
+| DD | UP | ~155 | 58% | +$12 | $0.08 | 2.02 | 0.043 |
+| DDD | UP | ~59 | 61% | +$12 | $0.20 | 1.69 | 0.091 |
+| UUU | DOWN | ~56 | 61% | +$13 | $0.24 | 1.60 | 0.110 |
+| DU | UP | ~149 | 40% | -$99 | -$0.67 | - | CATASTROPHIC |
+| UD | DOWN | ~229 | 48% | -$39 | -$0.17 | - | CATASTROPHIC |
+
+**Only UU->DOWN survives Bonferroni correction** (p=0.004 < 0.005 for ~10 tests). Notably, **UD->DOWN collapsed** from 70% WR (255 cycles) to 48% WR (471 cycles). This is the most dramatic edge decay observed.
+
+### 19.4 Regime Analysis Results
+
+**Script**: `research/regime_analysis.py`
+**Method**: Build all UU->DOWN trades with features, split by bins, test each bin's WR against overall with binomial test.
+
+#### 19.4.1 Temporal Stability (by day)
+
+**BTC+ETH:**
+
+| Day | Trades | WR | PnL/trade |
+|-----|--------|----|-----------|
+| Feb 28 | 25 | 56% | +$0.02 |
+| Mar 01 | 98 | **66%** | +$0.57 |
+| Mar 02 | 58 | **52%** | **-$0.17** |
+
+**BTC-only:**
+
+| Day | Trades | WR | PnL/trade |
+|-----|--------|----|-----------|
+| Feb 28 | 12 | 58% | +$0.04 |
+| Mar 01 | 46 | **70%** | +$0.70 |
+| Mar 02 | 26 | **58%** | +$0.13 |
+
+Mar 01 was the golden day. Mar 02 shows clear degradation, especially for ETH (which is pulling BTC+ETH combined WR below 55%). BTC-only holds 58% even on Mar 02.
+
+#### 19.4.2 Alternation Rate (SIGNIFICANT)
+
+The most actionable finding from regime analysis:
+
+| Regime | Trades | WR | PnL | Avg/trade | p-value |
+|--------|--------|----|-----|-----------|---------|
+| Trending (<40% alternation) | 37 | 49% | -$11 | -$0.30 | 0.18 |
+| Normal (40-60%) | 113 | 58% | +$12 | +$0.11 | 0.57 |
+| **Choppy (>60% alternation)** | **31** | **84%** | **+$45** | **+$1.46** | **0.009** |
+
+**Interpretation**: UU->DOWN is a mean-reversion strategy. When the market is choppy (high alternation between UP/DOWN), mean-reversion works perfectly. When trending, it fails. This has sound economic logic.
+
+**Caveat**: n=31 is small. 95% CI for 84% WR at n=31 is [66%, 95%]. Promising but not conclusive. For BTC-only, the effect is at p=0.066 (16 trades, 88% WR).
+
+#### 19.4.3 Time of Day
+
+| Hour UTC | Trades | WR | p-value | Note |
+|----------|--------|----|---------|------|
+| 09:00 | 11 | **27%** | **0.032** | European market open |
+| 05:00 | 12 | 75% | 0.38 | Asian pre-market |
+| 04:00 | 10 | 70% | 0.75 | Asian pre-market |
+
+09:00 UTC (European open) is toxic for mean-reversion -- likely fundamental moves that break the pattern. Small sample (n=11) but direction makes economic sense.
+
+#### 19.4.4 Streak Length at Entry (CRITICAL for Kelly)
+
+**BTC+ETH combined:**
+
+| Streak | Trades | WR | PnL/trade | Kelly would do |
+|--------|--------|----|-----------|----------------|
+| 2 (UU) | 115 | **65%** | +$0.53 | Base size $5 |
+| 3 (UUU) | 38 | **47%** | -$0.40 | 1.5x = $7.50 |
+| 4 (UUUU) | 17 | 65% | +$0.37 | 2.0x = $10 |
+
+**Per-coin breakdown:**
+
+| Streak | BTC WR (N) | ETH WR (N) |
+|--------|------------|------------|
+| 2 (UU) | 64% (58) | 67% (57) |
+| 3 (UUU) | **63%** (19) | **32%** (19) |
+| 4+ | 83% (6) | 55% (11) |
+
+**ETH collapses to 32% WR at streak=3.** Kelly was scaling size UP at exactly the point where ETH's edge DISAPPEARS. This is the root cause of the $45 live loss.
+
+#### 19.4.5 Other Features (Not Significant)
+
+| Feature | Finding | p-value |
+|---------|---------|---------|
+| Cross-coin UPs | 4 coins UP: 62% WR; 2 coins UP: 47% WR | >0.25 |
+| Entry ask price | No pattern (55-65% across all bins) | >0.50 |
+| Intra-cycle volatility | No difference between med/high vol | >0.75 |
+| Price trend (3-cycle) | Falling: 66%, Rising: 49% | 0.14 |
+| Trailing WR (window=15) | ~60-62% in all bins, not predictive | n/a |
+
+Trailing WR is not predictive -- losses appear random within the model, not regime-clustered.
+
+---
+
+## 20. Session 3: Kelly Post-Mortem
+
+### 20.1 What Happened
+
+The live bot ran with `--coins BTC,ETH --kelly 0.5` starting ~Mar 1 evening.
+
+**Kelly scaling formula**: `size = base_size * (1 + kelly * (streak - 2))` where streak = consecutive UP outcomes before entry.
+
+At streak=2 (UU): $5.00
+At streak=3 (UUU): $5 * (1 + 0.5*1) = $7.50
+At streak=4 (UUUU): $5 * (1 + 0.5*2) = $10.00
+At streak=5+: $12.50+
+
+### 20.2 The Catastrophe
+
+ETH went on a 6+ consecutive UP streak during a trending period. Kelly escalated:
+- Trade 1 (UU, $5): LOSS
+- Trade 2 (UUU, $7.50): LOSS
+- Trade 3 (UUUU, $10): LOSS
+- Trade 4 (UUUUU, $12.50): LOSS
+- ...
+
+With flat $5 sizing, these 4+ losses would cost ~$17. With Kelly scaling, the cost was ~$43.
+
+**Kelly tripled the losses** because it increased exposure precisely in the regime where ETH's edge evaporated (streak>=3 has 32% WR for ETH).
+
+### 20.3 Why Kelly Failed
+
+Kelly criterion assumes:
+1. **Stationary win rate** -- ETH's WR drops from 67% at streak=2 to 32% at streak=3
+2. **Known edge** -- the edge was estimated from insufficient data (440 cycles)
+3. **Long-run convergence** -- requires thousands of bets; we had dozens
+
+With non-stationary win rates, Kelly becomes an anti-strategy: it bets MORE when the edge is SMALLER.
+
+### 20.4 Resolution
+
+**Live bot restarted** with: `--coins BTC --kelly 0 --size 5`
+- Eliminated ETH (lost statistical significance, 32% WR at streak=3)
+- Eliminated Kelly scaling (non-stationary win rates)
+- BTC-only with flat sizing is the most conservative configuration
+
+### 20.5 Lesson
+
+**Never use Kelly without proving win rate stationarity across the conditions where Kelly would increase size.** In our case, Kelly's condition for increasing size (longer streaks) was ANTI-CORRELATED with higher win rates for ETH. The backtester should have tested Kelly at each streak length separately -- this was the missing analysis.
 
 ---
 
