@@ -41,7 +41,7 @@ credentials/
 
 # Logs and local data
 *.log
-data/
+data/old/
 reports/
 research/reports/
 
