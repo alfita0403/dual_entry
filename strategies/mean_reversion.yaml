@@ -1,57 +1,59 @@
-# Mean-Reversion Strategy Config
-# Based on Telonex 74-day backtest (60,605 markets)
-# Only Bonferroni-significant patterns (alpha = 0.000039)
+# Mean-Reversion Strategy Config (LIVE)
 #
-# Rules are ordered by PRIORITY (highest first = longest pattern).
-# For each coin in each cycle, the FIRST matching rule wins.
-# Each rule has its own max_ask = the GTC limit price we place.
+# Source: full_pattern_scan + top30_oos_suite + regime robustness.
+# This set keeps robust DOWN patterns with the best OOS consistency.
 #
-# IMPORTANT: keep rules sorted longest-pattern-first per coin!
-# If UUUU matches, we want that rule (higher WR, higher max_ask),
-# not UUU (lower WR, lower max_ask).
-#
-# Entry mechanism: GTC limit order at max_ask price, cancel after cancel_timeout.
-# If filled at better price, great. May fill as maker (0% fee) instead of taker (1.5%).
+# Execution model:
+# - Place GTC limit at max_ask around t=1s
+# - Cancel all unfilled after 10s
+# - Hold filled size to resolution
 
-entry_window_start: 1     # seconds after cycle start (place limit immediately)
-entry_window_end: 3       # seconds — orders placed once, ASAP
-cancel_timeout: 10.0      # seconds after placing GTC to cancel unfilled orders
-size: 5.0                 # shares per trade (flat, no Kelly)
+entry_window_start: 1
+entry_window_end: 3
+cancel_timeout: 10.0
+size: 5.0
 
 rules:
-  # --- ETH: strongest edge ---
-  # ETH UUUU->DOWN: WR=57.4%, N=751, break-even=$0.535
+  # ---------------------------------------------------------------
+  # Length 5 (highest priority by length)
+  # ---------------------------------------------------------------
+  # ETH UUUUU->DOWN behaves strongly; allow wider cap for ETH
+  - pattern: "UUUUU"
+    side: "DOWN"
+    coins: ["ETH"]
+    max_ask: 0.53
+
+  # ALL UUUUU->DOWN robust OOS; conservative cap for non-ETH
+  - pattern: "UUUUU"
+    side: "DOWN"
+    coins: ["BTC", "SOL", "XRP"]
+    max_ask: 0.50
+
+  # ---------------------------------------------------------------
+  # Length 4
+  # ---------------------------------------------------------------
+  # Strongest single-coin edge
   - pattern: "UUUU"
     side: "DOWN"
     coins: ["ETH"]
-    max_ask: 0.52
+    max_ask: 0.53
 
-  # ETH UUU->DOWN: WR=55.8%, N=1698, break-even=$0.519
-  - pattern: "UUU"
-    side: "DOWN"
-    coins: ["ETH"]
-    max_ask: 0.50
-
-  # --- ALL coins (non-ETH): decent edge ---
-  # ALL UUUU->DOWN: WR=54.5%, N=3252, break-even=$0.507
+  # Broad robust edge for other coins
   - pattern: "UUUU"
     side: "DOWN"
     coins: ["BTC", "SOL", "XRP"]
     max_ask: 0.50
 
-  # ALL UUU->DOWN: WR=54.0%, N=7069, break-even=$0.502
-  # SOL specific: WR=53.9%, break-even=$0.501
-  # BTC specific: WR=53.3%, break-even=$0.495
-  - pattern: "UUU"
-    side: "DOWN"
-    coins: ["SOL"]
-    max_ask: 0.49
-
-  - pattern: "UUU"
+  # BTC-specific robust family found in top30 suite
+  - pattern: "UDUU"
     side: "DOWN"
     coins: ["BTC"]
-    max_ask: 0.48
+    max_ask: 0.50
 
-  # XRP: weakest, only at very tight max_ask
-  # XRP UUU: not individually significant, skip
-  # XRP UUUU: included in ALL above
+  # ---------------------------------------------------------------
+  # Length 3 fallback (high frequency)
+  # ---------------------------------------------------------------
+  - pattern: "UUU"
+    side: "DOWN"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.50
