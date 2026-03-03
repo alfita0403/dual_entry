@@ -825,13 +825,19 @@ class SequenceStrategy:
         self.cycle_state = CycleState.DONE
 
         # Cancel any lingering pending orders (edge case: cycle ended before timeout)
+        # Fire-and-forget via async to avoid blocking the event loop.
         if self._pending_orders:
             order_ids = [p.order_id for p in self._pending_orders if p.order_id]
             if order_ids:
                 try:
-                    self.clob.cancel_orders(order_ids)
-                except Exception:
-                    pass
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._async_cancel(order_ids))
+                except RuntimeError:
+                    # No running loop (shouldn't happen, but safe fallback)
+                    try:
+                        self.clob.cancel_orders(order_ids)
+                    except Exception:
+                        pass
             self._pending_orders.clear()
 
         # Schedule resolution for all unique slugs from current positions
@@ -840,6 +846,13 @@ class SequenceStrategy:
             if pos.market_slug and pos.market_slug not in seen_slugs:
                 seen_slugs.add(pos.market_slug)
                 self._schedule_resolution_all(pos.market_slug)
+
+    async def _async_cancel(self, order_ids: List[str]) -> None:
+        """Cancel orders without blocking the event loop."""
+        try:
+            await asyncio.to_thread(self.clob.cancel_orders, order_ids)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Outcome inference from WS prices
@@ -1548,22 +1561,17 @@ class SequenceStrategy:
         self, order: Order, order_type: str = "GTC"
     ) -> Tuple[Dict[str, Any], float, float]:
         """Sign + POST on the dedicated executor thread."""
-        prev_t, prev_r = self.clob.timeout, self.clob.retry_count
-        self.clob.timeout = 5
-        self.clob.retry_count = 1
-        try:
-            t0 = time.perf_counter()
-            signed = self.signer.sign_order(order)
-            t_sign = (time.perf_counter() - t0) * 1_000_000
+        t0 = time.perf_counter()
+        signed = self.signer.sign_order(order)
+        t_sign = (time.perf_counter() - t0) * 1_000_000
 
-            t1 = time.perf_counter()
-            response = self.clob.post_order(signed, order_type)
-            t_post = (time.perf_counter() - t1) * 1_000_000
+        t1 = time.perf_counter()
+        response = self.clob.post_order(
+            signed, order_type, timeout=5, retry_count=1,
+        )
+        t_post = (time.perf_counter() - t1) * 1_000_000
 
-            return response, t_sign, t_post
-        finally:
-            self.clob.timeout = prev_t
-            self.clob.retry_count = prev_r
+        return response, t_sign, t_post
 
     async def _prewarm_clob(self) -> None:
         try:
@@ -1607,19 +1615,20 @@ class SequenceStrategy:
 
     async def _check_resolution_for_slug(self, old_slug: str) -> None:
         """Check if a finished market has resolved and record win/loss."""
-        positions = [
-            p for p in self._all_positions
-            if p.market_slug == old_slug and not p.resolved
-        ]
-        if not positions:
-            return
-
         delays = [10, 10, 15, 15, 20, 30, 30, 45, 60, 60]
         gamma = GammaClient()
         winner: Optional[str] = None
 
         for attempt, delay in enumerate(delays):
             await asyncio.sleep(delay)
+
+            # Re-snapshot positions each attempt to catch late fills
+            positions = [
+                p for p in self._all_positions
+                if p.market_slug == old_slug and not p.resolved
+            ]
+            if not positions:
+                return
 
             try:
                 market_data = await asyncio.to_thread(
@@ -1647,7 +1656,12 @@ class SequenceStrategy:
             log(f"Resolve: {old_slug} not closed after {len(delays)} attempts", "warning")
             return
 
-        self._apply_resolution(positions, winner)
+        # Final snapshot to catch any positions added during resolution attempts
+        final_positions = [
+            p for p in self._all_positions
+            if p.market_slug == old_slug and not p.resolved
+        ]
+        self._apply_resolution(final_positions, winner)
 
     def _apply_resolution(self, positions: List[PositionRecord], winner: str) -> None:
         for pos in positions:

@@ -119,6 +119,8 @@ class ApiClient(ThreadLocalSessionMixin):
         data: Optional[Any] = None,
         headers: Optional[Dict] = None,
         params: Optional[Dict] = None,
+        timeout: Optional[float] = None,
+        retry_count: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Make HTTP request with error handling.
@@ -177,8 +179,11 @@ class ApiClient(ThreadLocalSessionMixin):
                     data, separators=(",", ":"), ensure_ascii=False
                 ).encode("utf-8")
 
+        effective_timeout = timeout if timeout is not None else self.timeout
+        effective_retries = retry_count if retry_count is not None else self.retry_count
+
         last_error = None
-        for attempt in range(self.retry_count):
+        for attempt in range(effective_retries):
             try:
                 session = self.session
                 if method.upper() == "GET":
@@ -186,7 +191,7 @@ class ApiClient(ThreadLocalSessionMixin):
                         url,
                         headers=request_headers,
                         params=params,
-                        timeout=self.timeout,
+                        timeout=effective_timeout,
                     )
                 elif method.upper() == "POST":
                     response = session.post(
@@ -194,7 +199,7 @@ class ApiClient(ThreadLocalSessionMixin):
                         headers=request_headers,
                         data=body_bytes,
                         params=params,
-                        timeout=self.timeout,
+                        timeout=effective_timeout,
                     )
                 elif method.upper() == "DELETE":
                     response = session.delete(
@@ -202,7 +207,7 @@ class ApiClient(ThreadLocalSessionMixin):
                         headers=request_headers,
                         data=body_bytes,
                         params=params,
-                        timeout=self.timeout,
+                        timeout=effective_timeout,
                     )
                 else:
                     raise ApiError(f"Unsupported method: {method}")
@@ -676,6 +681,8 @@ class ClobClient(ApiClient):
         signed_order: Dict[str, Any],
         order_type: str = "GTC",
         post_only: bool = False,
+        timeout: Optional[float] = None,
+        retry_count: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Submit a signed order.
@@ -716,7 +723,10 @@ class ClobClient(ApiClient):
         headers = self._build_headers("POST", endpoint, body_json)
 
         # Pass pre-serialized bytes to skip double JSON serialization
-        return self._request("POST", endpoint, data=body_json.encode("utf-8"), headers=headers)
+        return self._request(
+            "POST", endpoint, data=body_json.encode("utf-8"), headers=headers,
+            timeout=timeout, retry_count=retry_count,
+        )
 
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """
