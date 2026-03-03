@@ -630,12 +630,82 @@ class SequenceStrategy:
             "success" if connected == 4 else "warning",
         )
 
+        # Pre-populate outcome history from Gamma API (resolved markets)
+        await self._warmup_from_gamma()
+
         # Enter cycle from first discovered market
         for coin in COINS:
             market = self._coin_markets.get(coin)
             if market:
                 self._maybe_enter_cycle(coin, market)
                 break
+
+    # ------------------------------------------------------------------
+    # Gamma warmup — pre-populate outcome history from resolved markets
+    # ------------------------------------------------------------------
+    async def _warmup_from_gamma(self) -> None:
+        """Fetch recent resolved 5m markets from Gamma to seed outcome history.
+
+        Constructs slugs for the last N cycles (oldest -> newest, excluding
+        the current running cycle) and queries Gamma for each.  Confirmed
+        outcomes are appended to ``_outcome_history`` so pattern matching
+        can fire immediately on the first live cycle.
+        """
+        # Determine current cycle start timestamp
+        current_ts: Optional[int] = None
+        for coin in COINS:
+            market = self._coin_markets.get(coin)
+            if market:
+                current_ts = market.start_timestamp()
+                if current_ts:
+                    break
+
+        if current_ts is None:
+            now = int(time.time())
+            current_ts = now - (now % 300)
+
+        # Number of past cycles to fetch (fill the deque, maxlen=6)
+        num_cycles = 6
+        log(f"Warming up history from Gamma ({num_cycles} past cycles)...", "info")
+
+        for coin in COINS:
+            entries: List[OutcomeEntry] = []
+            for i in range(num_cycles, 0, -1):  # oldest first
+                cycle_ts = current_ts - (i * 300)
+                slug = self._slug_for_cycle(coin, cycle_ts)
+
+                try:
+                    market_data = await asyncio.to_thread(
+                        self._gamma_client.get_market_by_slug, slug,
+                    )
+                    if not market_data or not market_data.get("closed", False):
+                        continue
+
+                    winner = self._parse_gamma_winner(market_data)
+                    outcome = self._winner_to_outcome(winner)
+                    if outcome is None:
+                        continue
+
+                    entry = OutcomeEntry(
+                        outcome=outcome,
+                        status=ConfirmationStatus.CONFIRMED,
+                        cycle_ts=cycle_ts,
+                        market_slug=slug,
+                        observed_up_ask=0.0,
+                    )
+                    entries.append(entry)
+                except Exception as exc:
+                    log(f"  Gamma warmup error for {slug}: {exc}", "warning")
+
+            for entry in entries:
+                self._outcome_history[coin].append(entry)
+                self._last_inference_ts[coin] = entry.cycle_ts
+
+            hist_str = self._history_values(list(self._outcome_history[coin]))
+            if hist_str:
+                log(f"  {coin}: [{hist_str}] ({len(entries)} confirmed)", "success")
+            else:
+                log(f"  {coin}: no resolved history found", "warning")
 
     # ------------------------------------------------------------------
     # Callbacks
