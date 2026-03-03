@@ -1,0 +1,54 @@
+# Mean-Reversion Strategy Config
+# Based on Telonex 74-day backtest (60,605 markets)
+# Only Bonferroni-significant patterns (alpha = 0.000039)
+#
+# Rules are ordered by PRIORITY (highest first = longest pattern).
+# For each coin in each cycle, the FIRST matching rule wins.
+# Each rule has its own max_ask derived from: max_ask = WR * 0.985 - slippage
+#
+# IMPORTANT: keep rules sorted longest-pattern-first per coin!
+# If UUUU matches, we want that rule (higher WR, higher max_ask),
+# not UUU (lower WR, lower max_ask).
+
+entry_window_start: 5     # seconds after cycle start
+entry_window_end: 10      # seconds — conservative, avoid late adverse prices
+size: 5.0                 # USDC per trade (flat, no Kelly)
+slippage: 0.03            # added to best ask for FOK price
+
+rules:
+  # --- ETH: strongest edge ---
+  # ETH UUUU->DOWN: WR=57.4%, N=751, break-even=$0.535
+  - pattern: "UUUU"
+    side: "DOWN"
+    coins: ["ETH"]
+    max_ask: 0.52
+
+  # ETH UUU->DOWN: WR=55.8%, N=1698, break-even=$0.519
+  - pattern: "UUU"
+    side: "DOWN"
+    coins: ["ETH"]
+    max_ask: 0.50
+
+  # --- ALL coins (non-ETH): decent edge ---
+  # ALL UUUU->DOWN: WR=54.5%, N=3252, break-even=$0.507
+  - pattern: "UUUU"
+    side: "DOWN"
+    coins: ["BTC", "SOL", "XRP"]
+    max_ask: 0.50
+
+  # ALL UUU->DOWN: WR=54.0%, N=7069, break-even=$0.502
+  # SOL specific: WR=53.9%, break-even=$0.501
+  # BTC specific: WR=53.3%, break-even=$0.495
+  - pattern: "UUU"
+    side: "DOWN"
+    coins: ["SOL"]
+    max_ask: 0.49
+
+  - pattern: "UUU"
+    side: "DOWN"
+    coins: ["BTC"]
+    max_ask: 0.48
+
+  # XRP: weakest, only at very tight max_ask
+  # XRP UUU: not individually significant, skip
+  # XRP UUUU: included in ALL above
