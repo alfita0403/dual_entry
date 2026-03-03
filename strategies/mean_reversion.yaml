@@ -21,13 +21,13 @@ rules:
   - pattern: "UUUUU"
     side: "DOWN"
     coins: ["ETH"]
-    max_ask: 0.53
+    max_ask: 0.54
 
   # ALL UUUUU->DOWN robust OOS; conservative cap for non-ETH
   - pattern: "UUUUU"
     side: "DOWN"
     coins: ["BTC", "SOL", "XRP"]
-    max_ask: 0.50
+    max_ask: 0.51
 
   # ---------------------------------------------------------------
   # Length 4
@@ -36,19 +36,19 @@ rules:
   - pattern: "UUUU"
     side: "DOWN"
     coins: ["ETH"]
-    max_ask: 0.53
+    max_ask: 0.54
 
   # Broad robust edge for other coins
   - pattern: "UUUU"
     side: "DOWN"
     coins: ["BTC", "SOL", "XRP"]
-    max_ask: 0.50
+    max_ask: 0.51
 
   # BTC-specific robust family found in top30 suite
   - pattern: "UDUU"
     side: "DOWN"
     coins: ["BTC"]
-    max_ask: 0.50
+    max_ask: 0.51
 
   # ---------------------------------------------------------------
   # Length 3 fallback (high frequency)
@@ -56,4 +56,4 @@ rules:
   - pattern: "UUU"
     side: "DOWN"
     coins: ["BTC", "ETH", "SOL", "XRP"]
-    max_ask: 0.50
+    max_ask: 0.51
