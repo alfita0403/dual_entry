@@ -10,7 +10,12 @@ Key design decisions (from research/full_pattern_scan.py):
   - ETH has the strongest edge (UUUU: 57.4%, UUU: 55.8%)
   - Per-rule max_ask ensures each pattern is +EV at its entry price
   - Rules are priority-ordered: longest pattern first per coin
-  - Entry window is 5-10s (conservative, avoids adverse late prices)
+
+Entry mechanism (GTC limit orders):
+  - At cycle detection (~t=3s), place GTC limit BUY at max_ask price
+  - Order rests on book; may fill as maker (0% fee) vs taker (1.5%)
+  - After cancel_timeout (default 10s), cancel all unfilled orders
+  - Any filled amount is held to market resolution
 
 Config file: mean_reversion.yaml (same directory)
 
@@ -145,6 +150,22 @@ class PositionRecord:
     exit_time: Optional[float] = None
 
 
+@dataclass
+class PendingOrder:
+    """Tracks a GTC limit order waiting for fill or cancellation."""
+    coin: str
+    side: str                     # "up" or "down"
+    token_id: str
+    order_id: str
+    limit_price: float            # the max_ask we placed at
+    size: float
+    placed_at: float              # time.time() when placed
+    market_slug: str
+    pattern: str
+    neg_risk: bool = False
+    tick_size: str = "0.01"
+
+
 def _append_trade_log(
     pos: PositionRecord,
     cfg: "SequenceConfig",
@@ -235,9 +256,9 @@ class PatternRule:
 class SequenceConfig:
     rules: List[PatternRule]
     size: float = 5.0
-    slippage: float = 0.03
-    max_ask: float = DEFAULT_MAX_ASK  # global fallback max ask
-    max_trades_per_cycle: int = 4   # one per coin
+    slippage: float = 0.03             # legacy (unused with GTC limits)
+    max_ask: float = DEFAULT_MAX_ASK   # global fallback max ask
+    max_trades_per_cycle: int = 4      # one per coin
     dry_run: bool = False
     market_check_interval: float = 5.0
     name: str = ""
@@ -245,6 +266,7 @@ class SequenceConfig:
     kelly: float = 0.0
     entry_window_start: int = ENTRY_WINDOW_START
     entry_window_end: int = ENTRY_WINDOW_END
+    cancel_timeout: float = 10.0       # seconds after placing GTC to cancel unfilled
 
     @classmethod
     def from_yaml(cls, path: str, dry_run: bool = False,
@@ -282,6 +304,7 @@ class SequenceConfig:
             name=name,
             entry_window_start=int(raw.get("entry_window_start", ENTRY_WINDOW_START)),
             entry_window_end=int(raw.get("entry_window_end", ENTRY_WINDOW_END)),
+            cancel_timeout=float(raw.get("cancel_timeout", 10.0)),
         )
         cfg.validate()
         return cfg
@@ -313,6 +336,7 @@ class CycleState(enum.Enum):
     WAITING_MARKET = "WAITING_MARKET"
     OBSERVING = "OBSERVING"       # Watching cycle, inferring outcomes at end
     ENTRY_WINDOW = "ENTRY_WINDOW" # New cycle, checking for pattern matches
+    PENDING_ORDERS = "PENDING"    # GTC limits placed, waiting for fills/cancel
     TRADED = "TRADED"             # Bought, holding to resolution
     DONE = "DONE"
 
@@ -389,6 +413,10 @@ class SequenceStrategy:
 
         # Book event (WS callback signals this)
         self._book_event: asyncio.Event = asyncio.Event()
+
+        # Pending GTC limit orders (placed, waiting for fill/cancel)
+        self._pending_orders: List[PendingOrder] = []
+        self._orders_placed_ts: float = 0.0  # when GTC orders were placed this cycle
 
         # Positions
         self._current_positions: List[PositionRecord] = []
@@ -646,13 +674,16 @@ class SequenceStrategy:
         self._try_infer_outcomes_from_prices()
 
         # Schedule resolution for any positions from old cycle
-        if self.cycle_state in (CycleState.OBSERVING, CycleState.ENTRY_WINDOW, CycleState.TRADED):
+        if self.cycle_state in (CycleState.OBSERVING, CycleState.ENTRY_WINDOW,
+                                CycleState.PENDING_ORDERS, CycleState.TRADED):
             self._transition_to_done()
 
         self._cycle_ts = market_start
         self._cycle_start_ts = float(market_start)
         self._traded_coins.clear()
         self._current_positions.clear()
+        self._pending_orders.clear()
+        self._orders_placed_ts = 0.0
         self._fee_rate_cache.clear()
         self.cycles_seen += 1
 
@@ -699,6 +730,16 @@ class SequenceStrategy:
 
     def _transition_to_done(self) -> None:
         self.cycle_state = CycleState.DONE
+
+        # Cancel any lingering pending orders (edge case: cycle ended before timeout)
+        if self._pending_orders:
+            order_ids = [p.order_id for p in self._pending_orders if p.order_id]
+            if order_ids:
+                try:
+                    self.clob.cancel_orders(order_ids)
+                except Exception:
+                    pass
+            self._pending_orders.clear()
 
         # Schedule resolution for all unique slugs from current positions
         seen_slugs: Set[str] = set()
@@ -780,13 +821,20 @@ class SequenceStrategy:
     # Entry execution
     # ------------------------------------------------------------------
     async def _try_enter_trades(self) -> None:
-        """Called during ENTRY_WINDOW to fire FOK buys on pattern matches."""
+        """Place GTC limit orders at max_ask for all pattern matches.
+
+        Orders are placed immediately and tracked in _pending_orders.
+        After cancel_timeout seconds, unfilled orders are cancelled.
+        Fills (immediate or partial) are recorded as positions.
+        """
         matches = self._find_pattern_matches()
+        placed_any = False
 
         for coin, rule in matches:
             if coin in self._traded_coins:
                 continue
-            if len(self._current_positions) >= self.cfg.max_trades_per_cycle:
+            if (len(self._current_positions) + len(self._pending_orders)
+                    >= self.cfg.max_trades_per_cycle):
                 break
 
             market = self._coin_markets.get(coin)
@@ -798,37 +846,47 @@ class SequenceStrategy:
             if not token_id:
                 continue
 
-            buy_price = self._best_asks[coin][buy_side]
-            effective_max_ask = rule.max_ask  # per-rule max_ask
-            if buy_price <= 0.01 or buy_price > effective_max_ask:
-                log(
-                    f"Skip {coin}: {buy_side} ask={buy_price:.3f} "
-                    f"(max_ask={effective_max_ask:.2f} for {rule.pattern})",
-                    "warning",
-                )
-                continue
-
-            # Add slippage for FOK
-            fok_price = min(buy_price + self.cfg.slippage, 0.99)
-
-            trade_size = self.cfg.size  # flat sizing (no Kelly)
+            # Use rule.max_ask as the limit price (no slippage needed)
+            limit_price = rule.max_ask
+            trade_size = self.cfg.size
 
             hist_str = "".join(self._outcome_history[coin])
+            current_ask = self._best_asks[coin][buy_side]
             log(
-                f"SIGNAL: {coin} [{hist_str}] -> {rule.pattern} -> BUY {buy_side.upper()} "
-                f"@ {buy_price:.3f} (FOK @ {fok_price:.3f}, max_ask={effective_max_ask:.2f})",
+                f"SIGNAL: {coin} [{hist_str}] -> {rule.pattern} -> "
+                f"GTC LIMIT BUY {buy_side.upper()} @ {limit_price:.3f} "
+                f"(ask={current_ask:.3f})",
                 "trade",
             )
 
             if self.cfg.dry_run:
-                tracker = self._simulate_buy(coin, buy_side, buy_price, market, rule.pattern, trade_size)
-            else:
-                tracker = await self._submit_live_buy(
-                    coin, buy_side, token_id, market, fok_price, rule.pattern, trade_size
+                tracker = self._simulate_buy(
+                    coin, buy_side, current_ask, market, rule.pattern, trade_size,
                 )
+                if tracker:
+                    self._traded_coins.add(coin)
+                    placed_any = True
+            else:
+                result = await self._submit_limit_buy(
+                    coin, buy_side, token_id, market, limit_price,
+                    rule.pattern, trade_size,
+                )
+                if result is not None:
+                    placed_any = True
+                    # result is either a PositionRecord (immediate fill)
+                    # or a PendingOrder (resting on book)
+                    if isinstance(result, PositionRecord):
+                        self._traded_coins.add(coin)
+                    # PendingOrder is already in self._pending_orders
 
-            if tracker:
-                self._traded_coins.add(coin)
+        if placed_any and not self.cfg.dry_run and self._pending_orders:
+            self._orders_placed_ts = time.time()
+            self.cycle_state = CycleState.PENDING_ORDERS
+            log(
+                f"Placed {len(self._pending_orders)} GTC limit(s). "
+                f"Cancel timeout: {self.cfg.cancel_timeout:.0f}s.",
+                "trade",
+            )
 
     def _simulate_buy(
         self, coin: str, side: str, ask_price: float, market: MarketInfo, pattern: str,
@@ -867,17 +925,23 @@ class SequenceStrategy:
         )
         return pos
 
-    async def _submit_live_buy(
+    async def _submit_limit_buy(
         self,
         coin: str,
         side: str,
         token_id: str,
         market: MarketInfo,
-        buy_price: float,
+        limit_price: float,
         pattern: str,
         trade_size: Optional[float] = None,
-    ) -> Optional[PositionRecord]:
-        """Submit a FOK limit BUY to the CLOB."""
+    ) -> Optional[Any]:
+        """Submit a GTC limit BUY to the CLOB.
+
+        Returns:
+            PositionRecord if immediately matched (full fill).
+            PendingOrder if order is resting on the book (live).
+            None on error.
+        """
         actual_size = trade_size if trade_size is not None else self.cfg.size
         label = f"{coin}-{side.upper()}"
         try:
@@ -891,7 +955,7 @@ class SequenceStrategy:
 
             order = Order(
                 token_id=token_id,
-                price=buy_price,
+                price=limit_price,
                 size=actual_size,
                 side="BUY",
                 funder=self.bot_config.safe_address,
@@ -901,12 +965,12 @@ class SequenceStrategy:
                 tick_size=market.tick_size,
             )
 
-            # Hot path: sign + POST on dedicated thread
+            # Sign + POST as GTC on dedicated thread
             t_start = time.perf_counter()
             loop = asyncio.get_running_loop()
             response, t_sign_us, t_post_us = await loop.run_in_executor(
                 self._clob_executor,
-                self._sync_sign_and_post, order, "FOK",
+                self._sync_sign_and_post, order, "GTC",
             )
             t_total_us = (time.perf_counter() - t_start) * 1_000_000
 
@@ -914,7 +978,7 @@ class SequenceStrategy:
 
             if not response.get("success", False):
                 error = response.get("errorMsg", "unknown")
-                log(f"FOK FAIL {label}: {error} {timing}", "error")
+                log(f"GTC FAIL {label}: {error} {timing}", "error")
                 return None
 
             order_id = (
@@ -925,11 +989,13 @@ class SequenceStrategy:
             )
 
             status = str(response.get("status", "")).lower()
+            self.total_orders_placed += 1
 
             if status in {"matched", "filled", "executed", "complete", "completed"}:
+                # Immediately filled — record as position
                 taking = _to_float(response.get("takingAmount", 0))
                 making = _to_float(response.get("makingAmount", 0))
-                fp = making / max(taking, 1e-12) if taking > 0 else buy_price
+                fp = making / max(taking, 1e-12) if taking > 0 else limit_price
                 fill_size = taking if taking > 0 else actual_size
                 cost = fp * fill_size
 
@@ -947,7 +1013,6 @@ class SequenceStrategy:
                 self._current_positions.append(pos)
                 self._all_positions.append(pos)
                 self.total_fills += 1
-                self.total_orders_placed += 1
                 self.total_spent += cost
                 self.total_shares += fill_size
                 if pattern in self.pattern_fills:
@@ -955,23 +1020,154 @@ class SequenceStrategy:
 
                 _append_trade_log(pos, self.cfg, outcome="PENDING", log_file=self.log_file)
                 log(
-                    f"FILLED {label} @ {fp:.4f} x{fill_size:.2f} "
+                    f"GTC IMMEDIATE FILL {label} @ {fp:.4f} x{fill_size:.2f} "
                     f"(pattern={pattern}) {timing}",
                     "success",
                 )
                 return pos
 
-            # FOK not filled = killed
-            log(f"FOK KILLED {label}: order not filled {timing}", "warning")
-            self.total_orders_placed += 1
+            if status == "live":
+                # Resting on book — track as pending
+                pending = PendingOrder(
+                    coin=coin,
+                    side=side,
+                    token_id=token_id,
+                    order_id=order_id,
+                    limit_price=limit_price,
+                    size=actual_size,
+                    placed_at=time.time(),
+                    market_slug=market.slug,
+                    pattern=pattern,
+                    neg_risk=market.neg_risk,
+                    tick_size=market.tick_size,
+                )
+                self._pending_orders.append(pending)
+                log(
+                    f"GTC LIVE {label} @ {limit_price:.3f} x{actual_size:.2f} "
+                    f"id={order_id[:16]}... {timing}",
+                    "trade",
+                )
+                return pending
+
+            # Unexpected status (delayed, unmatched, etc.)
+            log(
+                f"GTC UNEXPECTED {label}: status={status} id={order_id[:16]}... {timing}",
+                "warning",
+            )
+            # Still track it as pending if we got an order_id
+            if order_id:
+                pending = PendingOrder(
+                    coin=coin,
+                    side=side,
+                    token_id=token_id,
+                    order_id=order_id,
+                    limit_price=limit_price,
+                    size=actual_size,
+                    placed_at=time.time(),
+                    market_slug=market.slug,
+                    pattern=pattern,
+                    neg_risk=market.neg_risk,
+                    tick_size=market.tick_size,
+                )
+                self._pending_orders.append(pending)
+                return pending
             return None
 
         except Exception as exc:
-            log(f"FOK ERR {label}: {exc}", "error")
+            log(f"GTC ERR {label}: {exc}", "error")
             return None
 
+    async def _cancel_and_settle_pending(self) -> None:
+        """Cancel all unfilled GTC orders and record any fills as positions.
+
+        Called after cancel_timeout expires. For each pending order:
+        1. Poll get_order to check if it was (partially) filled
+        2. Cancel whatever remains unfilled
+        3. Record any filled amount as a position
+        """
+        if not self._pending_orders:
+            return
+
+        pending = list(self._pending_orders)
+        self._pending_orders.clear()
+
+        # Batch cancel all order IDs first (fast, single API call)
+        order_ids = [p.order_id for p in pending if p.order_id]
+        if order_ids:
+            try:
+                cancel_result = await asyncio.to_thread(
+                    self.clob.cancel_orders, order_ids
+                )
+                cancelled = cancel_result.get("canceled", [])
+                not_cancelled = cancel_result.get("not_canceled", {})
+                log(
+                    f"Cancelled {len(cancelled)}/{len(order_ids)} orders"
+                    + (f" (not_cancelled: {not_cancelled})" if not_cancelled else ""),
+                    "info",
+                )
+            except Exception as exc:
+                log(f"Cancel batch error: {exc}", "error")
+
+        # Now poll each order for fill status
+        for p in pending:
+            if not p.order_id:
+                continue
+            try:
+                order_data = await asyncio.to_thread(
+                    self.clob.get_order, p.order_id
+                )
+                size_matched = _to_float(order_data.get("size_matched", 0))
+                original_size = _to_float(order_data.get("original_size", p.size))
+                price = _to_float(order_data.get("price", p.limit_price))
+
+                label = f"{p.coin}-{p.side.upper()}"
+
+                if size_matched > 0:
+                    # Got a (partial) fill — record as position
+                    fill_price = price  # limit order fills at limit price or better
+                    cost = fill_price * size_matched
+
+                    pos = PositionRecord(
+                        coin=p.coin,
+                        side=p.side,
+                        fill_price=fill_price,
+                        fill_size=size_matched,
+                        fill_time=time.time(),
+                        market_slug=p.market_slug,
+                        order_id=p.order_id,
+                        cost=cost,
+                        pattern=p.pattern,
+                    )
+                    self._current_positions.append(pos)
+                    self._all_positions.append(pos)
+                    self.total_fills += 1
+                    self.total_spent += cost
+                    self.total_shares += size_matched
+                    if p.pattern in self.pattern_fills:
+                        self.pattern_fills[p.pattern] += 1
+                    self._traded_coins.add(p.coin)
+
+                    _append_trade_log(pos, self.cfg, outcome="PENDING", log_file=self.log_file)
+
+                    partial = "" if size_matched >= original_size else " (PARTIAL)"
+                    log(
+                        f"GTC FILLED{partial} {label} @ {fill_price:.4f} "
+                        f"x{size_matched:.2f}/{original_size:.2f} "
+                        f"(pattern={p.pattern})",
+                        "success",
+                    )
+                else:
+                    log(
+                        f"GTC NO FILL {label} @ {p.limit_price:.3f} "
+                        f"(pattern={p.pattern}) — cancelled",
+                        "warning",
+                    )
+
+            except Exception as exc:
+                log(f"Poll order {p.order_id[:16]}... error: {exc}", "error")
+
     def _sync_sign_and_post(
-        self, order: Order, order_type: str = "FOK"
+        self, order: Order, order_type: str = "GTC"
     ) -> Tuple[Dict[str, Any], float, float]:
         """Sign + POST on the dedicated executor thread."""
         prev_t, prev_r = self.clob.timeout, self.clob.retry_count
@@ -1264,15 +1460,16 @@ class SequenceStrategy:
             if cycle_age >= INFERENCE_TIME:
                 self._try_infer_outcomes_from_prices()
 
-        # --- Entry window: fire trades in configurable window ---
+        # --- Entry window: place GTC limit orders once ---
         if self.cycle_state == CycleState.ENTRY_WINDOW:
             cycle_age = now - self._cycle_start_ts
             ew_start = self.cfg.entry_window_start
             ew_end = self.cfg.entry_window_end
             if ew_start <= cycle_age <= ew_end:
                 await self._try_enter_trades()
-                # If we traded at least once, transition
-                if self._traded_coins:
+                # _try_enter_trades transitions to PENDING_ORDERS if GTC orders resting
+                # If all orders filled immediately (or dry-run), transition to TRADED:
+                if self.cycle_state == CycleState.ENTRY_WINDOW and self._traded_coins:
                     self.cycle_state = CycleState.TRADED
                     log(
                         f"Traded {len(self._traded_coins)} coin(s): "
@@ -1280,13 +1477,30 @@ class SequenceStrategy:
                         "trade",
                     )
             elif cycle_age > ew_end:
-                # Window expired with no trades
-                if not self._traded_coins:
+                # Window expired with no trades placed
+                if not self._traded_coins and not self._pending_orders:
                     log("Entry window expired, no trades executed.", "warning")
                     self.cycle_state = CycleState.OBSERVING
 
+        # --- Pending orders: wait for cancel_timeout, then cancel + settle ---
+        if self.cycle_state == CycleState.PENDING_ORDERS:
+            elapsed = now - self._orders_placed_ts
+            if elapsed >= self.cfg.cancel_timeout:
+                await self._cancel_and_settle_pending()
+                if self._traded_coins:
+                    self.cycle_state = CycleState.TRADED
+                    log(
+                        f"Traded {len(self._traded_coins)} coin(s): "
+                        f"{', '.join(sorted(self._traded_coins))}. Holding to resolution.",
+                        "trade",
+                    )
+                else:
+                    log("All GTC orders cancelled, no fills.", "warning")
+                    self.cycle_state = CycleState.OBSERVING
+
         # --- Check if all markets ended ---
-        if self.cycle_state in (CycleState.OBSERVING, CycleState.ENTRY_WINDOW, CycleState.TRADED):
+        if self.cycle_state in (CycleState.OBSERVING, CycleState.ENTRY_WINDOW,
+                                CycleState.PENDING_ORDERS, CycleState.TRADED):
             all_ended = all(
                 m.has_ended() for c in COINS
                 if (m := self._coin_markets.get(c)) is not None
@@ -1382,6 +1596,7 @@ class SequenceStrategy:
         state_map = {
             CycleState.OBSERVING: (D, "OBSERVE"),
             CycleState.ENTRY_WINDOW: (Y, "ENTRY"),
+            CycleState.PENDING_ORDERS: (Y, "PENDING"),
             CycleState.TRADED: (G, "HOLDING"),
             CycleState.WAITING_MARKET: (D, "WAIT"),
             CycleState.DONE: (D, "IDLE"),
@@ -1704,8 +1919,9 @@ def main() -> None:
     print()
 
     log(f"Entry window: {cfg.entry_window_start}-{cfg.entry_window_end}s", "info")
+    log(f"Cancel timeout: {cfg.cancel_timeout:.0f}s (GTC limit orders)", "info")
     log(f"Size: ${cfg.size:.0f} flat (no Kelly)", "info")
-    log(f"Slippage: ${cfg.slippage:.2f}", "info")
+    log(f"Order type: GTC limit at max_ask (maker-friendly)", "info")
     print()
 
     log("Rules (priority order, longest pattern first):", "info")

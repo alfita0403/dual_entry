@@ -4,16 +4,20 @@
 #
 # Rules are ordered by PRIORITY (highest first = longest pattern).
 # For each coin in each cycle, the FIRST matching rule wins.
-# Each rule has its own max_ask derived from: max_ask = WR * 0.985 - slippage
+# Each rule has its own max_ask = the GTC limit price we place.
 #
 # IMPORTANT: keep rules sorted longest-pattern-first per coin!
 # If UUUU matches, we want that rule (higher WR, higher max_ask),
 # not UUU (lower WR, lower max_ask).
+#
+# Entry mechanism: GTC limit order at max_ask price, cancel after cancel_timeout.
+# If filled at better price, great. May fill as maker (0% fee) instead of taker (1.5%).
 
-entry_window_start: 5     # seconds after cycle start
-entry_window_end: 10      # seconds — conservative, avoid late adverse prices
+entry_window_start: 3     # seconds after cycle start (place orders early)
+entry_window_end: 5       # seconds — narrow window, orders placed once
+cancel_timeout: 10.0      # seconds after placing GTC to cancel unfilled orders
 size: 5.0                 # USDC per trade (flat, no Kelly)
-slippage: 0.03            # added to best ask for FOK price
+slippage: 0.03            # legacy (unused with GTC limit orders)
 
 rules:
   # --- ETH: strongest edge ---
