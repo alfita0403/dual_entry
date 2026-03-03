@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import yaml
 import numpy as np
 import pandas as pd
 
@@ -250,6 +251,8 @@ BUILTIN_PATTERNS: Dict[str, str] = {
 class PatternRule:
     pattern: str
     buy_side: str  # "UP" or "DOWN"
+    coins: Optional[List[str]] = None  # None = all coins
+    max_ask: Optional[float] = None    # None = use global default
 
 
 @dataclass
@@ -294,22 +297,42 @@ class BacktestResult:
     cycles_with_signal: int = 0
 
 
+def load_yaml_rules(yaml_path: str) -> Tuple[List[PatternRule], Dict[str, Any]]:
+    """Load pattern rules from a mean_reversion YAML config.
+
+    Returns (rules, config_dict) where config_dict has entry_window, size, etc.
+    """
+    with open(yaml_path) as f:
+        cfg = yaml.safe_load(f)
+
+    rules: List[PatternRule] = []
+    for r in cfg.get("rules", []):
+        pattern = r["pattern"].replace("U", "U").replace("D", "D")
+        side_raw = r.get("side", "DOWN").upper()
+        buy_side = side_raw  # "DOWN" or "UP"
+        coins = [c.upper() for c in r.get("coins", [])] or None
+        max_ask = r.get("max_ask")
+        rules.append(PatternRule(pattern, buy_side, coins, max_ask))
+
+    return rules, cfg
+
+
 # ---------------------------------------------------------------------------
 # Core backtest logic
 # ---------------------------------------------------------------------------
-def get_entry_price(cycle: pd.DataFrame, coin: str, side: str) -> Optional[float]:
-    """Get the ask price for a coin/side at entry time (t=5-8s into cycle).
+def get_entry_price(
+    cycle: pd.DataFrame, coin: str, side: str, entry_time: int = ENTRY_TIME,
+) -> Optional[float]:
+    """Get the ask price for a coin/side at entry time.
 
-    Matches live strategy: ENTRY_WINDOW_START=5, bot enters on first tick.
-    Uses a tight 3-second window around ENTRY_TIME to get realistic fill price.
+    Uses a tight 3-second window around entry_time to get realistic fill price.
 
     For UP: reads {coin}_up_ask directly.
     For DOWN: derives from UP bid -> DOWN ask = 1 - UP bid.
     """
-    # Tight window: t=5 to t=8 (matches live bot entering at first opportunity)
     entry_rows = cycle[
-        (cycle["seconds_elapsed"] >= ENTRY_TIME) &
-        (cycle["seconds_elapsed"] <= ENTRY_TIME + 3)
+        (cycle["seconds_elapsed"] >= entry_time) &
+        (cycle["seconds_elapsed"] <= entry_time + 3)
     ]
     if entry_rows.empty:
         # Fallback: first 10 seconds
@@ -358,6 +381,7 @@ def run_backtest(
     use_gamma: bool = True,
     coins_filter: Optional[List[str]] = None,
     kelly_scale: float = 0.0,
+    entry_time: int = ENTRY_TIME,
 ) -> BacktestResult:
     """Run pattern backtest on historical CSV data.
 
@@ -415,6 +439,9 @@ def run_backtest(
             if not hist:
                 continue
             for rule in rules:
+                # Per-coin filter: skip if rule restricts to specific coins
+                if rule.coins and coin not in rule.coins:
+                    continue
                 plen = len(rule.pattern)
                 if len(hist) < plen:
                     continue
@@ -439,12 +466,13 @@ def run_backtest(
                 continue  # unresolved market, skip
 
             # Get entry price
-            entry_price = get_entry_price(cycle, coin, rule.buy_side)
+            entry_price = get_entry_price(cycle, coin, rule.buy_side, entry_time)
             if entry_price is None:
                 continue
 
-            # Max ask filter: skip expensive entries with bad risk/reward
-            if entry_price > max_ask:
+            # Max ask filter: per-rule max_ask overrides global
+            effective_max_ask = rule.max_ask if rule.max_ask is not None else max_ask
+            if entry_price > effective_max_ask:
                 continue
 
             # Kelly scaling: increase size based on streak length
@@ -525,15 +553,20 @@ def run_backtest(
     avg_pnl = total_pnl / total_trades if total_trades > 0 else 0.0
     max_dd_pct = (max_dd / peak_balance * 100) if peak_balance > 0 else 0.0
 
-    # Per-pattern breakdown
+    # Per-rule breakdown (unique key per rule to handle same pattern with different coins)
     per_pattern: Dict[str, Dict[str, Any]] = {}
     for rule in rules:
-        p = rule.pattern
-        pt = [t for t in trades if t.pattern == p]
+        rule_coins = set(rule.coins) if rule.coins else set(COINS)
+        coins_tag = ",".join(sorted(rule_coins))
+        key = f"{rule.pattern}[{coins_tag}]"
+        pt = [
+            t for t in trades
+            if t.pattern == rule.pattern and t.coin in rule_coins
+        ]
         pw = sum(1 for t in pt if t.won)
         pl = len(pt) - pw
         ppnl = sum(t.pnl for t in pt)
-        per_pattern[p] = {
+        per_pattern[key] = {
             "side": rule.buy_side,
             "trades": len(pt),
             "wins": pw,
@@ -541,6 +574,7 @@ def run_backtest(
             "win_rate": pw / len(pt) if pt else 0.0,
             "total_pnl": ppnl,
             "avg_pnl": ppnl / len(pt) if pt else 0.0,
+            "max_ask": rule.max_ask,
         }
 
     # Per-coin breakdown
@@ -618,15 +652,15 @@ def print_results(result: BacktestResult, show_trades: bool = False) -> None:
     print(f"  Max drawdown:     ${result.max_drawdown:.2f}")
     print(f"  Max drawdown %:   {result.max_drawdown_pct:.1f}%")
 
-    # Per-pattern
+    # Per-pattern/rule
     if result.per_pattern:
         print()
-        print(f"  --- Per Pattern ---")
-        print(f"  {'Pattern':<8} {'Side':<6} {'Trades':>6} {'Wins':>5} {'Loss':>5} {'WR':>6} {'PnL':>10} {'Avg':>10}")
-        print(f"  {'-'*8} {'-'*6} {'-'*6} {'-'*5} {'-'*5} {'-'*6} {'-'*10} {'-'*10}")
+        print(f"  --- Per Rule ---")
+        print(f"  {'Rule':<24} {'Side':<6} {'Trades':>6} {'Wins':>5} {'Loss':>5} {'WR':>6} {'PnL':>10} {'Avg':>10}")
+        print(f"  {'-'*24} {'-'*6} {'-'*6} {'-'*5} {'-'*5} {'-'*6} {'-'*10} {'-'*10}")
         for pattern, stats in result.per_pattern.items():
             print(
-                f"  {pattern:<8} {stats['side']:<6} {stats['trades']:>6} "
+                f"  {pattern:<24} {stats['side']:<6} {stats['trades']:>6} "
                 f"{stats['wins']:>5} {stats['losses']:>5} "
                 f"{stats['win_rate']:>5.0%} "
                 f"${stats['total_pnl']:>+9.2f} "
@@ -760,6 +794,13 @@ def main() -> None:
         help="Test ALL built-in patterns (DDD, UD, UUU, DU, DDDD, DD, UU, UDU, DUD)",
     )
     parser.add_argument(
+        "--yaml", type=str, default=None,
+        help=(
+            "Load rules from a YAML config file (e.g. strategies/mean_reversion.yaml). "
+            "Overrides --pattern/--side/--all-patterns. Supports per-coin and per-rule max_ask."
+        ),
+    )
+    parser.add_argument(
         "--size", type=float, default=5.0,
         help="Shares per trade (default: 5)",
     )
@@ -819,7 +860,22 @@ def main() -> None:
             sys.exit(1)
 
     # Parse rules
-    if args.all_patterns:
+    yaml_cfg = None
+    if args.yaml:
+        yaml_path = Path(args.yaml)
+        if not yaml_path.exists():
+            print(f"ERROR: YAML file not found: {args.yaml}")
+            sys.exit(1)
+        rules, yaml_cfg = load_yaml_rules(args.yaml)
+        print(f"\n  Loaded {len(rules)} rules from {args.yaml}")
+        for r in rules:
+            coins_str = ",".join(r.coins) if r.coins else "ALL"
+            ask_str = f"max_ask={r.max_ask}" if r.max_ask else ""
+            print(f"    {r.pattern} -> BUY {r.buy_side}  [{coins_str}]  {ask_str}")
+        # Use YAML size if not overridden on CLI
+        if yaml_cfg and args.size == 5.0 and "size" in yaml_cfg:
+            args.size = yaml_cfg["size"]
+    elif args.all_patterns:
         rules = [PatternRule(p, s) for p, s in BUILTIN_PATTERNS.items()]
     else:
         patterns = [p.strip().upper() for p in args.pattern.split(",")]
@@ -854,6 +910,12 @@ def main() -> None:
     if args.kelly > 0:
         print(f"  Kelly scaling: {args.kelly} (UU=1x, UUU={1+args.kelly:.1f}x, UUUU={1+2*args.kelly:.1f}x, ...)")
 
+    # Entry time: use YAML config or default
+    entry_time = ENTRY_TIME
+    if yaml_cfg and "entry_window_start" in yaml_cfg:
+        entry_time = yaml_cfg["entry_window_start"]
+        print(f"  Entry time: t={entry_time}s (from YAML)")
+
     # Run backtest
     result = run_backtest(
         csv_paths=args.csv_files,
@@ -865,6 +927,7 @@ def main() -> None:
         use_gamma=use_gamma,
         coins_filter=coins_filter,
         kelly_scale=args.kelly,
+        entry_time=entry_time,
     )
 
     # Print results
