@@ -428,6 +428,11 @@ class SequenceStrategy:
         self._coin_markets: Dict[str, Optional[MarketInfo]] = {
             c: None for c in COINS
         }
+        # Previous cycle's markets — saved before overwrite so REST book
+        # confirmation can look up old token IDs after the WS switches.
+        self._old_cycle_markets: Dict[str, Optional[MarketInfo]] = {
+            c: None for c in COINS
+        }
 
         # Outcome confirmation queue (Gamma recheck for every inferred cycle)
         # key=(coin, cycle_ts), value={"slug": str, "next_check": float}
@@ -576,7 +581,6 @@ class SequenceStrategy:
 
         try:
             await self._start_all_managers()
-            await self._warmstart_history()
             _tui_active = True
 
             while True:
@@ -645,102 +649,16 @@ class SequenceStrategy:
                 break
 
     # ------------------------------------------------------------------
-    # Warm-start: pre-fill outcome history from Gamma API
-    # ------------------------------------------------------------------
-    async def _warmstart_history(self) -> None:
-        """Query Gamma for the last 5 closed cycles per coin to seed history.
-
-        This eliminates the 25-minute cold-start window where the bot
-        has no pattern data.  Results are stored as CONFIRMED (orange)
-        when Gamma has resolved the market, or as UNKNOWN ('-') with a
-        recheck queued otherwise.
-        """
-        # Determine current cycle timestamp from any active market.
-        current_ts: Optional[int] = None
-        for coin in COINS:
-            m = self._coin_markets.get(coin)
-            if m:
-                ts = m.start_timestamp()
-                if ts is not None:
-                    current_ts = ts
-                    break
-        if current_ts is None:
-            log("Warm-start skipped: no active market found.", "warning")
-            return
-
-        # Previous 5 cycle timestamps (each cycle = 300s).
-        history_depth = 6  # maxlen of deque
-        prev_timestamps = [current_ts - 300 * (i + 1) for i in range(history_depth)]
-        prev_timestamps.reverse()  # oldest first
-
-        log(f"Warm-start: fetching {history_depth} previous cycles per coin...", "info")
-
-        for coin in COINS:
-            entries: list[OutcomeEntry] = []
-            for cycle_ts in prev_timestamps:
-                slug = self._slug_for_cycle(coin, cycle_ts)
-                try:
-                    market_data = await asyncio.to_thread(
-                        self._gamma_client.get_market_by_slug, slug
-                    )
-                    if market_data and market_data.get("closed", False):
-                        winner = self._parse_gamma_winner(market_data)
-                        outcome = self._winner_to_outcome(winner)
-                        if outcome is not None:
-                            entry = OutcomeEntry(
-                                outcome=outcome,
-                                status=ConfirmationStatus.CONFIRMED,
-                                cycle_ts=cycle_ts,
-                                market_slug=slug,
-                                observed_up_ask=0.0,
-                            )
-                            entries.append(entry)
-                            continue
-
-                    # Not closed or no winner yet — record as unknown, queue recheck.
-                    entry = OutcomeEntry(
-                        outcome="-",
-                        status=ConfirmationStatus.UNKNOWN,
-                        cycle_ts=cycle_ts,
-                        market_slug=slug,
-                        observed_up_ask=0.0,
-                    )
-                    entries.append(entry)
-                    self._queue_outcome_recheck(coin, cycle_ts, slug)
-
-                except Exception as exc:
-                    log(f"  Warm-start {coin} {slug}: {exc}", "warning")
-                    entry = OutcomeEntry(
-                        outcome="-",
-                        status=ConfirmationStatus.UNKNOWN,
-                        cycle_ts=cycle_ts,
-                        market_slug=slug,
-                        observed_up_ask=0.0,
-                    )
-                    entries.append(entry)
-                    self._queue_outcome_recheck(coin, cycle_ts, slug)
-
-            # Fill history deque (oldest first = natural append order).
-            for e in entries:
-                self._outcome_history[coin].append(e)
-                self._last_inference_ts[coin] = e.cycle_ts
-
-            confirmed = sum(1 for e in entries if e.status == ConfirmationStatus.CONFIRMED)
-            hist_str = self._history_values(entries)
-            log(
-                f"  {coin} warm-start: [{hist_str}] ({confirmed}/{len(entries)} confirmed)",
-                "success" if confirmed == len(entries) else "info",
-            )
-
-        log("Warm-start complete.", "success")
-
-    # ------------------------------------------------------------------
     # Callbacks
     # ------------------------------------------------------------------
     def _on_market_change(self, coin: str, old_slug: str, new_slug: str) -> None:
         mgr = self.managers[coin]
         market = mgr.current_market
         if market:
+            # Save old market before overwriting (REST book confirm needs its token IDs)
+            old_market = self._coin_markets.get(coin)
+            if old_market:
+                self._old_cycle_markets[coin] = old_market
             self._coin_markets[coin] = market
             log(f"{coin} -> {new_slug}", "info")
 
@@ -806,10 +724,27 @@ class SequenceStrategy:
             return
 
         # --- New cycle ---
+        old_cycle_ts = self._cycle_ts  # save for REST book confirm
+
         # Before entering new cycle, try to infer outcomes from old cycle
         self._try_infer_outcomes_from_prices()
-        # Upgrade provisional outcomes using residual bids (before cache reset)
+        # Upgrade provisional outcomes using residual WS bids (before cache reset)
         self._try_confirm_from_book()
+
+        # Collect old token IDs for REST book confirmation (before reset).
+        # The triggering coin's market was already overwritten by
+        # _on_market_change → use _old_cycle_markets.  Other coins may
+        # still point to the old cycle in _coin_markets.
+        old_token_ids: Dict[str, Dict[str, str]] = {}
+        if old_cycle_ts is not None:
+            for c in COINS:
+                saved = self._old_cycle_markets.get(c)
+                if saved and saved.start_timestamp() == old_cycle_ts:
+                    old_token_ids[c] = dict(saved.token_ids)
+                else:
+                    m = self._coin_markets.get(c)
+                    if m and m.start_timestamp() == old_cycle_ts:
+                        old_token_ids[c] = dict(m.token_ids)
 
         # Schedule resolution for any positions from old cycle
         if self.cycle_state in (CycleState.OBSERVING, CycleState.ENTRY_WINDOW,
@@ -866,6 +801,25 @@ class SequenceStrategy:
             hist = self._history_values(list(self._outcome_history[c]))
             if hist:
                 log(f"  {c} history: [{hist}]", "info")
+
+        # Fire async REST book confirm for coins not yet book-confirmed.
+        # This fetches the old market's orderbook via REST (bids near $1
+        # appear after resolution).  If it finds matches, it upgrades
+        # OBSERVING → ENTRY_WINDOW automatically.
+        if old_cycle_ts is not None and old_token_ids:
+            any_unconfirmed = any(
+                (e := self._find_outcome_entry(c, old_cycle_ts)) is not None
+                and e.status not in (
+                    ConfirmationStatus.CONFIRMED,
+                    ConfirmationStatus.BOOK_CONFIRMED,
+                )
+                for c in COINS
+            )
+            if any_unconfirmed:
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    self._rest_book_confirm(old_token_ids, old_cycle_ts)
+                )
 
     def _transition_to_done(self) -> None:
         self.cycle_state = CycleState.DONE
@@ -1119,6 +1073,88 @@ class SequenceStrategy:
                     + (f" [was {prev}]" if prev != "D" else ""),
                     "trade",
                 )
+
+    # ------------------------------------------------------------------
+    # REST-based book confirmation (async, runs in background at cycle start)
+    # ------------------------------------------------------------------
+    async def _rest_book_confirm(
+        self,
+        old_token_ids: Dict[str, Dict[str, str]],
+        old_cycle_ts: int,
+    ) -> None:
+        """Fetch the old market's orderbook via REST and upgrade outcomes.
+
+        After the WS switches to the new market, the old market's book
+        still has residual bids near $1 on the winning side.  This method
+        calls ``get_order_book`` for each unconfirmed coin and upgrades
+        PROVISIONAL → BOOK_CONFIRMED when it finds a bid >= 0.99.
+
+        If the upgrade creates new pattern matches and we're still inside
+        the entry window, automatically transition to ENTRY_WINDOW.
+        """
+        for coin in COINS:
+            entry = self._find_outcome_entry(coin, old_cycle_ts)
+            if entry is None:
+                continue
+            if entry.status in (
+                ConfirmationStatus.CONFIRMED,
+                ConfirmationStatus.BOOK_CONFIRMED,
+            ):
+                continue
+
+            token_ids = old_token_ids.get(coin)
+            if not token_ids:
+                continue
+
+            for side in ("up", "down"):
+                tid = token_ids.get(side, "")
+                if not tid:
+                    continue
+                try:
+                    book = await asyncio.to_thread(
+                        self.clob.get_order_book, tid,
+                    )
+                    bids = book.get("bids", [])
+                    if bids:
+                        best_bid = float(bids[0].get("price", 0))
+                        if best_bid >= BOOK_CONFIRM_BID:
+                            outcome = "U" if side == "up" else "D"
+                            prev = entry.outcome
+                            entry.outcome = outcome
+                            entry.status = ConfirmationStatus.BOOK_CONFIRMED
+                            log(
+                                f"  {coin} book-confirmed (REST): {outcome} "
+                                f"({side.upper()} bid={best_bid:.3f})"
+                                + (f" [was {prev}]" if prev != outcome else ""),
+                                "trade",
+                            )
+                            break  # found winner, skip other side
+                except Exception as exc:
+                    log(f"  REST book error {coin}/{side}: {exc}", "warning")
+
+        # Re-check patterns — if new matches appeared, enter trade window.
+        cycle_age = time.time() - self._cycle_start_ts
+        if cycle_age <= self.cfg.entry_window_end + 1:
+            matches = self._find_pattern_matches()
+            if matches and self.cycle_state == CycleState.OBSERVING:
+                match_strs = [
+                    f"{c}:{r.pattern}->BUY {r.buy_side.upper()}"
+                    for c, r in matches
+                ]
+                log(
+                    f"REST book-confirm MATCHES: {', '.join(match_strs)}",
+                    "trade",
+                )
+                self.cycle_state = CycleState.ENTRY_WINDOW
+
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._prewarm_clob())
+                for c, rule in matches:
+                    m = self._coin_markets.get(c)
+                    if m:
+                        tid = m.token_ids.get(rule.buy_side, "")
+                        if tid and tid not in self._fee_rate_cache:
+                            loop.create_task(self._prefetch_fee(tid))
 
     # ------------------------------------------------------------------
     # Pattern matching
