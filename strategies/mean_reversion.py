@@ -76,6 +76,11 @@ CERTAIN_DOWN_ASK = 0.01           # UP ask <= this => provisional DOWN
 GAMMA_RECHECK_INITIAL_DELAY = 210  # ~3.5 min after cycle closes
 GAMMA_RECHECK_RETRY_DELAY = 300    # retry every cycle if unresolved
 
+# Book-confirm threshold: if a side's bid >= this after cycle ends, that side won.
+# Market makers leave residual bids near $1 for resolved shares; checking this
+# at cycle rollover gives near-instant confirmation without waiting for Gamma.
+BOOK_CONFIRM_BID = 0.99
+
 # Max ask price filter — don't buy when ask is too expensive (bad risk/reward)
 DEFAULT_MAX_ASK = 0.60     # only enter if ask <= this
 
@@ -344,9 +349,10 @@ class CycleState(enum.Enum):
 
 
 class ConfirmationStatus(enum.Enum):
-    PROVISIONAL = "PROVISIONAL"
-    CONFIRMED = "CONFIRMED"
-    UNKNOWN = "UNKNOWN"
+    UNKNOWN = "UNKNOWN"             # ambiguous / no data
+    PROVISIONAL = "PROVISIONAL"     # inferred from ask at cycle end (white, NOT tradeable)
+    BOOK_CONFIRMED = "BOOK_CONFIRMED"  # bid >= 0.99 on residual book (blue, tradeable)
+    CONFIRMED = "CONFIRMED"         # Gamma API verified (orange, tradeable)
 
 
 @dataclass
@@ -781,6 +787,8 @@ class SequenceStrategy:
         # --- New cycle ---
         # Before entering new cycle, try to infer outcomes from old cycle
         self._try_infer_outcomes_from_prices()
+        # Upgrade provisional outcomes using residual bids (before cache reset)
+        self._try_confirm_from_book()
 
         # Schedule resolution for any positions from old cycle
         if self.cycle_state in (CycleState.OBSERVING, CycleState.ENTRY_WINDOW,
@@ -1039,6 +1047,59 @@ class SequenceStrategy:
                 )
 
     # ------------------------------------------------------------------
+    # Book confirmation — check residual bids at cycle rollover
+    # ------------------------------------------------------------------
+    def _try_confirm_from_book(self) -> None:
+        """Upgrade outcomes using residual bids from the just-ended market.
+
+        After a 5m market resolves, market makers leave liquidity on the
+        book.  The winning side still has bids near $1 (impatient holders
+        selling resolved shares for ~$0.99).  If either UP or DOWN bid >=
+        BOOK_CONFIRM_BID, we can confirm the winner almost instantly —
+        no need to wait for the Gamma API round-trip.
+
+        Must be called BEFORE the orderbook caches are reset for the new
+        cycle.
+        """
+        if self._cycle_ts is None:
+            return
+
+        for coin in COINS:
+            # Need fresh book data from this cycle
+            if self._up_ask_cycle_seen[coin] != self._cycle_ts:
+                continue
+
+            entry = self._find_outcome_entry(coin, self._cycle_ts)
+            if entry is None:
+                continue
+
+            # Don't downgrade Gamma-confirmed entries
+            if entry.status == ConfirmationStatus.CONFIRMED:
+                continue
+
+            up_bid = self._best_bids[coin]["up"]
+            down_bid = self._best_bids[coin]["down"]
+
+            if up_bid >= BOOK_CONFIRM_BID:
+                prev = entry.outcome
+                entry.outcome = "U"
+                entry.status = ConfirmationStatus.BOOK_CONFIRMED
+                log(
+                    f"  {coin} book-confirmed: U (UP bid={up_bid:.3f})"
+                    + (f" [was {prev}]" if prev != "U" else ""),
+                    "trade",
+                )
+            elif down_bid >= BOOK_CONFIRM_BID:
+                prev = entry.outcome
+                entry.outcome = "D"
+                entry.status = ConfirmationStatus.BOOK_CONFIRMED
+                log(
+                    f"  {coin} book-confirmed: D (DOWN bid={down_bid:.3f})"
+                    + (f" [was {prev}]" if prev != "D" else ""),
+                    "trade",
+                )
+
+    # ------------------------------------------------------------------
     # Pattern matching
     # ------------------------------------------------------------------
     def _find_pattern_matches(self) -> List[Tuple[str, PatternRule]]:
@@ -1067,9 +1128,10 @@ class SequenceStrategy:
                 recent_entries = hist[-pattern_len:]
                 recent = self._history_values(recent_entries)
                 if recent == rule.pattern:
-                    # Require confirmed history for pattern prefix (N-1 outcomes).
-                    prefix = recent_entries[:-1]
-                    if any(e.status != ConfirmationStatus.CONFIRMED for e in prefix):
+                    # ALL entries must be at least book-confirmed (blue) to trade.
+                    # PROVISIONAL (white) is not sufficient.
+                    _TRADEABLE = {ConfirmationStatus.BOOK_CONFIRMED, ConfirmationStatus.CONFIRMED}
+                    if any(e.status not in _TRADEABLE for e in recent_entries):
                         continue
                     matches.append((coin, rule))
                     break  # First matching rule wins per coin
@@ -1822,6 +1884,7 @@ class SequenceStrategy:
         X = Colors.RESET
         M = Colors.MAGENTA
         O = "\033[38;5;214m"
+        BL = "\033[94m"       # bright blue — book-confirmed
         W = 72
 
         lines: list[str] = []
@@ -1888,6 +1951,8 @@ class SequenceStrategy:
                 for entry in hist:
                     if entry.status == ConfirmationStatus.CONFIRMED and entry.outcome in {"U", "D"}:
                         rendered.append(f"{O}{entry.outcome}{X}")
+                    elif entry.status == ConfirmationStatus.BOOK_CONFIRMED and entry.outcome in {"U", "D"}:
+                        rendered.append(f"{BL}{entry.outcome}{X}")
                     else:
                         rendered.append(f"{Colors.WHITE}{entry.outcome}{X}")
                 hist_str = " ".join(rendered)
@@ -1904,7 +1969,8 @@ class SequenceStrategy:
                 recent = self._history_values(recent_entries)
                 if recent != rule.pattern:
                     continue
-                if any(e.status != ConfirmationStatus.CONFIRMED for e in recent_entries[:-1]):
+                _TRADEABLE = {ConfirmationStatus.BOOK_CONFIRMED, ConfirmationStatus.CONFIRMED}
+                if any(e.status not in _TRADEABLE for e in recent_entries):
                     continue
                 matches.append(f"{rule.pattern}->{rule.buy_side[0].upper()}")
 
