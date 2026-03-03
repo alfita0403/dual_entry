@@ -399,6 +399,9 @@ class SequenceStrategy:
         self._best_bids: Dict[str, Dict[str, float]] = {
             c: {"up": 0.0, "down": 0.0} for c in COINS
         }
+        # Last cycle_ts where we saw an UP-ask snapshot for each coin.
+        # Used to avoid inferring outcomes from default/stale ask placeholders.
+        self._up_ask_cycle_seen: Dict[str, Optional[int]] = {c: None for c in COINS}
         self._coin_markets: Dict[str, Optional[MarketInfo]] = {
             c: None for c in COINS
         }
@@ -616,11 +619,19 @@ class SequenceStrategy:
         market = mgr.current_market
         if market:
             self._coin_markets[coin] = market
-            # Invalidate stale orderbook data
-            self._best_asks[coin] = {"up": 1.0, "down": 1.0}
-            self._best_bids[coin] = {"up": 0.0, "down": 0.0}
             log(f"{coin} -> {new_slug}", "info")
+
+            # IMPORTANT: infer old-cycle outcomes before invalidating asks.
+            # If we reset to defaults (1.0), inference can mislabel outcomes as UP.
+            prev_cycle_ts = self._cycle_ts
             self._maybe_enter_cycle(coin, market)
+
+            # If cycle did not advance, this was a refresh/reconnect.
+            # Invalidate this coin cache to avoid stale local book values.
+            if self._cycle_ts == prev_cycle_ts:
+                self._best_asks[coin] = {"up": 1.0, "down": 1.0}
+                self._best_bids[coin] = {"up": 0.0, "down": 0.0}
+                self._up_ask_cycle_seen[coin] = None
 
             if old_slug:
                 self._schedule_resolution(coin, old_slug)
@@ -647,6 +658,8 @@ class SequenceStrategy:
                     asks = snapshot.asks
                     best_ask = asks[0].price if asks else 1.0
                     self._best_asks[coin][side] = best_ask
+                    if side == "up":
+                        self._up_ask_cycle_seen[coin] = self._cycle_ts
 
                     bids = snapshot.bids
                     best_bid = bids[0].price if bids else 0.0
@@ -690,6 +703,7 @@ class SequenceStrategy:
         # Reset orderbook caches
         self._best_asks = {c: {"up": 1.0, "down": 1.0} for c in COINS}
         self._best_bids = {c: {"up": 0.0, "down": 0.0} for c in COINS}
+        self._up_ask_cycle_seen = {c: None for c in COINS}
 
         now = time.time()
         cycle_age = now - self._cycle_start_ts
@@ -764,6 +778,12 @@ class SequenceStrategy:
         for coin in COINS:
             # Don't double-record for same cycle
             if self._last_inference_ts[coin] == self._cycle_ts:
+                continue
+
+            # Require at least one UP snapshot from this cycle.
+            # Prevents false inference from default ask placeholders.
+            if self._up_ask_cycle_seen[coin] != self._cycle_ts:
+                log(f"  {coin} outcome UNKNOWN (no fresh UP snapshot), not recorded", "warning")
                 continue
 
             up_ask = self._best_asks[coin]["up"]
