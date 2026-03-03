@@ -13,11 +13,10 @@
 # Entry mechanism: GTC limit order at max_ask price, cancel after cancel_timeout.
 # If filled at better price, great. May fill as maker (0% fee) instead of taker (1.5%).
 
-entry_window_start: 3     # seconds after cycle start (place orders early)
-entry_window_end: 5       # seconds — narrow window, orders placed once
+entry_window_start: 1     # seconds after cycle start (place limit immediately)
+entry_window_end: 3       # seconds — orders placed once, ASAP
 cancel_timeout: 10.0      # seconds after placing GTC to cancel unfilled orders
-size: 5.0                 # USDC per trade (flat, no Kelly)
-slippage: 0.03            # legacy (unused with GTC limit orders)
+size: 5.0                 # shares per trade (flat, no Kelly)
 
 rules:
   # --- ETH: strongest edge ---

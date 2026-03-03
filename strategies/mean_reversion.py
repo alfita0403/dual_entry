@@ -79,8 +79,8 @@ DEFAULT_MAX_ASK = 0.60     # only enter if ask <= this
 
 # How long after cycle start to look for pattern-match entries
 # (overridden by YAML config; these are fallback defaults)
-ENTRY_WINDOW_START = 5     # seconds after cycle start
-ENTRY_WINDOW_END = 10      # seconds — conservative to avoid adverse prices
+ENTRY_WINDOW_START = 1     # seconds after cycle start (place limit ASAP)
+ENTRY_WINDOW_END = 3       # seconds — orders placed once, not retried
 
 # Dry-run simulation penalties (match stat_arb.py)
 SIM_ENTRY_SLIP = 0.01
