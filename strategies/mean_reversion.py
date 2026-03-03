@@ -576,6 +576,7 @@ class SequenceStrategy:
 
         try:
             await self._start_all_managers()
+            await self._warmstart_history()
             _tui_active = True
 
             while True:
@@ -642,6 +643,96 @@ class SequenceStrategy:
             if market:
                 self._maybe_enter_cycle(coin, market)
                 break
+
+    # ------------------------------------------------------------------
+    # Warm-start: pre-fill outcome history from Gamma API
+    # ------------------------------------------------------------------
+    async def _warmstart_history(self) -> None:
+        """Query Gamma for the last 5 closed cycles per coin to seed history.
+
+        This eliminates the 25-minute cold-start window where the bot
+        has no pattern data.  Results are stored as CONFIRMED (orange)
+        when Gamma has resolved the market, or as UNKNOWN ('-') with a
+        recheck queued otherwise.
+        """
+        # Determine current cycle timestamp from any active market.
+        current_ts: Optional[int] = None
+        for coin in COINS:
+            m = self._coin_markets.get(coin)
+            if m:
+                ts = m.start_timestamp()
+                if ts is not None:
+                    current_ts = ts
+                    break
+        if current_ts is None:
+            log("Warm-start skipped: no active market found.", "warning")
+            return
+
+        # Previous 5 cycle timestamps (each cycle = 300s).
+        history_depth = 6  # maxlen of deque
+        prev_timestamps = [current_ts - 300 * (i + 1) for i in range(history_depth)]
+        prev_timestamps.reverse()  # oldest first
+
+        log(f"Warm-start: fetching {history_depth} previous cycles per coin...", "info")
+
+        for coin in COINS:
+            entries: list[OutcomeEntry] = []
+            for cycle_ts in prev_timestamps:
+                slug = self._slug_for_cycle(coin, cycle_ts)
+                try:
+                    market_data = await asyncio.to_thread(
+                        self._gamma_client.get_market_by_slug, slug
+                    )
+                    if market_data and market_data.get("closed", False):
+                        winner = self._parse_gamma_winner(market_data)
+                        outcome = self._winner_to_outcome(winner)
+                        if outcome is not None:
+                            entry = OutcomeEntry(
+                                outcome=outcome,
+                                status=ConfirmationStatus.CONFIRMED,
+                                cycle_ts=cycle_ts,
+                                market_slug=slug,
+                                observed_up_ask=0.0,
+                            )
+                            entries.append(entry)
+                            continue
+
+                    # Not closed or no winner yet — record as unknown, queue recheck.
+                    entry = OutcomeEntry(
+                        outcome="-",
+                        status=ConfirmationStatus.UNKNOWN,
+                        cycle_ts=cycle_ts,
+                        market_slug=slug,
+                        observed_up_ask=0.0,
+                    )
+                    entries.append(entry)
+                    self._queue_outcome_recheck(coin, cycle_ts, slug)
+
+                except Exception as exc:
+                    log(f"  Warm-start {coin} {slug}: {exc}", "warning")
+                    entry = OutcomeEntry(
+                        outcome="-",
+                        status=ConfirmationStatus.UNKNOWN,
+                        cycle_ts=cycle_ts,
+                        market_slug=slug,
+                        observed_up_ask=0.0,
+                    )
+                    entries.append(entry)
+                    self._queue_outcome_recheck(coin, cycle_ts, slug)
+
+            # Fill history deque (oldest first = natural append order).
+            for e in entries:
+                self._outcome_history[coin].append(e)
+                self._last_inference_ts[coin] = e.cycle_ts
+
+            confirmed = sum(1 for e in entries if e.status == ConfirmationStatus.CONFIRMED)
+            hist_str = self._history_values(entries)
+            log(
+                f"  {coin} warm-start: [{hist_str}] ({confirmed}/{len(entries)} confirmed)",
+                "success" if confirmed == len(entries) else "info",
+            )
+
+        log("Warm-start complete.", "success")
 
     # ------------------------------------------------------------------
     # Callbacks

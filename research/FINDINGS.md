@@ -1,6 +1,6 @@
 # Research Findings — Polymarket 5-Min Up/Down Markets
 
-> **Last updated**: 2026-03-03 (Session 4 — Telonex 73-day backtest destroys edge hypothesis)
+> **Last updated**: 2026-03-03 (Session 5 — Exhaustive Bonferroni pattern scan, OOS robustness suite, Gamma-confirmed inference)
 > **Data**: ~130,000 rows | 471 cycles | 3 days (self-collected) + **60,605 markets / 74 days (Telonex)**
 > **Coins**: BTC, ETH, SOL, XRP
 > **Market type**: Binary 5-minute Up/Down (ERC-1155 tokens on Polygon)
@@ -32,7 +32,8 @@
 20. [Session 3: Kelly Post-Mortem](#20-session-3-kelly-post-mortem) **NEW**
 21. [Late Entry Calibration Study](#21-late-entry-calibration-study)
 22. [Binance Volatility & Time Regime Analysis](#22-binance-volatility--time-regime-analysis)
-23. [Telonex 73-Day Backtest — The Definitive Answer](#23-telonex-73-day-backtest--the-definitive-answer) **NEW — CRITICAL**
+23. [Telonex 73-Day Backtest — The Definitive Answer](#23-telonex-73-day-backtest--the-definitive-answer)
+24. [Session 5: Exhaustive Pattern Scan, OOS Suite & Gamma-Confirmed Inference](#24-session-5-exhaustive-pattern-scan-oos-suite--gamma-confirmed-inference) **NEW — CRITICAL**
 
 ---
 
@@ -1706,6 +1707,178 @@ Our self-collected data (84 BTC trades) could answer this, but 84 trades is too 
 | Server code path | `~/dual_entry` |
 | Python server | 3.10 |
 | Python local | 3.14 |
+
+---
+
+---
+
+## 24. Session 5: Exhaustive Pattern Scan, OOS Suite & Gamma-Confirmed Inference
+
+> **Date**: 2026-03-03
+> **Key deliverables**: (1) Exhaustive 1,290-test Bonferroni pattern scan, (2) Top-30 OOS robustness suite with multi-holdout + regime validation, (3) Gamma-confirmed outcome inference system with warm-start, (4) Critical outcome inference bugfix
+> **Status**: Live strategy updated and deployed with OOS-robust rule set + Gamma confirmation
+
+### 24.1 Exhaustive Pattern Scan (Bonferroni-Corrected)
+
+**Script**: `research/full_pattern_scan.py`
+
+Ran 1,290 exhaustive tests across all patterns of length 2-6, all 4 coins individually + "ALL" pool, both UP and DOWN sides. Bonferroni-corrected alpha = 0.05 / 1,290 = 0.000039.
+
+**Result**: Only 30 pattern-coin-side combinations survive Bonferroni. **ALL of them are UP-streak -> DOWN mean-reversion.** No DD->UP, no continuation, no alternating patterns survive individual coin-level Bonferroni.
+
+Key survivors (by EV at max_ask=$0.50):
+
+| Strategy | Coin | WR | Max Ask | EV@0.50 | p-value |
+|----------|------|----|---------|---------|---------|
+| UUUUU->DOWN | ETH | 57.4% | $0.535 | +$0.035 | <0.00004 |
+| UUUU->DOWN | ETH | 56.1% | $0.521 | +$0.021 | <0.00004 |
+| UUUUU->DOWN | ALL | 54.6% | $0.508 | +$0.008 | <0.00004 |
+| UUUU->DOWN | ALL | 54.5% | $0.507 | +$0.007 | <0.00004 |
+| UUU->DOWN | ETH | 55.8% | $0.518 | +$0.018 | <0.00004 |
+
+**Critical insight**: "ALL" is a statistical pool, not a cross-coin signal. For live trading, per-coin max_ask caps are more accurate than uniform ALL caps.
+
+### 24.2 Top-30 OOS Robustness Suite
+
+**Script**: `research/top30_oos_suite.py`
+
+Full pipeline: exhaustive scan -> top-30 Bonferroni survivors -> multi-holdout OOS (7/14/21 day holdouts) -> quantile base-rate regime validation -> final survivor scoreboard.
+
+**11 strict survivors** (pass ALL OOS holdouts + >= 2/3 regime bins):
+
+| Strategy | WR | MaxAsk | EV@0.50 | OOS holdouts | Regimes |
+|----------|-----|--------|---------|-------------|---------|
+| ETH UUUU->DOWN | 57.4% | $0.535 | +$0.035 | 3/3 | 3/3 |
+| ALL UUUUU->DOWN | 54.6% | $0.508 | +$0.008 | 3/3 | 3/3 |
+| ALL UUUU->DOWN | 54.5% | $0.507 | +$0.007 | 3/3 | 3/3 |
+| BTC UDUU->DOWN | 54.2% | $0.504 | +$0.004 | 3/3 | 3/3 |
+| ALL UUU->DOWN | 54.0% | $0.502 | +$0.002 | 3/3 | 3/3 |
+
+**Regime robustness**: All surviving patterns maintain WR > base rate across low/mid/high base-rate regimes (quantile terciles). In UP-dominant periods, EV@0.50 can go negative even when WR > base (need tighter max_ask). In DOWN-dominant periods, edge amplifies significantly.
+
+### 24.3 Live Config Update (OOS-Robust Rule Set)
+
+Updated `strategies/mean_reversion.yaml` with 6 rules derived from the OOS suite:
+
+| Rule | Coins | Max Ask | Rationale |
+|------|-------|---------|-----------|
+| UUUUU->DOWN | ETH | $0.54 | Strongest individual coin signal |
+| UUUU->DOWN | ETH | $0.54 | ETH has highest WR at 4-streak |
+| UUUUU->DOWN | BTC, SOL, XRP | $0.51 | Pool survivors, tighter cap |
+| UUUU->DOWN | BTC, SOL, XRP | $0.51 | Pool survivors, tighter cap |
+| UDUU->DOWN | BTC | $0.51 | BTC-specific alternating pattern |
+| UUU->DOWN | ALL | $0.51 | Most frequent signal, modest edge |
+
+Entry window: 1-3s, cancel timeout: 10s, size: $5 flat.
+
+### 24.4 Expected Monthly PnL Model
+
+Based on pattern frequencies in Telonex data:
+- ~112 signals/day across all rules, ~34 fills/day at 30% fill rate
+- EV/share: ~$0.03, size=5 shares -> ~$0.15/trade
+- **~$149/month** at 30% fill rate (optimistic)
+- **~$111/month** conservative (extra entry fee)
+
+### 24.5 Critical Bug Fix: Outcome Inference at Cycle Rollover
+
+**Commit**: `0e7a914`
+
+**The bug**: In `_on_market_change()`, the asks/bids were reset to defaults (`up=1.0`) BEFORE inferring old-cycle outcomes. This caused the inference function to see `up_ask=1.0` (the default placeholder) and classify the outcome as "UP" — regardless of what actually happened.
+
+**Impact**: False UP classifications contaminated pattern histories, creating phantom UP streaks that triggered false DOWN trades.
+
+**Fix**: Three changes:
+1. Infer outcomes BEFORE invalidating ask cache
+2. Added `_up_ask_cycle_seen` dict requiring a fresh WS snapshot before inference
+3. Reject inference when no UP snapshot was received for that cycle
+
+### 24.6 Robust Gamma-Confirmed Outcome Inference System
+
+**Commit**: `d0a4004`
+
+This is the most important infrastructure change of the session. The previous system used WS price thresholds (UP_THRESHOLD=0.95, DOWN_THRESHOLD=0.05) which misclassified ~10-15% of markets decided in the last seconds.
+
+#### The Problem
+
+When the underlying asset price is near the strike, a small move in the last seconds can flip the outcome. The WS data arrives with 50-170ms latency, and at 0.96/0.04 the outcome is NOT certain. Markets where `up_ask` ends at 0.96 sometimes resolve DOWN.
+
+#### The Solution
+
+**Two-tier inference with Gamma API ground truth:**
+
+1. **WS inference (immediate, provisional)**: Only classify when `up_ask >= 0.99` (UP) or `up_ask <= 0.01` (DOWN). These thresholds represent near-absolute certainty — the market makers have consensus-priced the outcome.
+
+2. **Ambiguous outcomes**: When ask is between 0.01 and 0.99, record as `-` (unknown). This immediately breaks any pattern chain, preventing trades on uncertain history.
+
+3. **Gamma API recheck (async, ~3.5 min delay)**: Every recorded outcome (including provisionals) is queued for verification against Gamma API (`GET /markets/slug/{slug}`). When `closed=true` and `outcomePrices` resolves, the entry is upgraded to CONFIRMED.
+
+4. **Retry logic**: If Gamma hasn't closed the market yet, retry every 5 minutes until confirmed. All outcomes are eventually confirmed.
+
+5. **Pattern matching gate**: For a pattern of length N (e.g., UUU), at least the first N-1 outcomes MUST be CONFIRMED by Gamma before a trade is allowed. The last outcome (the trigger) can be provisional or confirmed.
+
+6. **Correction detection**: If Gamma confirms a different outcome than the WS inference, the entry is corrected and logged as a warning.
+
+#### TUI Color Coding
+
+- **White** (`\033[97m`): Provisional or unknown — not yet verified by Gamma
+- **Orange** (`\033[38;5;214m`): Confirmed by Gamma API — ground truth verified
+
+#### Data Structures
+
+```python
+class ConfirmationStatus(Enum):
+    PROVISIONAL = "PROVISIONAL"   # WS inference, not yet verified
+    CONFIRMED = "CONFIRMED"       # Gamma API verified
+    UNKNOWN = "UNKNOWN"           # Ambiguous WS, awaiting Gamma
+
+@dataclass
+class OutcomeEntry:
+    outcome: str                  # "U", "D", or "-"
+    status: ConfirmationStatus
+    cycle_ts: int
+    market_slug: str
+    observed_up_ask: float
+```
+
+The `_outcome_history` deque now stores `OutcomeEntry` objects instead of plain strings.
+
+### 24.7 Warm-Start: Pre-Fill History from Gamma API
+
+**Commit**: (this session)
+
+Eliminates the 25-minute cold-start window where the bot has no pattern data. At startup:
+
+1. Calculate the previous 6 cycle timestamps (each 5 min apart) from the current active market
+2. For each (coin, cycle_ts), query Gamma API for the market resolution
+3. If `closed=true` with resolved `outcomePrices`: store as CONFIRMED (orange in TUI)
+4. If not closed yet (e.g., immediately preceding cycle): store as `-` UNKNOWN and queue for async Gamma recheck
+5. Load into `_outcome_history` oldest-first
+
+**Result**: The bot can start trading on valid patterns from the very first cycle, rather than waiting 25+ minutes to accumulate 5 outcomes via WS observation.
+
+### 24.8 Research Pipeline Scripts
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `research/full_pattern_scan.py` | Exhaustive pattern scanner: all lengths 2-6, all coins, Bonferroni, OOS holdout, date filters | **UPDATED** |
+| `research/top30_oos_suite.py` | Full pipeline: scan -> top-N -> multi-holdout OOS -> regime validation -> scoreboard | **NEW** |
+| `research/base_regime_validation.py` | Tests patterns across base-rate regimes (fixed + quantile bins) | **NEW** |
+
+### 24.9 Key Lessons from This Session
+
+1. **UD->DOWN collapsed from 70% WR (255 cycles) to 49% (15,190 cycles in Telonex)**. This was the most dramatic edge decay observed. Never trust small-sample backtests.
+
+2. **All surviving patterns after Bonferroni are UP-streak -> DOWN mean-reversion.** No continuation, no alternating, no DOWN-streak patterns survive. The market microstructure creates a specific mean-reversion signature only after UP streaks.
+
+3. **ETH is the strongest individual coin for mean-reversion patterns.** UUUU->DOWN at 57.4% WR on ETH is the single best OOS-robust signal.
+
+4. **Asia morning 92% WR (n=12) shrunk to 50.8% WR (n=701) with Telonex data.** Hour-of-day filters do not survive larger datasets.
+
+5. **Late entry strategy is DEAD.** Market maker is well-calibrated at every time point. No alpha from entering late.
+
+6. **10-15% of markets are decided in the last 10 seconds.** WS-based inference at 0.95/0.05 thresholds is unreliable for these. Only >= 0.99 provides near-certainty. Gamma API is the only ground truth.
+
+7. **Pattern chains built on uncertain outcomes are worse than no chains at all.** A single misclassified outcome can trigger a false pattern match and a losing trade.
 
 ---
 
