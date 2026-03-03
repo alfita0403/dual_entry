@@ -69,10 +69,12 @@ TRADE_LOG_FILE = Path(__file__).resolve().parent.parent / "meanrev_trades.txt"
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "mean_reversion.yaml"
 
 # Outcome inference thresholds (applied at t >= INFERENCE_TIME)
-# Last 5 seconds of the 300s cycle — prices are near-settled by then
-INFERENCE_TIME = 295       # seconds into cycle to read outcome
-UP_THRESHOLD = 0.95        # UP ask > this => outcome is UP (near-certain)
-DOWN_THRESHOLD = 0.05      # UP ask < this => outcome is DOWN (near-certain)
+# Last 5 seconds of the 300s cycle — use only near-certain terminal ticks.
+INFERENCE_TIME = 295               # seconds into cycle to read outcome
+CERTAIN_UP_ASK = 0.99             # UP ask >= this => provisional UP
+CERTAIN_DOWN_ASK = 0.01           # UP ask <= this => provisional DOWN
+GAMMA_RECHECK_INITIAL_DELAY = 210  # ~3.5 min after cycle closes
+GAMMA_RECHECK_RETRY_DELAY = 300    # retry every cycle if unresolved
 
 # Max ask price filter — don't buy when ask is too expensive (bad risk/reward)
 DEFAULT_MAX_ASK = 0.60     # only enter if ask <= this
@@ -341,6 +343,21 @@ class CycleState(enum.Enum):
     DONE = "DONE"
 
 
+class ConfirmationStatus(enum.Enum):
+    PROVISIONAL = "PROVISIONAL"
+    CONFIRMED = "CONFIRMED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass
+class OutcomeEntry:
+    outcome: str
+    status: ConfirmationStatus
+    cycle_ts: int
+    market_slug: str
+    observed_up_ask: float
+
+
 # ===================================================================
 # Strategy
 # ===================================================================
@@ -380,7 +397,7 @@ class SequenceStrategy:
         self._cycle_ts: Optional[int] = None
         self._cycle_start_ts: float = 0.0
 
-        # Rolling outcome history per coin: 'U' or 'D'
+        # Rolling outcome history per coin with confirmation status.
         # maxlen=6 supports patterns up to length 6
         self._outcome_history: Dict[str, deque] = {
             c: deque(maxlen=6) for c in COINS
@@ -405,6 +422,13 @@ class SequenceStrategy:
         self._coin_markets: Dict[str, Optional[MarketInfo]] = {
             c: None for c in COINS
         }
+
+        # Outcome confirmation queue (Gamma recheck for every inferred cycle)
+        # key=(coin, cycle_ts), value={"slug": str, "next_check": float}
+        self._pending_outcome_rechecks: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        self._outcome_recheck_inflight: Set[Tuple[str, int]] = set()
+        self._last_outcome_recheck_ts: float = 0.0
+        self._gamma_client = GammaClient()
 
         # Fee cache
         self._fee_rate_cache: Dict[str, int] = {}
@@ -537,7 +561,9 @@ class SequenceStrategy:
         if self.cfg.kelly > 0:
             log(f"  kelly:    {self.cfg.kelly} (streak scaling enabled)")
         log(f"  max_ask:  {self.cfg.max_ask:.2f}")
-        log(f"  infer:    t>={INFERENCE_TIME}s, UP>{UP_THRESHOLD}, DOWN<{DOWN_THRESHOLD}")
+        log(
+            f"  infer:    t>={INFERENCE_TIME}s, UP>={CERTAIN_UP_ASK:.2f}, DOWN<={CERTAIN_DOWN_ASK:.2f}"
+        )
         log(f"  dry_run:  {self.cfg.dry_run}")
         log(f"  log:      {self.log_file}")
         print()
@@ -738,7 +764,7 @@ class SequenceStrategy:
 
         # Log outcome history
         for c in COINS:
-            hist = "".join(self._outcome_history[c])
+            hist = self._history_values(list(self._outcome_history[c]))
             if hist:
                 log(f"  {c} history: [{hist}]", "info")
 
@@ -765,12 +791,113 @@ class SequenceStrategy:
     # ------------------------------------------------------------------
     # Outcome inference from WS prices
     # ------------------------------------------------------------------
-    def _try_infer_outcomes_from_prices(self) -> None:
-        """At end of cycle, infer outcome from UP ask prices.
+    @staticmethod
+    def _slug_for_cycle(coin: str, cycle_ts: int) -> str:
+        return f"{coin.lower()}-updown-5m-{cycle_ts}"
 
-        Called just before entering a new cycle.  For each coin, if the
-        current UP ask is extreme enough (> UP_THRESHOLD or < DOWN_THRESHOLD),
-        record the outcome.
+    @staticmethod
+    def _winner_to_outcome(winner: Optional[str]) -> Optional[str]:
+        if winner == "up":
+            return "U"
+        if winner == "down":
+            return "D"
+        return None
+
+    @staticmethod
+    def _parse_gamma_winner(market_data: Dict[str, Any]) -> Optional[str]:
+        raw_prices = market_data.get("outcomePrices", "[]")
+        raw_outcomes = market_data.get("outcomes", "[]")
+        prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+        outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+
+        for idx, price in enumerate(prices):
+            if str(price) == "1" and idx < len(outcomes):
+                winner = str(outcomes[idx]).lower()
+                if winner in {"up", "down"}:
+                    return winner
+        return None
+
+    def _find_outcome_entry(self, coin: str, cycle_ts: int) -> Optional[OutcomeEntry]:
+        for entry in self._outcome_history[coin]:
+            if entry.cycle_ts == cycle_ts:
+                return entry
+        return None
+
+    def _queue_outcome_recheck(self, coin: str, cycle_ts: int, slug: str) -> None:
+        key = (coin, cycle_ts)
+        if key in self._pending_outcome_rechecks:
+            return
+        self._pending_outcome_rechecks[key] = {
+            "slug": slug,
+            "next_check": time.time() + GAMMA_RECHECK_INITIAL_DELAY,
+        }
+
+    async def _process_outcome_rechecks(self) -> None:
+        if not self._pending_outcome_rechecks:
+            return
+
+        now = time.time()
+        due: List[Tuple[str, int, str]] = []
+        for (coin, cycle_ts), meta in list(self._pending_outcome_rechecks.items()):
+            if (coin, cycle_ts) in self._outcome_recheck_inflight:
+                continue
+            if float(meta.get("next_check", 0.0)) <= now:
+                due.append((coin, cycle_ts, str(meta.get("slug", ""))))
+
+        for coin, cycle_ts, slug in due:
+            key = (coin, cycle_ts)
+            self._outcome_recheck_inflight.add(key)
+            try:
+                entry = self._find_outcome_entry(coin, cycle_ts)
+                if entry is None:
+                    self._pending_outcome_rechecks.pop(key, None)
+                    continue
+
+                market_data = await asyncio.to_thread(
+                    self._gamma_client.get_market_by_slug, slug
+                )
+                if not market_data or not market_data.get("closed", False):
+                    self._pending_outcome_rechecks[key]["next_check"] = now + GAMMA_RECHECK_RETRY_DELAY
+                    continue
+
+                winner = self._parse_gamma_winner(market_data)
+                outcome = self._winner_to_outcome(winner)
+                if outcome is None:
+                    self._pending_outcome_rechecks[key]["next_check"] = now + GAMMA_RECHECK_RETRY_DELAY
+                    continue
+
+                prev = entry.outcome
+                entry.outcome = outcome
+                entry.status = ConfirmationStatus.CONFIRMED
+
+                self._pending_outcome_rechecks.pop(key, None)
+
+                if prev != outcome:
+                    log(
+                        f"  {coin} outcome corrected by Gamma: {prev} -> {outcome} ({slug})",
+                        "warning",
+                    )
+                else:
+                    log(f"  {coin} outcome confirmed by Gamma: {outcome} ({slug})", "info")
+
+            except Exception as exc:
+                if key in self._pending_outcome_rechecks:
+                    self._pending_outcome_rechecks[key]["next_check"] = now + GAMMA_RECHECK_RETRY_DELAY
+                log(f"  Gamma recheck error for {slug}: {exc}", "warning")
+            finally:
+                self._outcome_recheck_inflight.discard(key)
+
+    @staticmethod
+    def _history_values(entries: List[OutcomeEntry]) -> str:
+        return "".join(e.outcome for e in entries)
+
+    def _try_infer_outcomes_from_prices(self) -> None:
+        """At end of cycle, infer provisional outcome from last UP ask.
+
+        Always records one symbol per coin:
+        - U / D when last tick is near-certain
+        - - when ambiguous or missing
+        Every recorded result is then rechecked with Gamma until confirmed.
         """
         if self._cycle_ts is None:
             return
@@ -780,27 +907,64 @@ class SequenceStrategy:
             if self._last_inference_ts[coin] == self._cycle_ts:
                 continue
 
+            cycle_ts = self._cycle_ts
+            slug = self._slug_for_cycle(coin, cycle_ts)
+
             # Require at least one UP snapshot from this cycle.
             # Prevents false inference from default ask placeholders.
-            if self._up_ask_cycle_seen[coin] != self._cycle_ts:
-                log(f"  {coin} outcome UNKNOWN (no fresh UP snapshot), not recorded", "warning")
+            if self._up_ask_cycle_seen[coin] != cycle_ts:
+                entry = OutcomeEntry(
+                    outcome="-",
+                    status=ConfirmationStatus.UNKNOWN,
+                    cycle_ts=cycle_ts,
+                    market_slug=slug,
+                    observed_up_ask=1.0,
+                )
+                self._outcome_history[coin].append(entry)
+                self._last_inference_ts[coin] = cycle_ts
+                self._queue_outcome_recheck(coin, cycle_ts, slug)
+                log(f"  {coin} outcome provisional: - (no fresh UP snapshot)", "warning")
                 continue
 
             up_ask = self._best_asks[coin]["up"]
 
-            if up_ask > UP_THRESHOLD:
-                self._outcome_history[coin].append("U")
-                self._last_inference_ts[coin] = self._cycle_ts
-                log(f"  {coin} outcome inferred: UP (ask={up_ask:.3f})", "trade")
-            elif up_ask < DOWN_THRESHOLD:
-                self._outcome_history[coin].append("D")
-                self._last_inference_ts[coin] = self._cycle_ts
-                log(f"  {coin} outcome inferred: DOWN (ask={up_ask:.3f})", "trade")
+            if up_ask >= CERTAIN_UP_ASK:
+                entry = OutcomeEntry(
+                    outcome="U",
+                    status=ConfirmationStatus.PROVISIONAL,
+                    cycle_ts=cycle_ts,
+                    market_slug=slug,
+                    observed_up_ask=up_ask,
+                )
+                self._outcome_history[coin].append(entry)
+                self._last_inference_ts[coin] = cycle_ts
+                self._queue_outcome_recheck(coin, cycle_ts, slug)
+                log(f"  {coin} outcome provisional: U (ask={up_ask:.3f})", "trade")
+            elif up_ask <= CERTAIN_DOWN_ASK:
+                entry = OutcomeEntry(
+                    outcome="D",
+                    status=ConfirmationStatus.PROVISIONAL,
+                    cycle_ts=cycle_ts,
+                    market_slug=slug,
+                    observed_up_ask=up_ask,
+                )
+                self._outcome_history[coin].append(entry)
+                self._last_inference_ts[coin] = cycle_ts
+                self._queue_outcome_recheck(coin, cycle_ts, slug)
+                log(f"  {coin} outcome provisional: D (ask={up_ask:.3f})", "trade")
             else:
-                # Ambiguous — don't record (breaks pattern chains, which is correct;
-                # we only want high-confidence sequences)
+                entry = OutcomeEntry(
+                    outcome="-",
+                    status=ConfirmationStatus.UNKNOWN,
+                    cycle_ts=cycle_ts,
+                    market_slug=slug,
+                    observed_up_ask=up_ask,
+                )
+                self._outcome_history[coin].append(entry)
+                self._last_inference_ts[coin] = cycle_ts
+                self._queue_outcome_recheck(coin, cycle_ts, slug)
                 log(
-                    f"  {coin} outcome AMBIGUOUS (ask={up_ask:.3f}), not recorded",
+                    f"  {coin} outcome provisional: - (ask={up_ask:.3f}, ambiguous)",
                     "warning",
                 )
 
@@ -830,8 +994,13 @@ class SequenceStrategy:
                 if len(hist) < pattern_len:
                     continue
 
-                recent = "".join(hist[-pattern_len:])
+                recent_entries = hist[-pattern_len:]
+                recent = self._history_values(recent_entries)
                 if recent == rule.pattern:
+                    # Require confirmed history for pattern prefix (N-1 outcomes).
+                    prefix = recent_entries[:-1]
+                    if any(e.status != ConfirmationStatus.CONFIRMED for e in prefix):
+                        continue
                     matches.append((coin, rule))
                     break  # First matching rule wins per coin
 
@@ -870,7 +1039,7 @@ class SequenceStrategy:
             limit_price = rule.max_ask
             trade_size = self.cfg.size
 
-            hist_str = "".join(self._outcome_history[coin])
+            hist_str = self._history_values(list(self._outcome_history[coin]))
             current_ask = self._best_asks[coin][buy_side]
             log(
                 f"SIGNAL: {coin} [{hist_str}] -> {rule.pattern} -> "
@@ -1272,15 +1441,7 @@ class SequenceStrategy:
                 if not market_data.get("closed", False):
                     continue
 
-                raw_prices = market_data.get("outcomePrices", "[]")
-                raw_outcomes = market_data.get("outcomes", "[]")
-                prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-                outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
-
-                for idx, price in enumerate(prices):
-                    if str(price) == "1" and idx < len(outcomes):
-                        winner = str(outcomes[idx]).lower()
-                        break
+                winner = self._parse_gamma_winner(market_data)
 
                 if winner:
                     log(
@@ -1413,16 +1574,7 @@ class SequenceStrategy:
                 if not market_data or not market_data.get("closed", False):
                     continue
 
-                raw_prices = market_data.get("outcomePrices", "[]")
-                raw_outcomes = market_data.get("outcomes", "[]")
-                prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-                outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
-
-                winner = None
-                for idx, price in enumerate(prices):
-                    if str(price) == "1" and idx < len(outcomes):
-                        winner = str(outcomes[idx]).lower()
-                        break
+                winner = self._parse_gamma_winner(market_data)
                 if not winner:
                     continue
 
@@ -1474,11 +1626,16 @@ class SequenceStrategy:
     async def _tick(self) -> None:
         now = time.time()
 
-        # --- Outcome inference: at t >= 280s of current cycle, read prices ---
+        # --- Outcome inference: near cycle end, read last tick prices ---
         if self._cycle_start_ts > 0:
             cycle_age = now - self._cycle_start_ts
             if cycle_age >= INFERENCE_TIME:
                 self._try_infer_outcomes_from_prices()
+
+        # --- Gamma recheck queue (every 5s) ---
+        if now - self._last_outcome_recheck_ts >= 5.0:
+            self._last_outcome_recheck_ts = now
+            await self._process_outcome_rechecks()
 
         # --- Entry window: place GTC limit orders once ---
         if self.cycle_state == CycleState.ENTRY_WINDOW:
@@ -1594,6 +1751,7 @@ class SequenceStrategy:
         D = Colors.DIM
         X = Colors.RESET
         M = Colors.MAGENTA
+        O = "\033[38;5;214m"
         W = 72
 
         lines: list[str] = []
@@ -1655,13 +1813,30 @@ class SequenceStrategy:
         lines.append(f"  {B}Outcome History{X}")
         for coin in COINS:
             hist = list(self._outcome_history[coin])
-            hist_str = " ".join(hist) if hist else "--"
+            if hist:
+                rendered = []
+                for entry in hist:
+                    if entry.status == ConfirmationStatus.CONFIRMED and entry.outcome in {"U", "D"}:
+                        rendered.append(f"{O}{entry.outcome}{X}")
+                    else:
+                        rendered.append(f"{Colors.WHITE}{entry.outcome}{X}")
+                hist_str = " ".join(rendered)
+            else:
+                hist_str = "--"
+
             # Highlight if pattern matches
             matches = []
             for rule in self.cfg.rules:
                 plen = len(rule.pattern)
-                if len(hist) >= plen and "".join(hist[-plen:]) == rule.pattern:
-                    matches.append(f"{rule.pattern}->{rule.buy_side[0].upper()}")
+                if len(hist) < plen:
+                    continue
+                recent_entries = hist[-plen:]
+                recent = self._history_values(recent_entries)
+                if recent != rule.pattern:
+                    continue
+                if any(e.status != ConfirmationStatus.CONFIRMED for e in recent_entries[:-1]):
+                    continue
+                matches.append(f"{rule.pattern}->{rule.buy_side[0].upper()}")
 
             match_tag = ""
             if matches:
@@ -1835,7 +2010,7 @@ class SequenceStrategy:
         print()
         print("  Final outcome history:")
         for coin in COINS:
-            hist = " ".join(self._outcome_history[coin])
+            hist = " ".join(entry.outcome for entry in self._outcome_history[coin])
             print(f"    {coin:>4}: [{hist}]")
 
         if self._all_positions:
