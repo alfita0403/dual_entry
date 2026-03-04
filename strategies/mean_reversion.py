@@ -667,9 +667,14 @@ class SequenceStrategy:
             prev_cycle_ts = self._cycle_ts
             self._maybe_enter_cycle(coin, market)
 
-            # If cycle did not advance, this was a refresh/reconnect.
-            # Invalidate this coin cache to avoid stale local book values.
+            # If cycle did not advance, this coin switched to the same cycle.
+            # Before resetting cache, try late inference for this coin's
+            # PREVIOUS cycle outcome (it may have been a dash because the
+            # first coin triggered _maybe_enter_cycle before this coin had data).
             if self._cycle_ts == prev_cycle_ts:
+                self._try_late_inference_for_coin(coin)
+
+                # Now invalidate this coin cache to avoid stale local book values.
                 self._best_asks[coin] = {"up": 1.0, "down": 1.0}
                 self._best_bids[coin] = {"up": 0.0, "down": 0.0}
                 self._up_ask_cycle_seen[coin] = None
@@ -726,15 +731,21 @@ class SequenceStrategy:
         # --- New cycle ---
         old_cycle_ts = self._cycle_ts  # save for REST book confirm
 
+        # Preserve old markets for ALL coins before anything overwrites them.
+        # The triggering coin was already overwritten in _on_market_change,
+        # but the others may still point to the old cycle.
+        if old_cycle_ts is not None:
+            for c in COINS:
+                m = self._coin_markets.get(c)
+                if m and m.start_timestamp() == old_cycle_ts:
+                    self._old_cycle_markets[c] = m
+
         # Before entering new cycle, try to infer outcomes from old cycle
         self._try_infer_outcomes_from_prices()
         # Upgrade provisional outcomes using residual WS bids (before cache reset)
         self._try_confirm_from_book()
 
         # Collect old token IDs for REST book confirmation (before reset).
-        # The triggering coin's market was already overwritten by
-        # _on_market_change → use _old_cycle_markets.  Other coins may
-        # still point to the old cycle in _coin_markets.
         old_token_ids: Dict[str, Dict[str, str]] = {}
         if old_cycle_ts is not None:
             for c in COINS:
@@ -1053,10 +1064,6 @@ class SequenceStrategy:
             return
 
         for coin in COINS:
-            # Need fresh book data from this cycle
-            if self._up_ask_cycle_seen[coin] != self._cycle_ts:
-                continue
-
             entry = self._find_outcome_entry(coin, self._cycle_ts)
             if entry is None:
                 continue
@@ -1065,6 +1072,8 @@ class SequenceStrategy:
             if entry.status == ConfirmationStatus.CONFIRMED:
                 continue
 
+            # Check bids — no need for _up_ask_cycle_seen gate here since
+            # we're checking bids (not asks) and any non-default bid is useful.
             up_bid = self._best_bids[coin]["up"]
             down_bid = self._best_bids[coin]["down"]
 
@@ -1086,6 +1095,71 @@ class SequenceStrategy:
                     + (f" [was {prev}]" if prev != "D" else ""),
                     "trade",
                 )
+
+    def _try_late_inference_for_coin(self, coin: str) -> None:
+        """Late inference for a single coin that switched after the cycle already advanced.
+
+        When coin A triggers _maybe_enter_cycle, coins B/C/D may not have had
+        WS data yet, producing dashes.  When those coins' _on_market_change fires
+        later (same cycle), they still have their old cached asks/bids.  Use them
+        to upgrade the dash before the cache is reset.
+        """
+        if self._cycle_ts is None:
+            return
+
+        # Find the PREVIOUS cycle's outcome entry for this coin.
+        # We need the cycle_ts from the outcome that was just recorded as a dash.
+        # It's the most recent entry in history for this coin.
+        hist = list(self._outcome_history[coin])
+        if not hist:
+            return
+
+        entry = hist[-1]
+        # Only upgrade if it's still a dash/unknown
+        if entry.outcome != "-" and entry.status != ConfirmationStatus.UNKNOWN:
+            return
+
+        # Try bid-based confirmation first (most reliable)
+        up_bid = self._best_bids[coin]["up"]
+        down_bid = self._best_bids[coin]["down"]
+
+        if up_bid >= BOOK_CONFIRM_BID:
+            entry.outcome = "U"
+            entry.status = ConfirmationStatus.BOOK_CONFIRMED
+            log(
+                f"  {coin} late book-confirmed: U (UP bid={up_bid:.3f})",
+                "trade",
+            )
+            return
+        if down_bid >= BOOK_CONFIRM_BID:
+            entry.outcome = "D"
+            entry.status = ConfirmationStatus.BOOK_CONFIRMED
+            log(
+                f"  {coin} late book-confirmed: D (DOWN bid={down_bid:.3f})",
+                "trade",
+            )
+            return
+
+        # Try ask-based provisional inference
+        up_ask = self._best_asks[coin]["up"]
+        if up_ask == 1.0 and self._up_ask_cycle_seen[coin] is None:
+            # No real data — can't infer
+            return
+
+        if up_ask >= CERTAIN_UP_ASK:
+            entry.outcome = "U"
+            entry.status = ConfirmationStatus.PROVISIONAL
+            log(
+                f"  {coin} late inferred: U (ask={up_ask:.3f})",
+                "trade",
+            )
+        elif up_ask <= CERTAIN_DOWN_ASK:
+            entry.outcome = "D"
+            entry.status = ConfirmationStatus.PROVISIONAL
+            log(
+                f"  {coin} late inferred: D (ask={up_ask:.3f})",
+                "trade",
+            )
 
     # ------------------------------------------------------------------
     # REST-based book confirmation (async, runs in background at cycle start)
@@ -1147,7 +1221,7 @@ class SequenceStrategy:
 
         # Re-check patterns — if new matches appeared, enter trade window.
         cycle_age = time.time() - self._cycle_start_ts
-        if cycle_age <= self.cfg.entry_window_end + 1:
+        if cycle_age <= self.cfg.entry_window_end + 5:
             matches = self._find_pattern_matches()
             if matches and self.cycle_state == CycleState.OBSERVING:
                 match_strs = [
