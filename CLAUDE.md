@@ -46,8 +46,9 @@ python strategies/stat_arb.py --spread 0.15 --target 0.15 --timeout 20 --size 10
 python strategies/stat_arb.py --dry-run --name "test_config"
 
 # Run research analysis
-python research/autocorrelation.py     # Outcome sequence analysis
-python research/research_v3.py         # Hypothesis-driven strategy tests
+python research/backtest.py --custom                    # Backtest all custom rules
+python research/backtest.py --pattern DDDDD --coin ETH  # Single pattern test
+python research/full_pattern_scan.py                    # Discover new patterns
 
 # Data collection (runs 24/7 on server)
 python scripts/data_collector.py

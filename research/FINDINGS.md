@@ -448,8 +448,8 @@ At 400ms latency, strategies must rely on signals persisting 5+ seconds.
 
 | File | Purpose |
 |------|---------|
-| `strategies/mean_reversion.py` | Live trading bot (~2550 lines). RSI filter, drawdown protection, multi-pattern rules, Gamma inference |
-| `strategies/mean_reversion.yaml` | Live config: 6 rules, RSI filter, drawdown settings |
+| `strategies/mean_reversion.py` | Live trading bot (~2550 lines). Drawdown protection, multi-pattern rules, Gamma inference |
+| `strategies/mean_reversion.yaml` | Live config: 8 bidirectional rules, all max_ask=0.51, RSI disabled |
 
 ### Core Research
 
@@ -457,44 +457,17 @@ At 400ms latency, strategies must rely on signals persisting 5+ seconds.
 |------|---------|
 | `research/backtest.py` | **Main backtester**. Runs YAML configs on Telonex + CSV data. `--pattern UUU` for single-pattern analysis, `--coin ETH`, per-cycle equity curves, strategy presets. Look-ahead bias in RSI fixed (Session 8). |
 | `research/full_pattern_scan.py` | Exhaustive 1,290-test Bonferroni pattern scanner |
-| `research/top30_oos_suite.py` | Full pipeline: scan → top-30 → multi-holdout OOS → regime validation |
 | `research/base_regime_validation.py` | Tests patterns across base-rate regimes (quantile bins) |
-| `research/configurable_backtest.py` | User-friendly backtester with editable config section + equity curve plot |
-
-### Indicator & Regime Research
-
-| File | Purpose | Verdict |
-|------|---------|---------|
-| `research/rsi_multi_timeframe.py` | RSI period + timeframe grid search | **RSI(7) 5m is optimal** |
-| `research/indicators_multi_timeframe.py` | 5 indicators x 5 timeframes + combos | RSI dominates |
-| `research/technical_indicators_telonex.py` | RSI/BB/MACD/Stoch/Vol vs outcomes | Monotonic RSI relationship found |
-| `research/edge_stability_telonex.py` | 74-day rolling stability analysis | Edge stable/strengthening |
-| `research/regime_choppy_telonex.py` | Choppy regime test | **DEAD** (51.3% WR at n=4082) |
-| `research/regime_vol_telonex.py` | Volatility & session regime test | **DEAD** |
-| `research/four_hypotheses_telonex.py` | Cross-coin divergence, streak speed, weekday, post-loss autocorr | Only post-loss significant |
+| `research/edge_stability_telonex.py` | 74-day rolling stability analysis — edge stable/strengthening |
+| `research/four_hypotheses_telonex.py` | Cross-coin divergence, streak speed, weekday, post-loss autocorrelation |
 
 ### Analysis & Validation
 
 | File | Purpose |
 |------|---------|
-| `research/_analyze_trades.py` | Live trade log analyzer with RSI simulation + Gamma resolution |
-| `research/backtest_realdata.py` | Backtester using self-collected CSV data (5 days) |
+| `research/_analyze_trades.py` | Live trade log analyzer with Gamma resolution |
 | `research/streak_overlap_analysis.py` | Overlapping pattern rule analysis (+$572 over 74d) |
 | `research/fill_rate_simulation.py` | Optimal max_ask vs fill rate simulation |
-
-### Earlier Research (Historical)
-
-| File | Purpose | Status |
-|------|---------|--------|
-| `research/telonex_backtest.py` | Pattern analysis on Telonex (pre-backtest.py) | Superseded by `backtest.py` |
-| `research/autocorrelation.py` | Outcome sequence dependence (255 cycles) | Superseded by Telonex |
-| `research/backtest_patterns.py` | Pattern backtester (255-471 cycles) | Superseded by `backtest.py` |
-| `research/trend_check.py` | Spot momentum vs pattern edge decomposition | Finding absorbed into RSI filter |
-| `research/regime_analysis.py` | Regime detection (471 cycles) | Superseded by Telonex regime tests |
-| `research/research_v3.py` | Hypothesis-driven, 7 strategies, all negative | Historical reference |
-| `research/research_v2.py` | Grid search, 14-fold CV | Superseded |
-| `research/research_v1.py` | Original grid search | Superseded |
-| `research/late_entry.py` | Late-entry calibration study | **DEAD** — MM well-calibrated |
 
 ### Data Files
 
@@ -505,7 +478,8 @@ At 400ms latency, strategies must rely on signals persisting 5+ seconds.
 | `data/prices_YYYY-MM-DD.csv` | Self-collected orderbook data (24/7 on server) |
 | `data/meanrev_trades.txt` | Live trade log |
 | `research/resolution_cache.json` | Gamma API resolution cache |
-| `research/binance_*_cache*.json` | Cached Binance klines (various timeframes) |
+| `research/binance_klines_cache_bt.json` | Binance klines cache for backtest.py |
+| `research/binance_klines_74d.json` | Full 74-day Binance kline dataset |
 
 ### Scripts
 
