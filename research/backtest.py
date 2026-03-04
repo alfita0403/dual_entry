@@ -3,7 +3,8 @@ backtest.py — One-command backtester with equity curve comparison.
 
 Two data modes:
   --csv   : Use your own scraped 1-second CSVs (data/prices_*.csv)
-            Real entry prices, real max_ask filter, real outcomes.
+            Real entry prices per side (UP_ask for UP bets, DOWN_ask for DOWN bets),
+            real max_ask filter (NO FILL if ask > max_ask), real outcomes.
   (default): Use Telonex 74-day parquet (outcomes only, assumes entry at max_ask)
 
 Usage:
@@ -107,26 +108,26 @@ COINS = ["BTC", "ETH", "SOL", "XRP"]
 
 # Default rules (from mean_reversion.yaml — must stay in sync!)
 DEFAULT_RULES = [
-    {"pattern": "UUUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.54},
+    {"pattern": "UUUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.56},
     {
         "pattern": "UUUUU",
         "side": "DOWN",
         "coins": ["BTC", "SOL", "XRP"],
-        "max_ask": 0.51,
+        "max_ask": 0.56,
     },
-    {"pattern": "UUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.54},
+    {"pattern": "UUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.56},
     {
         "pattern": "UUUU",
         "side": "DOWN",
         "coins": ["BTC", "SOL", "XRP"],
-        "max_ask": 0.51,
+        "max_ask": 0.56,
     },
-    {"pattern": "UDUU", "side": "DOWN", "coins": ["BTC"], "max_ask": 0.50},
+    {"pattern": "UDUU", "side": "DOWN", "coins": ["BTC"], "max_ask": 0.56},
     {
         "pattern": "UUU",
         "side": "DOWN",
         "coins": ["BTC", "ETH", "SOL", "XRP"],
-        "max_ask": 0.49,
+        "max_ask": 0.56,
     },
 ]
 
@@ -340,14 +341,15 @@ def csv_build_cycles(raw: pd.DataFrame):
     """Build per-coin outcome sequences + entry prices from CSV data.
 
     Outcomes are resolved via Gamma API (100% ground truth), cached locally.
-    Entry prices are real DOWN asks at t=5-8s of each cycle.
+    Entry prices are real asks at t=5-8s (UP_ask for UP bets, DOWN_ask for DOWN).
     """
     cycle_groups = list(raw.groupby("cycle_start"))
     cycle_groups.sort(key=lambda x: x[0])
 
     cache = _load_resolution_cache()
     coin_data = {
-        c: {"outcomes": [], "dates": [], "start_ts": [], "entry_ask": []} for c in COINS
+        c: {"outcomes": [], "dates": [], "start_ts": [], "up_ask": [], "down_ask": []}
+        for c in COINS
     }
 
     api_calls = 0
@@ -398,19 +400,25 @@ def csv_build_cycles(raw: pd.DataFrame):
                 outcome = None
                 n_unknown += 1
 
-            # --- Entry price: DOWN ask = 1 - UP bid ---
-            entry_ask = np.nan
+            # --- Entry prices: UP ask and DOWN ask (= 1 - UP bid) ---
+            up_ask_val = np.nan
+            down_ask_val = np.nan
             if len(entry) >= 1:
+                up_ask_col = f"{cl}_up_ask"
                 up_bid_col = f"{cl}_up_bid"
+                avg_up_ask = entry[up_ask_col].mean()
                 avg_up_bid = entry[up_bid_col].mean()
+                if 0.01 < avg_up_ask < 0.99:
+                    up_ask_val = round(avg_up_ask, 4)
                 down_ask = 1.0 - avg_up_bid
                 if 0.01 < down_ask < 0.99:
-                    entry_ask = round(down_ask, 4)
+                    down_ask_val = round(down_ask, 4)
 
             coin_data[coin]["outcomes"].append(outcome)
             coin_data[coin]["dates"].append(cycle_date)
             coin_data[coin]["start_ts"].append(cycle_ts)
-            coin_data[coin]["entry_ask"].append(entry_ask)
+            coin_data[coin]["up_ask"].append(up_ask_val)
+            coin_data[coin]["down_ask"].append(down_ask_val)
 
     _save_resolution_cache(cache)
     total = n_resolved + n_unknown
@@ -429,7 +437,8 @@ def csv_build_cycles(raw: pd.DataFrame):
             "outcomes": d["outcomes"],
             "dates": d["dates"],
             "start_ts": d["start_ts"],
-            "entry_ask": d["entry_ask"],
+            "up_ask": d["up_ask"],
+            "down_ask": d["down_ask"],
             "n": len(d["outcomes"]),
         }
     return seqs
@@ -439,7 +448,7 @@ def find_trades_csv(seqs, rules, size=5.0, fee=0.0):
     """Find trades using CSV data with REAL entry prices.
 
     Key differences from Telonex mode:
-    - Uses actual DOWN ask at t=5-8 as entry price (not max_ask)
+    - Uses actual ask at t=5-8 as entry price (UP_ask for UP bets, DOWN_ask for DOWN bets)
     - Applies max_ask filter against real price
     - PnL uses real entry price (price improvement if ask < max_ask)
     - None outcomes break pattern chains
@@ -449,7 +458,8 @@ def find_trades_csv(seqs, rules, size=5.0, fee=0.0):
         outcomes = d["outcomes"]
         dates = d["dates"]
         ts_arr = d["start_ts"]
-        asks = d["entry_ask"]
+        up_asks = d["up_ask"]
+        down_asks = d["down_ask"]
         n = d["n"]
 
         for i in range(1, n):
@@ -474,8 +484,9 @@ def find_trades_csv(seqs, rules, size=5.0, fee=0.0):
                 if not match:
                     continue
 
-                # Get real entry price
-                entry_ask = asks[i]
+                # Get real entry price for the CORRECT side
+                side = rule["side"]
+                entry_ask = up_asks[i] if side == "UP" else down_asks[i]
                 if np.isnan(entry_ask):
                     break  # no price data, skip
 
@@ -484,7 +495,6 @@ def find_trades_csv(seqs, rules, size=5.0, fee=0.0):
                     break  # too expensive, skip (first matching rule, so break)
 
                 # Trade executes at real entry_ask (price improvement!)
-                side = rule["side"]
                 actual = outcomes[i]
                 hit = (side == "DOWN" and actual == "D") or (
                     side == "UP" and actual == "U"
@@ -1725,7 +1735,7 @@ def main():
 
         has_entry_ask = "entry_ask" in best_trades.columns
         if has_entry_ask:
-            print(f"\n  Entry price stats (real DOWN ask at t=5-8s):")
+            print(f"\n  Entry price stats (real ask at t=5-8s, side-aware):")
             print(
                 f"  {'Pattern':<8} {'Trades':>7} {'WR':>6} {'PnL':>10} {'AvgAsk':>8} {'MinAsk':>8} {'MaxAsk':>8}"
             )
