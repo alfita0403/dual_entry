@@ -225,38 +225,32 @@ class TestYAMLConfig:
         assert cfg.dd_cooldown_minutes == 30.0
 
     def test_loads_maxask_055(self):
-        """YAML should have max_ask=0.55 for all rules (raised from 0.51)."""
+        """YAML should have max_ask=0.55 for all 5 ETH-only rules."""
         cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
-        # All 7 rules use max_ask 0.55
-        assert len(cfg.rules) == 7
+        assert len(cfg.rules) == 5
         for r in cfg.rules:
             assert r.max_ask == 0.55, (
                 f"Rule {r.pattern} has max_ask={r.max_ask}, expected 0.55"
             )
+            assert r.coins == ["ETH"], (
+                f"Rule {r.pattern} has coins={r.coins}, expected ['ETH']"
+            )
 
     def test_bidirectional_rules(self):
-        """YAML should have both UP and DOWN side rules."""
+        """YAML should have both UP and DOWN side rules, all ETH."""
         cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
 
-        # DOWN-streak reversals bet UP: DDDDD, DDDD, DDD (all ETH)
+        # DOWN-streak reversals bet UP: DDDDD, DDDD, DDD
         up_rules = [r for r in cfg.rules if r.buy_side == "up"]
         assert len(up_rules) == 3
         up_patterns = sorted([r.pattern for r in up_rules])
         assert up_patterns == ["DDD", "DDDD", "DDDDD"]
-        for r in up_rules:
-            assert r.coins == ["ETH"]
 
-        # UP-streak reversals bet DOWN: UUUU(ETH), UUUU(BTC/SOL/XRP), UUU(ETH), UUU(BTC/SOL/XRP)
+        # UP-streak reversals bet DOWN: UUUU, UUU
         dn_rules = [r for r in cfg.rules if r.buy_side == "down"]
-        assert len(dn_rules) == 4
-        eth_uuuu = next(
-            r for r in dn_rules if r.pattern == "UUUU" and "ETH" in (r.coins or [])
-        )
-        assert eth_uuuu.max_ask == 0.55
-        others_uuuu = next(
-            r for r in dn_rules if r.pattern == "UUUU" and "BTC" in (r.coins or [])
-        )
-        assert set(others_uuuu.coins or []) == {"BTC", "SOL", "XRP"}
+        assert len(dn_rules) == 2
+        dn_patterns = sorted([r.pattern for r in dn_rules])
+        assert dn_patterns == ["UUU", "UUUU"]
 
     def test_rules_sorted_longest_first(self):
         """Rules should be sorted by pattern length (longest first)."""

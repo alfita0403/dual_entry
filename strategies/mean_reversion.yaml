@@ -1,10 +1,10 @@
 # Mean-Reversion Strategy Config (LIVE)
 #
-# Bidirectional: bets DOWN after UP streaks, UP after DOWN streaks.
-# All patterns Bonferroni-significant on Telonex 74-day dataset.
-# max_ask values raised from 0.51 to 0.55 based on CSV backtest with
-# real prices — at 0.51 all patterns lose due to insufficient fills.
-# No indicator filters (RSI proven useless after look-ahead bias fix).
+# ETH-only, bidirectional: bet DOWN after UP streaks, UP after DOWN streaks.
+# All 5 patterns Bonferroni-significant on Telonex 74-day dataset.
+# BTC/SOL/XRP removed: 53% WR below 55% breakeven, net -$530 on Telonex.
+# max_ask=0.55 — all 5 ETH patterns profitable on Telonex (+$400/74d)
+# and CSV real prices (+$35/5d, avg entry $0.50-0.54).
 #
 # Execution model:
 # - Place GTC limit at max_ask around t=1s
@@ -32,51 +32,39 @@ drawdown_protection:
 
 rules:
   # ---------------------------------------------------------------
-  # DOWN-streak reversals (bet UP)
+  # DOWN-streak reversals (bet UP) — ETH only
   # ---------------------------------------------------------------
 
-  # DDDDD->UP ETH (60.3% WR Telonex, 62.5% WR CSV@0.55, N=292)
+  # DDDDD->UP ETH (60.3% WR Telonex, 61.5% CSV@0.55, N=292)
   - pattern: "DDDDD"
     side: "UP"
     coins: ["ETH"]
     max_ask: 0.55
 
-  # DDDD->UP ETH (58.3% WR Telonex, 54.5% WR CSV@0.55, N=701)
+  # DDDD->UP ETH (58.3% WR Telonex, 54.5% CSV@0.55, N=701)
   - pattern: "DDDD"
     side: "UP"
     coins: ["ETH"]
     max_ask: 0.55
 
-  # DDD->UP ETH (55.6% WR Telonex, 54.8% WR CSV@0.57, N=1580)
+  # DDD->UP ETH (55.6% WR Telonex, 53.3% CSV@0.55, N=1580)
   - pattern: "DDD"
     side: "UP"
     coins: ["ETH"]
     max_ask: 0.55
 
   # ---------------------------------------------------------------
-  # UP-streak reversals (bet DOWN)
+  # UP-streak reversals (bet DOWN) — ETH only
   # ---------------------------------------------------------------
 
-  # UUUU->DOWN ETH (57.4% WR Telonex, 58.8% WR CSV@0.54, N=751)
+  # UUUU->DOWN ETH (57.4% WR Telonex, 57.1% CSV@0.55, N=751)
   - pattern: "UUUU"
     side: "DOWN"
     coins: ["ETH"]
     max_ask: 0.55
 
-  # UUUU->DOWN others (54.5% WR Telonex, CSV too few trades)
-  - pattern: "UUUU"
-    side: "DOWN"
-    coins: ["BTC", "SOL", "XRP"]
-    max_ask: 0.55
-
-  # UUU->DOWN ETH (55.8% WR Telonex, 54.9% WR CSV@0.57, N=1698)
+  # UUU->DOWN ETH (55.8% WR Telonex, 49.1% CSV@0.55, N=1698)
   - pattern: "UUU"
     side: "DOWN"
     coins: ["ETH"]
-    max_ask: 0.55
-
-  # UUU->DOWN others (54.0% WR Telonex, CSV marginal)
-  - pattern: "UUU"
-    side: "DOWN"
-    coins: ["BTC", "SOL", "XRP"]
     max_ask: 0.55
