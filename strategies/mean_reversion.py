@@ -850,13 +850,20 @@ class SequenceStrategy:
         global _tui_active
 
         log("Sequence Pattern Strategy started (4-coin WebSocket)", "success")
-        log(
-            f"  rules:    {', '.join(f'{r.pattern}->BUY {r.buy_side.upper()}' for r in self.cfg.rules)}"
-        )
         log(f"  size:     {self.cfg.size} shares")
         if self.cfg.kelly > 0:
             log(f"  kelly:    {self.cfg.kelly} (streak scaling enabled)")
-        log(f"  max_ask:  {self.cfg.max_ask:.2f}")
+        log(f"  rules ({len(self.cfg.rules)}):")
+        for rule in self.cfg.rules:
+            coins_str = (
+                "ALL"
+                if not rule.coins or set(rule.coins) >= set(COINS)
+                else ",".join(rule.coins)
+            )
+            side_label = "UP" if rule.buy_side == "up" else "DOWN"
+            log(
+                f"    {rule.pattern:<8} {side_label:<5} {coins_str:<12} @{rule.max_ask:.2f}"
+            )
         log(
             f"  infer:    t>={INFERENCE_TIME}s, UP>={CERTAIN_UP_ASK:.2f}, DOWN<={CERTAIN_DOWN_ASK:.2f}"
         )
@@ -2562,10 +2569,6 @@ class SequenceStrategy:
         else:
             dry = ""
 
-        rules_str = ", ".join(
-            f"{r.pattern}->{r.buy_side[0].upper()}" for r in self.cfg.rules
-        )
-
         # RSI indicator
         rsi_val = self._rsi_filter.current_rsi
         if self._rsi_filter.enabled and not np.isnan(rsi_val):
@@ -2590,11 +2593,30 @@ class SequenceStrategy:
             f"   {D}{up_str}{X}"
             f"{rsi_str}{dd_str}"
         )
+
+        # Rules table — grouped by side, one line per rule
         kelly_str = f"  kelly={self.cfg.kelly}" if self.cfg.kelly > 0 else ""
+        n_rules = len(self.cfg.rules)
         lines.append(
-            f"  {D}rules: {rules_str}  size={self.cfg.size}  "
-            f"max_ask={self.cfg.max_ask:.2f}{kelly_str}  cycle #{self.cycles_seen}{X}"
+            f"  {D}Rules ({n_rules})  size=${self.cfg.size:.0f}"
+            f"{kelly_str}  cycle #{self.cycles_seen}{X}"
         )
+        up_rules = [r for r in self.cfg.rules if r.buy_side == "up"]
+        dn_rules = [r for r in self.cfg.rules if r.buy_side == "down"]
+        for rule in up_rules + dn_rules:
+            coins_str = (
+                "ALL"
+                if not rule.coins or set(rule.coins) >= set(COINS)
+                else ",".join(rule.coins)
+            )
+            side_c = G if rule.buy_side == "up" else R
+            side_label = "UP" if rule.buy_side == "up" else "DN"
+            lines.append(
+                f"    {B}{rule.pattern:<8}{X}"
+                f" {side_c}{side_label:<4}{X}"
+                f" {D}{coins_str:<12}{X}"
+                f" {D}@{rule.max_ask:.2f}{X}"
+            )
         hsep()
 
         # --- Outcome history ---
@@ -2686,16 +2708,20 @@ class SequenceStrategy:
             f"   pnl:{pnl_c}{B}${self.session_pnl:+.2f}{X}"
         )
 
-        # Per-pattern breakdown
+        # Per-pattern breakdown (deduplicated — e.g. UUUU appears for ETH and others)
         pattern_parts = []
+        seen_patterns: set[str] = set()
         for rule in self.cfg.rules:
             p = rule.pattern
+            if p in seen_patterns:
+                continue
+            seen_patterns.add(p)
             pw = self.pattern_wins.get(p, 0)
             pl = self.pattern_losses.get(p, 0)
-            pf = self.pattern_fills.get(p, 0)
             pr = pw + pl
             pwr = f"{(pw / pr) * 100:.0f}%" if pr > 0 else "--"
-            pattern_parts.append(f"{p}: {G}{pw}W{X}/{R}{pl}L{X}={pwr}")
+            side_label = "U" if rule.buy_side == "up" else "D"
+            pattern_parts.append(f"{p}->{side_label}: {G}{pw}W{X}/{R}{pl}L{X}={pwr}")
         if pattern_parts:
             lines.append(f"  {D}patterns:{X} " + "  ".join(pattern_parts))
 
@@ -2764,12 +2790,19 @@ class SequenceStrategy:
         print("=" * 60)
         print("  SEQUENCE PATTERN - SESSION SUMMARY")
         print("=" * 60)
-        rules_str = ", ".join(
-            f"{r.pattern}->BUY {r.buy_side.upper()}" for r in self.cfg.rules
-        )
-        print(f"  Rules:         {rules_str}")
         print(f"  Size:          {self.cfg.size}")
         print(f"  Dry run:       {self.cfg.dry_run}")
+        print(f"  Rules ({len(self.cfg.rules)}):")
+        for rule in self.cfg.rules:
+            coins_str = (
+                "ALL"
+                if not rule.coins or set(rule.coins) >= set(COINS)
+                else ",".join(rule.coins)
+            )
+            side_label = "UP" if rule.buy_side == "up" else "DOWN"
+            print(
+                f"    {rule.pattern:<8} {side_label:<5} {coins_str:<12} @{rule.max_ask:.2f}"
+            )
         print(f"  Cycles seen:   {self.cycles_seen}")
         print(f"  Total fills:   {self.total_fills}")
         print(
@@ -2788,17 +2821,27 @@ class SequenceStrategy:
             wr = (self.total_wins / self.total_resolved) * 100
             print(f"  Win rate:      {wr:.1f}%")
 
-        # Pattern breakdown
+        # Pattern breakdown (deduplicated)
         print()
         print("  Per-pattern breakdown:")
+        seen: set[str] = set()
         for rule in self.cfg.rules:
             p = rule.pattern
+            if p in seen:
+                continue
+            seen.add(p)
+            coins_str = (
+                "ALL"
+                if not rule.coins or set(rule.coins) >= set(COINS)
+                else ",".join(rule.coins)
+            )
+            side_label = "UP" if rule.buy_side == "up" else "DOWN"
             pw = self.pattern_wins.get(p, 0)
             pl = self.pattern_losses.get(p, 0)
             pr = pw + pl
             pwr = f"{(pw / pr) * 100:.1f}%" if pr > 0 else "--"
             print(
-                f"    {p} -> BUY {rule.buy_side.upper()}: {pw}W / {pl}L (win rate: {pwr})"
+                f"    {p:<8} {side_label:<5} {coins_str:<12}: {pw}W / {pl}L (WR: {pwr})"
             )
 
         # Coin breakdown
