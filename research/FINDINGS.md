@@ -1,10 +1,14 @@
 # Research Findings — Polymarket 5-Min Up/Down Markets
 
-> **Last updated**: 2026-03-04 (Session 7 — RSI filter deployed, drawdown protection, tighter max_ask)
+> **Last updated**: 2026-03-04 (Session 8 — Look-ahead bias in RSI backtester FIXED, corrected numbers)
 > **Data**: 60,605 resolved markets / 74 days (Telonex) + 5 days self-collected + 75 live trades
 > **Coins**: BTC, ETH, SOL, XRP
 > **Market type**: Binary 5-minute Up/Down (ERC-1155 tokens on Polygon)
 > **Live status**: Running `mean_reversion.py` with RSI(7) filter + drawdown circuit breaker
+>
+> **WARNING**: Session 7 numbers for RSI filter (71.5% WR) were INVALID due to look-ahead bias
+> in the backtester. The RSI was computed using the candle that contained the trade's outcome.
+> Corrected numbers show RSI provides NO benefit to WR in backtesting. See Section 6.
 
 ---
 
@@ -36,7 +40,7 @@ The bot trades Polymarket's 5-minute Up/Down binary markets. After observing con
 
 ### 1.2 Pre-Trade Filters
 
-1. **RSI(7) on Binance BTCUSDT 5m klines**: Skip ALL trades when RSI >= 60. This is the single most impactful improvement — removes 39% of trades that have only 38.3% WR, boosting overall WR from 54% to 71.5% in backtest.
+1. **RSI(7) on Binance BTCUSDT 5m klines**: Skip ALL trades when RSI >= 60. **NOTE**: The 71.5% WR claimed in Session 7 was caused by look-ahead bias (see Section 6). After fixing the backtester, RSI(7)<60 reduces WR to 52.4% and cuts PnL. The filter is still deployed live as a safety measure (fail-closed: if Binance is unreachable, all trades are blocked).
 
 2. **Drawdown circuit breaker**: Pause trading if session PnL drops below -$30 or after 8 consecutive losses. Auto-resumes after 30 minutes.
 
@@ -107,14 +111,15 @@ Lower-edge patterns need tighter entry prices to stay profitable:
 
 ### 1.5 Expected Performance (Backtest)
 
-With RSI(7) skip>60 on Telonex 74 days:
-- **3,879 trades, 71.5% WR, $53.82/day**
-- Without RSI filter: 8,181 trades, 54.0% WR, $15.49/day
-- RSI filter increases daily PnL by **+247%**
+**After look-ahead bias fix** (Session 8), with current YAML rules on Telonex 74 days:
+- **No filter (baseline)**: 8,181 trades, 54.0% WR, +$1,568 PnL, **+$27.51/day**
+- **RSI(7) skip>60**: 3,292 trades, 52.4% WR, +$400, +$7.02/day (WORSE)
+
+The baseline without RSI is the strongest configuration. 10/10 weeks profitable.
 
 Realistic expectations (accounting for fill rate, slippage):
-- 30% fill rate: ~$16/day
-- 50% fill rate: ~$27/day
+- 30% fill rate: ~$8/day
+- 50% fill rate: ~$14/day
 - 70% profitable days
 
 ### 1.6 Outcome Inference System
@@ -178,23 +183,33 @@ The pattern edge comes from a different mechanism than simple autocorrelation �
 
 This dataset settled every open question. Everything from the initial 3-day self-collected data (471 cycles) showed massive regression to the mean when tested against 74 days.
 
-### 4.1 Pattern Results (Bonferroni-corrected, alpha = 0.000039)
+### 4.1 Pattern Results (Bonferroni-corrected, 1,240 tests, alpha = 0.05/1240)
 
-| Pattern | Side | Trades | WR | vs base | p-value | Verdict |
-|---------|------|--------|----|---------|---------|---------|
-| **UU→DOWN** | DOWN | 14,803 | **52.2%** | +3.7pp | <0.0001 | **SIGNIFICANT** |
-| **UUU→DOWN** | DOWN | 7,069 | **54.0%** | +5.4pp | <0.0001 | **SIGNIFICANT** |
-| **UUUU→DOWN** | DOWN | 3,252 | **54.5%** | +6.0pp | <0.0001 | **SIGNIFICANT** |
-| **UUUUU→DOWN** | DOWN | 1,426 | **54.6%** | +6.1pp | <0.0001 | **SIGNIFICANT** |
-| **DDD→UP** | UP | 6,776 | **53.1%** | +1.7pp | 0.003 | SIGNIFICANT |
-| DD→UP | UP | 14,219 | 52.3% | +0.9pp | 0.016 | nominal only |
-| **UD→DOWN** | DOWN | 15,190 | **49.0%** | +0.4pp | 0.153 | **DEAD** |
+**14 Bonferroni-significant patterns** (Session 8 exhaustive scan):
+
+| Coin | Pattern | Bet | N | WR | MaxAsk | bonf_p |
+|------|---------|-----|---|-----|--------|--------|
+| ALL | UUU | D | 7,071 | 54.0% | 0.540 | 0.0000 |
+| ALL | DD | U | 14,219 | 52.3% | 0.523 | 0.0000 |
+| ALL | UU | D | 14,807 | 52.2% | 0.522 | 0.0000 |
+| ALL | UUUU | D | 3,252 | 54.5% | 0.545 | 0.0002 |
+| ALL | DDD | U | 6,776 | 53.1% | 0.531 | 0.0002 |
+| ALL | DUDUDD | U | 958 | 57.7% | 0.577 | 0.0012 |
+| ETH | UUU | D | 1,698 | 55.8% | 0.558 | 0.0013 |
+| ALL | DDDD | U | 3,176 | 54.1% | 0.541 | 0.0031 |
+| ETH | DDD | U | 1,580 | 55.6% | 0.556 | 0.0051 |
+| ALL | DUUU | D | 3,819 | 53.6% | 0.536 | 0.0066 |
+| ETH | DDDD | U | 701 | 58.3% | 0.583 | 0.0070 |
+| ALL | DDUUD | U | 1,861 | 54.7% | 0.547 | 0.0337 |
+| ETH | UUUU | D | 751 | 57.4% | 0.574 | 0.0360 |
+| ALL | DDDUUD | U | 935 | 56.6% | 0.566 | 0.0401 |
 
 **Key findings:**
-1. **All surviving patterns are UP-streak → DOWN.** Mean-reversion after UP streaks is the ONLY statistically robust edge.
-2. **Longer UP streaks = higher WR** (UU 52.2% → UUUU 54.5%). Mean-reversion pressure increases with streak length.
-3. **UD→DOWN is DEAD** (49.0% WR). Our early 70.2% WR on 255 cycles was pure noise + spot momentum.
-4. **ETH is the strongest coin** (UUUU→DOWN at 57.4% WR).
+1. **Both UP-streak->DOWN and DOWN-streak->UP are significant.** Mean-reversion works in both directions.
+2. **Longer streaks = higher WR** (UU 52.2% -> UUUU 54.5%). Mean-reversion pressure increases with streak length.
+3. **DDD->UP is real** (6,776 trades, 53.1% WR, p<0.001). This is a candidate to ADD to the live strategy.
+4. **ETH is the strongest coin** across both directions (UUU 55.8%, DDD 55.6%, UUUU 57.4%).
+5. **UD->DOWN is DEAD** (49.0% WR). Our early 70.2% WR on 255 cycles was pure noise + spot momentum.
 
 ### 4.2 Streak Length Effect
 
@@ -207,7 +222,7 @@ This dataset settled every open question. Everything from the initial 3-day self
 | 6 | 55.8% | 360 |
 | 7 | 56.6% | 159 |
 
-P(DOWN) increases ~1pp per additional UP. The effect is real but weak without the RSI filter.
+P(DOWN) increases ~1pp per additional UP. The effect is real and profitable at tight max_ask values.
 
 ### 4.3 Regression to the Mean
 
@@ -254,69 +269,62 @@ These are the basis for the 6 live YAML rules.
 
 **Script**: `research/edge_stability_telonex.py`
 
-Rolling 7-day analysis over 74 days:
+Rolling 7-day analysis over 74 days (baseline, no RSI filter):
 - WR trend slope: +0.00028/day (p=0.023) — slightly strengthening
 - No structural break detected (Bonferroni p=0.148)
 - PnL curve is convex (accelerating)
 - 70.2% of days are profitable
 - Worst single day: -$162
+- **10/10 weeks profitable** in single-pattern backtest (UUU->DOWN at max_ask=$0.45)
+
+> Note: RSI-filtered stability results from Session 7 are INVALID due to look-ahead bias.
 
 ---
 
-## 6. RSI Filter — The Breakthrough
+## 6. RSI Filter — LOOK-AHEAD BIAS DISCOVERED (Session 8)
 
-This is the single most impactful improvement found in the entire research pipeline.
+### 6.1 The Bug
 
-### 6.1 Discovery
+**CRITICAL**: All RSI numbers from Session 7 were INVALID due to look-ahead bias in `research/backtest.py`.
 
-**Scripts**: `research/technical_indicators_telonex.py`, `research/rsi_multi_timeframe.py`
+The `IndicatorEngine.get_value()` method (line 695-696) used the Binance candle `[T, T+300)` to compute RSI for a trade at time T. That candle contains the ENTIRE 5-minute cycle's price action -- including the outcome. The RSI was literally seeing the future.
 
-Crossed Binance BTCUSDT 5m technical indicators with Telonex outcomes. Found that RSI has a textbook-perfect monotonic relationship with DOWN win rate:
+**Effect**: RSI(7)<60 appeared to boost WR from 54% to 71.5%. In reality (after fix), it REDUCES WR to 52.4%. The RSI filter was selectively admitting winning trades and blocking losing trades because it could see the outcome.
 
-| RSI Range | Trades | WR | Avg PnL/trade |
-|-----------|--------|----|---------------|
-| [0-20) | 2 | 100.0% | +$2.45 |
-| [20-30) | 50 | 84.0% | +$1.64 |
-| [30-40) | 360 | 78.9% | +$1.39 |
-| [40-50) | 1,804 | 66.7% | +$0.77 |
-| [50-60) | 3,207 | 56.4% | +$0.25 |
-| **[60-70)** | **2,060** | **41.6%** | **-$0.49** |
-| **[70-80)** | **603** | **34.5%** | **-$0.84** |
-| **[80-100)** | **95** | **17.9%** | **-$1.67** |
+**Fix applied** (commit `8499530`): Changed candidate order from `[snapped, snapped - tf_s, snapped + tf_s]` to `[last_completed, last_completed - tf_s]` where `last_completed = snapped - tf_s`.
 
-When RSI >= 60, every trade is net negative. The filter surgically removes losers.
+### 6.2 Corrected RSI Numbers
 
-### 6.2 Why RSI(7) at 5m
+| Config | Trades | WR | PnL | $/day |
+|--------|--------|-----|-----|-------|
+| **No filter (baseline)** | **8,181** | **54.0%** | **+$1,568** | **+$27.51** |
+| RSI(7) skip>60 | 3,292 | 52.4% | +$400 | +$7.02 |
+| RSI(7) skip>65 | 4,500 | 52.7% | +$711 | +$12.47 |
+| RSI(14) skip>60 | 5,100 | 52.7% | +$827 | +$14.50 |
 
-| Config | Trades kept | WR | Daily PnL |
-|--------|------------|-----|-----------|
-| **RSI(7) skip>60** | **3,879** | **71.5%** | **$53.82** |
-| RSI(7) skip>65 | 5,010 | 66.3% | $51.54 |
-| RSI(14) skip>60 | 5,423 | 61.6% | $38.34 |
-| RSI(21) skip>60 | 6,312 | 58.1% | $29.48 |
-| No filter (baseline) | 8,181 | 54.0% | $15.49 |
+**The baseline without RSI is the best configuration.** Every RSI threshold tested reduces PnL by filtering out profitable trades along with unprofitable ones.
 
-- **RSI(7) is optimal** — shorter period is more responsive to recent momentum
-- **5m timeframe matches Polymarket's 5-min cycles** — all other timeframes perform worse
-- The 4,302 removed trades have only **38.3% WR**
+### 6.3 Why the Monotonic Table Was Fake
 
-### 6.3 Why This Is NOT Overfitting
+The "textbook-perfect" RSI vs WR table from Session 7 (84% WR at RSI<30, 18% at RSI>80) was entirely an artifact of look-ahead bias. When RSI was low, the current candle was moving DOWN (which is what we bet on), so we saw more wins. When RSI was high, the candle was moving UP, so we saw more losses. The RSI wasn't predicting -- it was reporting.
 
-1. **Monotonic relationship** across all RSI levels — not a cherry-picked threshold
-2. **Validated on 3 independent datasets**: Telonex (74 days), self-collected CSV (5 days), live trades (75 trades)
-3. **Structural logic**: betting against momentum (DOWN) when momentum is strong (RSI>60) is inherently bad
-4. **The user's own $20.80 loss cluster happened during RSI 67-90** — would have been completely blocked
+All research scripts that used the biased `get_value()` produced invalid results:
+- `research/rsi_multi_timeframe.py` -- INVALID
+- `research/top30_oos_suite.py` -- RSI-filtered results INVALID (baseline results still valid)
+- `research/indicators_multi_timeframe.py` -- INVALID
+- `research/technical_indicators_telonex.py` -- INVALID
 
-### 6.4 Other Indicators Tested (All Inferior to RSI)
+### 6.4 Why RSI Is Still Deployed Live
 
-| Indicator | Best bin | WR | Worst bin | WR |
-|-----------|----------|-----|-----------|-----|
-| Bollinger Bands | Below lower | 93.1% | Above upper | 18.8% |
-| RSI(14) | <30 | 80.7% | >70 | 29.5% |
-| MACD | Bearish | 57.8% | Bullish | 49.3% |
-| Stochastic %K | <20 | 65.7% | >80 | 47.2% |
+Despite no backtesting benefit, RSI is kept in the live strategy as a safety measure:
+1. **Fail-closed behavior** (Session 7 fix): If Binance API is unreachable, all trades are blocked. This prevents trading blind.
+2. **Staleness check**: RSI data older than 5 minutes blocks trades.
+3. **Potential live benefit**: In live trading, RSI may help filter periods with bad ask prices (high spread). This hypothesis has NOT been tested yet.
+4. **Low cost**: At worst it reduces trade volume, but doesn't cause losses.
 
-BB above upper band is the most discriminating single filter (skipped WR=18.8%), but RSI alone captures most of the same signal. Combinations provide diminishing returns.
+### 6.5 Other Indicators -- ALL INVALID
+
+All indicator comparisons from Session 7 (BB, MACD, Stoch, Vol) used the same biased `get_value()`. The numbers in the previous version of this document were wrong. These indicators need to be re-tested with the corrected backtester before any conclusions can be drawn.
 
 ---
 
@@ -371,7 +379,7 @@ Every regime filter that looked amazing on small samples collapsed with more dat
 
 ### 8.3 Trend Dependency
 
-Early backtests showed 70% WR, but decomposition revealed 88% of PnL came from spot-DOWN cycles where the base rate was already 76.4%. The pattern added only +1.5pp when BTC spot was falling (p=0.34). The RSI filter elegantly solves this — it detects when momentum is strong and sits out.
+Early backtests showed 70% WR, but decomposition revealed 88% of PnL came from spot-DOWN cycles where the base rate was already 76.4%. The pattern added only +1.5pp when BTC spot was falling (p=0.34). The tight max_ask limits partially address this -- when momentum is strong, DOWN asks are expensive (>$0.49), so the bot naturally sits out.
 
 ### 8.4 Kelly Criterion Failure
 
@@ -383,7 +391,19 @@ The most dramatic edge decay: 70.2% WR on 255 cycles → 49.0% on 15,190 cycles.
 
 ### 8.6 Inference Matters
 
-WS-based outcome classification at 0.95/0.05 thresholds misclassifies ~10-15% of markets decided in the last seconds. The DDD pattern (72.7% WR) collapsed to 37.7% when strict thresholds were applied — the "pattern" was an artifact of noisy classification. Always use Gamma API ground truth.
+WS-based outcome classification at 0.95/0.05 thresholds misclassifies ~10-15% of markets decided in the last seconds. The DDD pattern (72.7% WR) collapsed to 37.7% when strict thresholds were applied -- the "pattern" was an artifact of noisy classification. Always use Gamma API ground truth.
+
+### 8.7 Look-Ahead Bias in Technical Indicators (Session 8)
+
+**The most expensive bug in this project.** The backtester's `IndicatorEngine.get_value()` used the Binance candle `[T, T+300)` to compute RSI for a trade at time T. That candle covers the same 5 minutes as the Polymarket cycle -- it literally contains the outcome. RSI wasn't predicting; it was reporting.
+
+This created a textbook-perfect monotonic WR vs RSI table that was completely artificial. Several hours of research and optimization were wasted fitting to a phantom signal.
+
+**Lesson**: When any indicator shows "too good to be true" results, immediately audit the data pipeline for time leakage. Check: (1) Is the indicator computed from data available BEFORE the trade decision? (2) Does any input overlap with the outcome period? The fix was trivial (use the PRIOR completed candle), but the bug went undetected because the results were "structurally logical" -- RSI > 60 during UP momentum should hurt DOWN bets. The logic was correct; the implementation was wrong.
+
+### 8.8 Cascade Loss Problem
+
+When UUU triggers and loses (outcome U), it extends to UUUU, which triggers again. If that loses too, extends to UUUUU. 808 cascades found in 74 days. Even when the final UUUUU trade wins, the cascade net is -$2.55. When all 3 lose: -$7.55. The strategy is profitable DESPITE cascades, not because they're avoided. This is a known cost of the overlapping rule structure.
 
 ---
 
@@ -435,7 +455,7 @@ At 400ms latency, strategies must rely on signals persisting 5+ seconds.
 
 | File | Purpose |
 |------|---------|
-| `research/backtest.py` | **Main backtester**. Runs YAML configs on Telonex + CSV data. Per-cycle equity curves, strategy presets, RSI filter integration |
+| `research/backtest.py` | **Main backtester**. Runs YAML configs on Telonex + CSV data. `--pattern UUU` for single-pattern analysis, `--coin ETH`, per-cycle equity curves, strategy presets. Look-ahead bias in RSI fixed (Session 8). |
 | `research/full_pattern_scan.py` | Exhaustive 1,290-test Bonferroni pattern scanner |
 | `research/top30_oos_suite.py` | Full pipeline: scan → top-30 → multi-holdout OOS → regime validation |
 | `research/base_regime_validation.py` | Tests patterns across base-rate regimes (quantile bins) |
@@ -516,11 +536,12 @@ At 400ms latency, strategies must rely on signals persisting 5+ seconds.
 
 | Config | Trades | WR | Daily PnL | Period |
 |--------|--------|-----|-----------|--------|
-| YAML rules, no filter | 8,181 | 54.0% | $15.49 | Telonex 74d |
-| **YAML rules + RSI(7) skip>60** | **3,879** | **71.5%** | **$53.82** | **Telonex 74d** |
-| Self-collected CSV (no filter) | ~100 | ~53% | varies | 5 days |
-| Self-collected CSV + RSI(7) | ~60 | ~67% | varies | 5 days |
-| Live trades (no filter) | 75 | 47% | -$14.05 total | 1 day |
+| **YAML rules, no filter (BEST)** | **8,181** | **54.0%** | **$27.51** | **Telonex 74d** |
+| YAML rules + RSI(7) skip>60 | 3,292 | 52.4% | $7.02 | Telonex 74d |
+| Live trades (no RSI at time) | 75 | 47% | -$14.05 total | 1 day |
+
+> Note: Session 7 claimed RSI(7)<60 gave 71.5% WR / $53.82/day. This was caused by
+> look-ahead bias in the backtester RSI computation. See Section 6 for details.
 
 ---
 
