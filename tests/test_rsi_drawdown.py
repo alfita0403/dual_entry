@@ -224,13 +224,13 @@ class TestYAMLConfig:
         assert cfg.dd_max_consecutive_losses == 8
         assert cfg.dd_cooldown_minutes == 30.0
 
-    def test_loads_maxask_055(self):
-        """YAML should have max_ask=0.55 for all 5 ETH-only rules."""
+    def test_loads_maxask_060(self):
+        """YAML should have max_ask=0.60 for all 5 ETH-only rules."""
         cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
         assert len(cfg.rules) == 5
         for r in cfg.rules:
-            assert r.max_ask == 0.55, (
-                f"Rule {r.pattern} has max_ask={r.max_ask}, expected 0.55"
+            assert r.max_ask == 0.60, (
+                f"Rule {r.pattern} has max_ask={r.max_ask}, expected 0.60"
             )
             assert r.coins == ["ETH"], (
                 f"Rule {r.pattern} has coins={r.coins}, expected ['ETH']"

@@ -3,8 +3,9 @@
 # ETH-only, bidirectional: bet DOWN after UP streaks, UP after DOWN streaks.
 # All 5 patterns Bonferroni-significant on Telonex 74-day dataset.
 # BTC/SOL/XRP removed: 53% WR below 55% breakeven, net -$530 on Telonex.
-# max_ask=0.55 — all 5 ETH patterns profitable on Telonex (+$400/74d)
-# and CSV real prices (+$35/5d, avg entry $0.50-0.54).
+# max_ask=0.60 — CSV sweep shows $0.60-0.67 optimal zone (+$37-46/5d).
+# Avg entry $0.51-0.53 regardless of max_ask (orderbook ceiling).
+# Telonex WR=55.7% confirmed on 3,278 trades.
 #
 # Execution model:
 # - Place GTC limit at max_ask around t=1s
@@ -39,19 +40,19 @@ rules:
   - pattern: "DDDDD"
     side: "UP"
     coins: ["ETH"]
-    max_ask: 0.55
+    max_ask: 0.60
 
   # DDDD->UP ETH (58.3% WR Telonex, 54.5% CSV@0.55, N=701)
   - pattern: "DDDD"
     side: "UP"
     coins: ["ETH"]
-    max_ask: 0.55
+    max_ask: 0.60
 
   # DDD->UP ETH (55.6% WR Telonex, 53.3% CSV@0.55, N=1580)
   - pattern: "DDD"
     side: "UP"
     coins: ["ETH"]
-    max_ask: 0.55
+    max_ask: 0.60
 
   # ---------------------------------------------------------------
   # UP-streak reversals (bet DOWN) — ETH only
@@ -61,10 +62,10 @@ rules:
   - pattern: "UUUU"
     side: "DOWN"
     coins: ["ETH"]
-    max_ask: 0.55
+    max_ask: 0.60
 
   # UUU->DOWN ETH (55.8% WR Telonex, 49.1% CSV@0.55, N=1698)
   - pattern: "UUU"
     side: "DOWN"
     coins: ["ETH"]
-    max_ask: 0.55
+    max_ask: 0.60
