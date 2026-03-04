@@ -1,83 +1,86 @@
 # Mean-Reversion Strategy Config (LIVE)
 #
-# Source: full_pattern_scan + top30_oos_suite + regime robustness + RSI filter.
-# Per-pattern max_ask tuned by WR (tighter for lower-edge UUU).
+# Bidirectional: bets DOWN after UP streaks, UP after DOWN streaks.
+# All patterns Bonferroni-significant on Telonex 74-day dataset.
+# No indicator filters (RSI proven useless after look-ahead bias fix).
 #
 # Execution model:
 # - Place GTC limit at max_ask around t=1s
 # - Cancel all unfilled after 10s
 # - Hold filled size to resolution
-#
-# RSI filter (implemented in mean_reversion.py):
-# - Fetch BTCUSDT 5m klines from Binance
-# - Skip ALL trades when RSI(7) >= 60
-# - Backtest: 71.5% WR, $53.82/day (Telonex 74d), 66.7% WR (real CSV 5d)
-#
-# Drawdown protection (implemented in mean_reversion.py):
-# - Pause trading if session drawdown exceeds max_drawdown
-# - Pause after max_consecutive_losses in a row
 
 entry_window_start: 1
 entry_window_end: 3
 cancel_timeout: 10.0
 size: 5.0
 
-# RSI filter config
+# RSI filter — disabled (look-ahead bias proved it doesn't help WR)
 rsi_filter:
-  enabled: true
+  enabled: false
   period: 7
   timeframe: "5m"
-  threshold: 60        # skip trade when RSI >= this
+  threshold: 60
 
 # Drawdown protection
 drawdown_protection:
   enabled: true
-  max_drawdown: 30.0          # pause if session PnL drops below -$30
-  max_consecutive_losses: 8   # pause after 8 losses in a row
-  cooldown_minutes: 30        # auto-resume after cooldown (0 = manual restart)
+  max_drawdown: 30.0
+  max_consecutive_losses: 8
+  cooldown_minutes: 30
 
 rules:
   # ---------------------------------------------------------------
-  # Length 5 (highest priority by length)
+  # DOWN-streak reversals (bet UP) — NEW
   # ---------------------------------------------------------------
-  # ETH UUUUU->DOWN behaves strongly; allow wider cap for ETH
-  - pattern: "UUUUU"
+
+  # DUDUDD->UP ALL (57.7% WR, N=958, bonf_p=0.0012, 10/10 weeks green)
+  - pattern: "DUDUDD"
+    side: "UP"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.51
+
+  # DDDDD->UP ETH (60.3% WR, N=292, p=0.000266)
+  - pattern: "DDDDD"
+    side: "UP"
+    coins: ["ETH"]
+    max_ask: 0.51
+
+  # DDDD->UP ETH (58.3% WR, N=701, bonf_p=0.0070, 8/9 weeks green)
+  - pattern: "DDDD"
+    side: "UP"
+    coins: ["ETH"]
+    max_ask: 0.51
+
+  # DDD->UP ETH (55.6% WR, N=1580, bonf_p=0.0051)
+  - pattern: "DDD"
+    side: "UP"
+    coins: ["ETH"]
+    max_ask: 0.51
+
+  # ---------------------------------------------------------------
+  # UP-streak reversals (bet DOWN) — existing patterns
+  # ---------------------------------------------------------------
+
+  # UUUU->DOWN ETH (57.4% WR, N=751, bonf_p=0.036)
+  - pattern: "UUUU"
     side: "DOWN"
     coins: ["ETH"]
-    max_ask: 0.54
+    max_ask: 0.51
 
-  # ALL UUUUU->DOWN robust OOS; conservative cap for non-ETH
-  - pattern: "UUUUU"
+  # UUUU->DOWN others (54.5% WR, N=2501)
+  - pattern: "UUUU"
     side: "DOWN"
     coins: ["BTC", "SOL", "XRP"]
     max_ask: 0.51
 
-  # ---------------------------------------------------------------
-  # Length 4
-  # ---------------------------------------------------------------
-  # Strongest single-coin edge
-  - pattern: "UUUU"
-    side: "DOWN"
-    coins: ["ETH"]
-    max_ask: 0.54
-
-  # Broad robust edge for other coins
-  - pattern: "UUUU"
-    side: "DOWN"
-    coins: ["BTC", "SOL", "XRP"]
-    max_ask: 0.51
-
-  # BTC-specific robust family found in top30 suite
-  - pattern: "UDUU"
-    side: "DOWN"
-    coins: ["BTC"]
-    max_ask: 0.50
-
-  # ---------------------------------------------------------------
-  # Length 3 fallback (tighter max_ask — lowest edge pattern)
-  # Telonex WR: 54.0%, breakeven ~$0.502
-  # ---------------------------------------------------------------
+  # UUU->DOWN ETH (55.8% WR, N=1698, bonf_p=0.0013, 9/9 weeks green)
   - pattern: "UUU"
     side: "DOWN"
-    coins: ["BTC", "ETH", "SOL", "XRP"]
-    max_ask: 0.49
+    coins: ["ETH"]
+    max_ask: 0.51
+
+  # UUU->DOWN others (54.0% WR, N=5373, bonf_p=0.0000, 10/10 weeks green)
+  - pattern: "UUU"
+    side: "DOWN"
+    coins: ["BTC", "SOL", "XRP"]
+    max_ask: 0.51

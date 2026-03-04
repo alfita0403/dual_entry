@@ -209,9 +209,9 @@ class TestDrawdownProtection:
 # ===================================================================
 class TestYAMLConfig:
     def test_loads_rsi_config(self):
-        """YAML should load RSI filter config."""
+        """YAML should load RSI filter config (disabled after look-ahead fix)."""
         cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
-        assert cfg.rsi_enabled is True
+        assert cfg.rsi_enabled is False
         assert cfg.rsi_period == 7
         assert cfg.rsi_timeframe == "5m"
         assert cfg.rsi_threshold == 60.0
@@ -227,19 +227,20 @@ class TestYAMLConfig:
     def test_loads_tighter_maxask(self):
         """YAML should have updated max_ask values."""
         cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
-        # Find UUU rule
+        # All rules now use max_ask 0.51
         uuu_rule = next(r for r in cfg.rules if r.pattern == "UUU")
-        assert uuu_rule.max_ask == 0.49  # tightened from 0.51
+        assert uuu_rule.max_ask == 0.51
 
-        # Find UDUU rule
-        uduu_rule = next(r for r in cfg.rules if r.pattern == "UDUU")
-        assert uduu_rule.max_ask == 0.50  # tightened from 0.51
+        # DDDD->UP ETH should exist (new bidirectional pattern)
+        dddd_rule = next(r for r in cfg.rules if r.pattern == "DDDD")
+        assert dddd_rule.buy_side == "up"
+        assert dddd_rule.max_ask == 0.51
 
-        # ETH UUUU should still be 0.54
+        # ETH UUUU now also 0.51 (uniform max_ask)
         eth_uuuu = next(
             r for r in cfg.rules if r.pattern == "UUUU" and "ETH" in (r.coins or [])
         )
-        assert eth_uuuu.max_ask == 0.54
+        assert eth_uuuu.max_ask == 0.51
 
     def test_rules_sorted_longest_first(self):
         """Rules should be sorted by pattern length (longest first)."""

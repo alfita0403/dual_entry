@@ -5,9 +5,10 @@ Config-driven multi-pattern strategy based on Telonex 74-day backtest.
 Each rule specifies: pattern, side, coins, and per-rule max_ask.
 
 Key design decisions (from research/full_pattern_scan.py):
-  - Only UP-streak -> DOWN mean-reversion patterns are significant
-  - Longer streaks have higher WR but lower frequency
-  - ETH has the strongest edge (UUUU: 57.4%, UUU: 55.8%)
+  - Bidirectional: UP-streak -> DOWN and DOWN-streak -> UP
+  - Both directions are Bonferroni-significant on 74 days
+  - ETH has the strongest edge in both directions
+  - No indicator filters (RSI proven useless after look-ahead bias fix)
   - Per-rule max_ask ensures each pattern is +EV at its entry price
   - Rules are priority-ordered: longest pattern first per coin
 

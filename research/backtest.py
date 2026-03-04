@@ -57,42 +57,39 @@ warnings.filterwarnings("ignore")
 # ============================================================================
 # CUSTOM CONFIG — edit this section to test your own strategy
 # ============================================================================
-CUSTOM_LABEL = "Custom: RSI(7)<60 + BB"
+CUSTOM_LABEL = "Top 7 Bonferroni (no filter)"
 
 CUSTOM_RULES = [
-    {"pattern": "UUUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.54},
+    # --- Longest patterns first (first match wins) ---
+    # #2: DUDUDD->UP ALL (57.7% WR, N=958, bonf_p=0.0012)
     {
-        "pattern": "UUUUU",
-        "side": "DOWN",
-        "coins": ["BTC", "SOL", "XRP"],
+        "pattern": "DUDUDD",
+        "side": "UP",
+        "coins": ["BTC", "ETH", "SOL", "XRP"],
         "max_ask": 0.51,
     },
-    {"pattern": "UUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.54},
+    # #13: DDDDD->UP ETH (60.3% WR, N=292, p=0.000266)
+    {"pattern": "DDDDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.51},
+    # #1: DDDD->UP ETH (58.3% WR, N=701, bonf_p=0.0070)
+    {"pattern": "DDDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.51},
+    # #6: UUUU->DOWN ETH (57.4% WR, N=751, bonf_p=0.036)
+    {"pattern": "UUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.51},
+    # #6: UUUU->DOWN others (54.5% WR)
     {
         "pattern": "UUUU",
         "side": "DOWN",
         "coins": ["BTC", "SOL", "XRP"],
         "max_ask": 0.51,
     },
-    {"pattern": "UDUU", "side": "DOWN", "coins": ["BTC"], "max_ask": 0.50},
-    {
-        "pattern": "UUU",
-        "side": "DOWN",
-        "coins": ["BTC", "ETH", "SOL", "XRP"],
-        "max_ask": 0.49,
-    },
+    # #3: UUU->DOWN ETH (55.8% WR, N=1698, bonf_p=0.0013)
+    {"pattern": "UUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.51},
+    # #5: UUU->DOWN others (54.0% WR, N=5373)
+    {"pattern": "UUU", "side": "DOWN", "coins": ["BTC", "SOL", "XRP"], "max_ask": 0.51},
+    # #4: DDD->UP ETH (55.6% WR, N=1580, bonf_p=0.0051)
+    {"pattern": "DDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.51},
 ]
 
-CUSTOM_FILTERS = [
-    {
-        "indicator": "RSI",
-        "period": 7,
-        "timeframe": "5m",
-        "condition": "<",
-        "threshold": 60,
-    },
-    # {"indicator": "BB_UPPER", "period": 20, "timeframe": "5m", "condition": "<", "threshold": 0},
-]
+CUSTOM_FILTERS = []  # No filters — RSI proven useless after look-ahead fix
 
 CUSTOM_SIZE = 5.0
 CUSTOM_FEE = 0.0  # 0% maker on Builder Program
@@ -105,7 +102,7 @@ PROJECT_DIR = SCRIPT_DIR.parent
 DATA_DIR = PROJECT_DIR / "data"
 TELONEX_FILE = DATA_DIR / "telonex_updown_5m.parquet"
 KLINE_CACHE = SCRIPT_DIR / "binance_klines_cache_bt.json"
-OUTPUT_DIR = SCRIPT_DIR
+OUTPUT_DIR = SCRIPT_DIR / "pngs"
 COINS = ["BTC", "ETH", "SOL", "XRP"]
 
 # Default rules (from mean_reversion.yaml — must stay in sync!)
@@ -821,6 +818,9 @@ def plot_curves(
     if not HAS_MPL:
         print("  (matplotlib not installed, skipping plot)")
         return
+
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Determine max cycle count across all configs (for shared X axis)
     max_cycles = 0
