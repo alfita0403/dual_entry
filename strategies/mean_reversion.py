@@ -371,6 +371,7 @@ class PositionRecord:
     order_id: str = ""
     cost: float = 0.0
     pattern: str = ""  # which pattern triggered this
+    rule_id: str = ""  # unique rule identifier for per-rule tracking
     # Resolution
     resolved: bool = False
     won: Optional[bool] = None
@@ -393,6 +394,7 @@ class PendingOrder:
     placed_at: float  # time.time() when placed
     market_slug: str
     pattern: str
+    rule_id: str = ""  # unique rule identifier for per-rule tracking
     neg_risk: bool = False
     tick_size: str = "0.01"
 
@@ -492,6 +494,16 @@ class PatternRule:
     max_ask: float = DEFAULT_MAX_ASK  # per-rule max ask
     coins: Optional[List[str]] = None  # coins this rule applies to (None = all)
     priority: int = 0  # lower = higher priority
+
+    @property
+    def rule_id(self) -> str:
+        """Unique identifier for per-rule tracking. E.g. 'UUUU>DN:ETH'."""
+        if not self.coins or set(self.coins) >= set(COINS):
+            coins_tag = "ALL"
+        else:
+            coins_tag = ",".join(sorted(self.coins))
+        side_tag = "UP" if self.buy_side == "up" else "DN"
+        return f"{self.pattern}>{side_tag}:{coins_tag}"
 
 
 @dataclass
@@ -747,18 +759,27 @@ class SequenceStrategy:
         self.coin_losses: Dict[str, int] = {c: 0 for c in COINS}
         self.coin_resolved: Dict[str, int] = {c: 0 for c in COINS}
 
-        # Per-pattern stats
+        # Per-rule stats (keyed by rule_id for unique tracking)
         self.pattern_wins: Dict[str, int] = {}
         self.pattern_losses: Dict[str, int] = {}
         self.pattern_fills: Dict[str, int] = {}
         for rule in cfg.rules:
-            self.pattern_wins[rule.pattern] = 0
-            self.pattern_losses[rule.pattern] = 0
-            self.pattern_fills[rule.pattern] = 0
+            self.pattern_wins[rule.rule_id] = 0
+            self.pattern_losses[rule.rule_id] = 0
+            self.pattern_fills[rule.rule_id] = 0
 
         self._load_stats_from_log()
 
         # RSI filter
+        # Lookup table: (pattern, coin) -> rule_id
+        self._rule_id_map: Dict[Tuple[str, str], str] = {}
+        for rule in cfg.rules:
+            target_coins = rule.coins if rule.coins else COINS
+            for c in target_coins:
+                key = (rule.pattern, c)
+                if key not in self._rule_id_map:
+                    self._rule_id_map[key] = rule.rule_id
+
         self._rsi_filter = RSIFilter(
             period=cfg.rsi_period,
             timeframe=cfg.rsi_timeframe,
@@ -816,8 +837,9 @@ class SequenceStrategy:
                 self.total_spent += cost
                 self.total_shares += size
 
-                if pattern in self.pattern_fills:
-                    self.pattern_fills[pattern] += 1
+                rid = self._rule_id_map.get((pattern, coin), "")
+                if rid in self.pattern_fills:
+                    self.pattern_fills[rid] += 1
 
                 if outcome.startswith("WIN"):
                     self.total_wins += 1
@@ -825,8 +847,8 @@ class SequenceStrategy:
                     if coin in self.coin_wins:
                         self.coin_wins[coin] += 1
                         self.coin_resolved[coin] += 1
-                    if pattern in self.pattern_wins:
-                        self.pattern_wins[pattern] += 1
+                    if rid in self.pattern_wins:
+                        self.pattern_wins[rid] += 1
                     profit_str = outcome.replace("WIN +$", "").replace("WIN +", "")
                     self.session_pnl += _to_float(profit_str)
                     self.total_received += size
@@ -837,8 +859,8 @@ class SequenceStrategy:
                     if coin in self.coin_losses:
                         self.coin_losses[coin] += 1
                         self.coin_resolved[coin] += 1
-                    if pattern in self.pattern_losses:
-                        self.pattern_losses[pattern] += 1
+                    if rid in self.pattern_losses:
+                        self.pattern_losses[rid] += 1
                     self.session_pnl -= cost
         except Exception:
             pass
@@ -1769,6 +1791,7 @@ class SequenceStrategy:
                     market,
                     rule.pattern,
                     trade_size,
+                    rule_id=rule.rule_id,
                 )
                 if tracker:
                     self._traded_coins.add(coin)
@@ -1782,6 +1805,7 @@ class SequenceStrategy:
                     limit_price,
                     rule.pattern,
                     trade_size,
+                    rule_id=rule.rule_id,
                 )
                 if result is not None:
                     placed_any = True
@@ -1808,6 +1832,7 @@ class SequenceStrategy:
         market: MarketInfo,
         pattern: str,
         trade_size: Optional[float] = None,
+        rule_id: str = "",
     ) -> Optional[PositionRecord]:
         """Simulate a fill for dry-run mode."""
         sim_price = ask_price + SIM_ENTRY_SLIP
@@ -1824,6 +1849,7 @@ class SequenceStrategy:
             order_id=f"SIM-{coin}-{int(time.time())}",
             cost=cost,
             pattern=pattern,
+            rule_id=rule_id,
         )
         self._current_positions.append(pos)
         self._all_positions.append(pos)
@@ -1831,8 +1857,8 @@ class SequenceStrategy:
         self.total_orders_placed += 1
         self.total_spent += cost
         self.total_shares += sim_size
-        if pattern in self.pattern_fills:
-            self.pattern_fills[pattern] += 1
+        if rule_id in self.pattern_fills:
+            self.pattern_fills[rule_id] += 1
 
         _append_trade_log(
             pos,
@@ -1858,6 +1884,7 @@ class SequenceStrategy:
         limit_price: float,
         pattern: str,
         trade_size: Optional[float] = None,
+        rule_id: str = "",
     ) -> Optional[Any]:
         """Submit a GTC limit BUY to the CLOB.
 
@@ -1935,14 +1962,15 @@ class SequenceStrategy:
                     order_id=order_id,
                     cost=cost,
                     pattern=pattern,
+                    rule_id=rule_id,
                 )
                 self._current_positions.append(pos)
                 self._all_positions.append(pos)
                 self.total_fills += 1
                 self.total_spent += cost
                 self.total_shares += fill_size
-                if pattern in self.pattern_fills:
-                    self.pattern_fills[pattern] += 1
+                if rule_id in self.pattern_fills:
+                    self.pattern_fills[rule_id] += 1
 
                 _append_trade_log(
                     pos,
@@ -1970,6 +1998,7 @@ class SequenceStrategy:
                     placed_at=time.time(),
                     market_slug=market.slug,
                     pattern=pattern,
+                    rule_id=rule_id,
                     neg_risk=market.neg_risk,
                     tick_size=market.tick_size,
                 )
@@ -1998,6 +2027,7 @@ class SequenceStrategy:
                     placed_at=time.time(),
                     market_slug=market.slug,
                     pattern=pattern,
+                    rule_id=rule_id,
                     neg_risk=market.neg_risk,
                     tick_size=market.tick_size,
                 )
@@ -2067,14 +2097,15 @@ class SequenceStrategy:
                         order_id=p.order_id,
                         cost=cost,
                         pattern=p.pattern,
+                        rule_id=p.rule_id,
                     )
                     self._current_positions.append(pos)
                     self._all_positions.append(pos)
                     self.total_fills += 1
                     self.total_spent += cost
                     self.total_shares += size_matched
-                    if p.pattern in self.pattern_fills:
-                        self.pattern_fills[p.pattern] += 1
+                    if p.rule_id in self.pattern_fills:
+                        self.pattern_fills[p.rule_id] += 1
                     self._traded_coins.add(p.coin)
 
                     _append_trade_log(
@@ -2229,6 +2260,7 @@ class SequenceStrategy:
 
             coin_key = pos.coin.upper()
             pattern = pos.pattern
+            rid = pos.rule_id
 
             if coin_key in self.coin_resolved:
                 self.coin_resolved[coin_key] += 1
@@ -2243,8 +2275,8 @@ class SequenceStrategy:
                 self.total_wins += 1
                 if coin_key in self.coin_wins:
                     self.coin_wins[coin_key] += 1
-                if pattern in self.pattern_wins:
-                    self.pattern_wins[pattern] += 1
+                if rid in self.pattern_wins:
+                    self.pattern_wins[rid] += 1
                 self.session_pnl += profit
                 self.total_received += pos.payout
                 self._drawdown.record_outcome(True, self.session_pnl)
@@ -2263,8 +2295,8 @@ class SequenceStrategy:
                 self.total_losses += 1
                 if coin_key in self.coin_losses:
                     self.coin_losses[coin_key] += 1
-                if pattern in self.pattern_losses:
-                    self.pattern_losses[pattern] += 1
+                if rid in self.pattern_losses:
+                    self.pattern_losses[rid] += 1
                 self.session_pnl -= effective_cost
                 self._drawdown.record_outcome(False, self.session_pnl)
                 outcome_str = f"LOSS -${effective_cost:.4f}"
@@ -2708,22 +2740,26 @@ class SequenceStrategy:
             f"   pnl:{pnl_c}{B}${self.session_pnl:+.2f}{X}"
         )
 
-        # Per-pattern breakdown (deduplicated — e.g. UUUU appears for ETH and others)
-        pattern_parts = []
-        seen_patterns: set[str] = set()
+        # Per-rule breakdown (each rule tracked independently)
+        rule_parts = []
         for rule in self.cfg.rules:
-            p = rule.pattern
-            if p in seen_patterns:
-                continue
-            seen_patterns.add(p)
-            pw = self.pattern_wins.get(p, 0)
-            pl = self.pattern_losses.get(p, 0)
+            rid = rule.rule_id
+            pw = self.pattern_wins.get(rid, 0)
+            pl = self.pattern_losses.get(rid, 0)
             pr = pw + pl
             pwr = f"{(pw / pr) * 100:.0f}%" if pr > 0 else "--"
+            if not rule.coins or set(rule.coins) >= set(COINS):
+                tag = rule.pattern
+            else:
+                tag = f"{rule.pattern}:{','.join(rule.coins)}"
             side_label = "U" if rule.buy_side == "up" else "D"
-            pattern_parts.append(f"{p}->{side_label}: {G}{pw}W{X}/{R}{pl}L{X}={pwr}")
-        if pattern_parts:
-            lines.append(f"  {D}patterns:{X} " + "  ".join(pattern_parts))
+            rule_parts.append(f"{tag}->{side_label}: {G}{pw}W{X}/{R}{pl}L{X}={pwr}")
+        if rule_parts:
+            # Split into 2 lines if > 4 rules for readability
+            mid = (len(rule_parts) + 1) // 2
+            lines.append(f"  {D}rules:{X}  " + "  ".join(rule_parts[:mid]))
+            if len(rule_parts) > mid:
+                lines.append(f"         " + "  ".join(rule_parts[mid:]))
 
         # Per-coin breakdown
         coin_parts = []
@@ -2821,27 +2857,23 @@ class SequenceStrategy:
             wr = (self.total_wins / self.total_resolved) * 100
             print(f"  Win rate:      {wr:.1f}%")
 
-        # Pattern breakdown (deduplicated)
+        # Per-rule breakdown (each rule tracked independently)
         print()
-        print("  Per-pattern breakdown:")
-        seen: set[str] = set()
+        print("  Per-rule breakdown:")
         for rule in self.cfg.rules:
-            p = rule.pattern
-            if p in seen:
-                continue
-            seen.add(p)
             coins_str = (
                 "ALL"
                 if not rule.coins or set(rule.coins) >= set(COINS)
                 else ",".join(rule.coins)
             )
             side_label = "UP" if rule.buy_side == "up" else "DOWN"
-            pw = self.pattern_wins.get(p, 0)
-            pl = self.pattern_losses.get(p, 0)
+            pw = self.pattern_wins.get(rule.rule_id, 0)
+            pl = self.pattern_losses.get(rule.rule_id, 0)
             pr = pw + pl
             pwr = f"{(pw / pr) * 100:.1f}%" if pr > 0 else "--"
             print(
-                f"    {p:<8} {side_label:<5} {coins_str:<12}: {pw}W / {pl}L (WR: {pwr})"
+                f"    {rule.pattern:<8} {side_label:<5} {coins_str:<12}: "
+                f"{pw}W / {pl}L (WR: {pwr})"
             )
 
         # Coin breakdown
