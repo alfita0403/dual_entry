@@ -2723,12 +2723,26 @@ class SequenceStrategy:
         else:
             dry = ""
 
-        # RSI indicator
+        # RSI indicator (show for both skip-filter and boost modes)
         rsi_val = self._rsi_filter.current_rsi
-        if self._rsi_filter.enabled and not np.isnan(rsi_val):
-            rsi_c = R if rsi_val >= self._rsi_filter.threshold else G
+        rsi_active = self._rsi_filter.enabled or self._rsi_filter.boost_enabled
+        if rsi_active and not np.isnan(rsi_val):
+            if self._rsi_filter.enabled:
+                rsi_c = R if rsi_val >= self._rsi_filter.threshold else G
+            else:
+                rsi_c = O  # orange/yellow when boost-only
             rsi_str = f"   RSI({self._rsi_filter.period}):{rsi_c}{B}{rsi_val:.0f}{X}"
-        elif self._rsi_filter.enabled:
+            # Show boost sizes for each side
+            if self._rsi_filter.boost_enabled:
+                up_sz = self._rsi_filter.get_trade_size("up", self.cfg.size)
+                dn_sz = self._rsi_filter.get_trade_size("down", self.cfg.size)
+                # Undo the counter increments from display calls
+                self._rsi_filter.boost_count = max(0, self._rsi_filter.boost_count - 2)
+                self._rsi_filter.base_count = max(0, self._rsi_filter.base_count - 2)
+                up_c = G if up_sz > self.cfg.size else D
+                dn_c = G if dn_sz > self.cfg.size else D
+                rsi_str += f"  {up_c}UP=${up_sz:.0f}{X} {dn_c}DN=${dn_sz:.0f}{X}"
+        elif rsi_active:
             rsi_str = f"   RSI:{D}--{X}"
         else:
             rsi_str = ""
