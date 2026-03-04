@@ -1,5 +1,5 @@
 """
-Full Pattern Scan — exhaustive search across all coins, all patterns, both sides.
+Full Pattern Scan - exhaustive search across all coins, all patterns, both sides.
 
 Uses Telonex 74-day dataset (60,605 markets) to find every statistically
 significant pattern/coin combination and compute the max entry price (max_ask)
@@ -17,7 +17,7 @@ import argparse
 import sys
 from itertools import product
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -30,16 +30,68 @@ DATA_FILE = Path(__file__).parent.parent / "data" / "telonex_updown_5m.parquet"
 COINS = ["BTC", "ETH", "SOL", "XRP"]
 FEE_RATE = 0.015       # 1.5% taker fee on shares
 SLIPPAGE = 0.03        # $0.03 slippage on entry
-N_DAYS = 74            # dataset span
 
 
-def load_data():
+def load_data(from_date: Optional[str] = None, to_date: Optional[str] = None):
     df = pd.read_parquet(DATA_FILE)
     df["coin"] = df["slug"].str.extract(r"^(\w+)-updown-5m-")[0].str.upper()
     df["unix_ts"] = df["slug"].str.extract(r"-(\d+)$")[0].astype(float)
+    df["datetime"] = pd.to_datetime(df["unix_ts"], unit="s", utc=True)
     df["outcome"] = df["result_id"].map({"0": "UP", "1": "DOWN"})
+
+    if from_date:
+        df = df[df["datetime"] >= pd.Timestamp(from_date, tz="UTC")]
+    if to_date:
+        df = df[df["datetime"] <= pd.Timestamp(to_date, tz="UTC")]
+
     df = df.sort_values(["coin", "unix_ts"]).reset_index(drop=True)
     return df
+
+
+def infer_n_days(df: pd.DataFrame) -> float:
+    if df.empty:
+        return 1.0
+    span_days = (df["datetime"].max() - df["datetime"].min()).total_seconds() / 86400.0
+    return max(1.0, span_days)
+
+
+def build_coin_data(df: pd.DataFrame) -> Dict[str, Dict[str, object]]:
+    coin_data: Dict[str, Dict[str, object]] = {}
+    for coin in COINS:
+        cdf = df[df["coin"] == coin].sort_values("unix_ts")
+        outcomes = cdf["outcome"].tolist()
+        ud = ["U" if o == "UP" else "D" if o == "DOWN" else None for o in outcomes]
+        valid = [o for o in outcomes if o is not None]
+        if not valid:
+            continue
+        base_down = sum(1 for o in valid if o == "DOWN") / len(valid)
+        base_up = 1 - base_down
+        n_cycles = len(cdf)
+        coin_data[coin] = {
+            "ud": ud,
+            "base_down": base_down,
+            "base_up": base_up,
+            "n_cycles": n_cycles,
+        }
+    return coin_data
+
+
+def test_min_streak(ud_seq: list, streak_dir: str, min_streak: int, buy_side_ud: str) -> Tuple[int, int]:
+    trades, wins = 0, 0
+    for i in range(min_streak, len(ud_seq)):
+        if ud_seq[i] is None:
+            continue
+        ok = True
+        for j in range(1, min_streak + 1):
+            if i - j < 0 or ud_seq[i - j] is None or ud_seq[i - j] != streak_dir:
+                ok = False
+                break
+        if not ok:
+            continue
+        trades += 1
+        if ud_seq[i] == buy_side_ud:
+            wins += 1
+    return trades, wins
 
 
 def test_pattern_coin(ud_seq: list, pattern: str, buy_side: str) -> Tuple[int, int]:
@@ -59,7 +111,7 @@ def test_pattern_coin(ud_seq: list, pattern: str, buy_side: str) -> Tuple[int, i
     return trades, wins
 
 
-def compute_metrics(trades: int, wins: int, base_rate: float, n_days: int):
+def compute_metrics(trades: int, wins: int, base_rate: float, n_days: float):
     """Compute WR, break-even price, significance, frequency."""
     if trades == 0:
         return None
@@ -107,6 +159,71 @@ def compute_metrics(trades: int, wins: int, base_rate: float, n_days: int):
     }
 
 
+def eval_strategy_oos(
+    row: dict,
+    coin_data_oos: Dict[str, Dict[str, object]],
+    n_days_oos: float,
+) -> Optional[dict]:
+    """Evaluate one in-sample strategy row on OOS data without re-fitting."""
+    buy_side_ud = "D" if row["side"] == "DOWN" else "U"
+
+    if row["scope"] == "single":
+        coin = row["coin"]
+        if coin not in coin_data_oos:
+            return None
+        cd = coin_data_oos[coin]
+        base = float(cd["base_down"] if buy_side_ud == "D" else cd["base_up"])
+        t, w = test_pattern_coin(cd["ud"], row["pattern"], buy_side_ud)
+        if t == 0:
+            return None
+        m = compute_metrics(t, w, base, n_days_oos)
+        return m
+
+    if row["scope"] == "combined":
+        total_t, total_w = 0, 0
+        bases = []
+        for coin in COINS:
+            cd = coin_data_oos.get(coin)
+            if cd is None:
+                continue
+            base = float(cd["base_down"] if buy_side_ud == "D" else cd["base_up"])
+            bases.append(base)
+            t, w = test_pattern_coin(cd["ud"], row["pattern"], buy_side_ud)
+            total_t += t
+            total_w += w
+
+        if total_t == 0 or not bases:
+            return None
+        avg_base = float(np.mean(bases))
+        return compute_metrics(total_t, total_w, avg_base, n_days_oos)
+
+    if row["scope"] == "min_streak":
+        pattern = str(row["pattern"])
+        streak_dir = pattern[0]
+        min_streak = len(pattern.replace("+", ""))
+        coin_label = row["coin"]
+        coins_to_scan = COINS if coin_label == "ALL" else [coin_label]
+        total_t, total_w = 0, 0
+        bases = []
+
+        for coin in coins_to_scan:
+            cd = coin_data_oos.get(coin)
+            if cd is None:
+                continue
+            base = float(cd["base_down"] if buy_side_ud == "D" else cd["base_up"])
+            bases.append(base)
+            t, w = test_min_streak(cd["ud"], streak_dir, min_streak, buy_side_ud)
+            total_t += t
+            total_w += w
+
+        if total_t == 0 or not bases:
+            return None
+        avg_base = float(np.mean(bases))
+        return compute_metrics(total_t, total_w, avg_base, n_days_oos)
+
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Exhaustive pattern scan")
     parser.add_argument("--max-len", type=int, default=6,
@@ -115,33 +232,56 @@ def main():
                         help="Min trades to report (default 100)")
     parser.add_argument("--top", type=int, default=60,
                         help="Show top N results (default 60)")
+    parser.add_argument("--from-date", type=str, default=None,
+                        help="UTC date filter start, e.g. 2026-01-01")
+    parser.add_argument("--to-date", type=str, default=None,
+                        help="UTC date filter end, e.g. 2026-03-01")
+    parser.add_argument("--oos-days", type=int, default=0,
+                        help="Reserve last N days for out-of-sample validation")
+    parser.add_argument("--oos-min-trades", type=int, default=30,
+                        help="Min OOS trades to report a strategy (default 30)")
     args = parser.parse_args()
 
     print("Loading Telonex data...")
-    df = load_data()
+    full_df = load_data(args.from_date, args.to_date)
+    if full_df.empty:
+        print("No data after filters. Exiting.")
+        sys.exit(1)
+
+    oos_df = None
+    if args.oos_days > 0:
+        cutoff = full_df["datetime"].max() - pd.Timedelta(days=args.oos_days)
+        df = full_df[full_df["datetime"] < cutoff].copy()
+        oos_df = full_df[full_df["datetime"] >= cutoff].copy()
+        if df.empty or oos_df.empty:
+            print("OOS split invalid (train or OOS empty). Use fewer --oos-days.")
+            sys.exit(1)
+        print(
+            f"  Train: {df['datetime'].min()} -> {df['datetime'].max()} ({len(df):,} rows)"
+        )
+        print(
+            f"  OOS:   {oos_df['datetime'].min()} -> {oos_df['datetime'].max()} ({len(oos_df):,} rows)"
+        )
+    else:
+        df = full_df
+
+    n_days = infer_n_days(df)
 
     # Precompute per-coin sequences and base rates
-    coin_data = {}
+    coin_data = build_coin_data(df)
     for coin in COINS:
-        cdf = df[df["coin"] == coin].sort_values("unix_ts")
-        outcomes = cdf["outcome"].tolist()
-        ud = ["U" if o == "UP" else "D" if o == "DOWN" else None for o in outcomes]
-        valid = [o for o in outcomes if o is not None]
-        base_down = sum(1 for o in valid if o == "DOWN") / len(valid)
-        base_up = 1 - base_down
-        n_cycles = len(cdf)
-        coin_data[coin] = {
-            "ud": ud,
-            "base_down": base_down,
-            "base_up": base_up,
-            "n_cycles": n_cycles,
-        }
+        if coin not in coin_data:
+            continue
+        cd = coin_data[coin]
+        base_down = float(cd["base_down"])
+        base_up = float(cd["base_up"])
+        n_cycles = int(cd["n_cycles"])
         print(f"  {coin}: {n_cycles:,} cycles, base DOWN={base_down:.1%}, base UP={base_up:.1%}")
 
     # =========================================================================
     # SCAN 1: Per-coin patterns (each coin individually)
     # =========================================================================
-    print(f"\nScanning patterns length 2-{args.max_len} × {len(COINS)} coins × 2 sides...")
+    print(f"\nScanning patterns length 2-{args.max_len} x {len(COINS)} coins x 2 sides...")
     all_results = []
 
     for p_len in range(2, args.max_len + 1):
@@ -155,7 +295,7 @@ def main():
                     t, w = test_pattern_coin(cd["ud"], pattern, buy_side_ud)
                     if t < args.min_trades:
                         continue
-                    m = compute_metrics(t, w, base, N_DAYS)
+                    m = compute_metrics(t, w, float(base), n_days)
                     if m is None:
                         continue
                     m["pattern"] = pattern
@@ -177,8 +317,8 @@ def main():
 
                 if total_t < args.min_trades:
                     continue
-                avg_base = np.mean(bases)
-                m = compute_metrics(total_t, total_w, avg_base, N_DAYS)
+                avg_base = float(np.mean(bases))
+                m = compute_metrics(total_t, total_w, avg_base, n_days)
                 if m is None:
                     continue
                 m["pattern"] = pattern
@@ -204,27 +344,14 @@ def main():
                     cd = coin_data[coin]
                     base = cd["base_down"] if buy_side_ud == "D" else cd["base_up"]
                     bases.append(base)
-                    ud = cd["ud"]
-
-                    for i in range(min_streak, len(ud)):
-                        if ud[i] is None:
-                            continue
-                        # Check streak of at least min_streak
-                        ok = True
-                        for j in range(1, min_streak + 1):
-                            if i - j < 0 or ud[i - j] is None or ud[i - j] != streak_dir:
-                                ok = False
-                                break
-                        if not ok:
-                            continue
-                        total_t += 1
-                        if ud[i] == buy_side_ud:
-                            total_w += 1
+                    t, w = test_min_streak(cd["ud"], streak_dir, min_streak, buy_side_ud)
+                    total_t += t
+                    total_w += w
 
                 if total_t < args.min_trades:
                     continue
-                avg_base = np.mean(bases)
-                m = compute_metrics(total_t, total_w, avg_base, N_DAYS)
+                avg_base = float(np.mean(bases))
+                m = compute_metrics(total_t, total_w, avg_base, n_days)
                 if m is None:
                     continue
                 m["pattern"] = f"{streak_dir * min_streak}+"
@@ -276,7 +403,7 @@ def main():
     profitable_50.sort(key=lambda x: -x["ev_at_50"])
 
     print(f"\n{'=' * 90}")
-    print(f"  PROFITABLE AT ASK=$0.50 (after slippage+fees) — {len(profitable_50)} strategies")
+    print(f"  PROFITABLE AT ASK=$0.50 (after slippage+fees) - {len(profitable_50)} strategies")
     print(f"{'=' * 90}")
 
     if profitable_50:
@@ -289,7 +416,7 @@ def main():
             print(f"  {r['coin']:<5} {r['pattern']:<8} {r['side']:<5} {r['trades']:>6,} {r['wr']:>5.1%} "
                   f"${r['max_ask']:>.3f} ${r['ev_at_50']:>+7.4f} ${daily_ev:>+6.3f} {r['trades_per_day']:>5.1f}")
     else:
-        print("  NONE — no strategy is profitable at ask=$0.50 after Bonferroni correction.")
+        print("  NONE - no strategy is profitable at ask=$0.50 after Bonferroni correction.")
 
     # =========================================================================
     # OUTPUT 3: Top strategies by EV at ask=$0.48
@@ -298,7 +425,7 @@ def main():
     profitable_48.sort(key=lambda x: -x["ev_at_48"])
 
     print(f"\n{'=' * 90}")
-    print(f"  PROFITABLE AT ASK=$0.48 (optimistic entry) — {len(profitable_48)} strategies")
+    print(f"  PROFITABLE AT ASK=$0.48 (optimistic entry) - {len(profitable_48)} strategies")
     print(f"{'=' * 90}")
 
     if profitable_48:
@@ -314,7 +441,7 @@ def main():
         print("  NONE.")
 
     # =========================================================================
-    # OUTPUT 4: Strategy configurator — what max_ask to use for each
+    # OUTPUT 4: Strategy configurator - what max_ask to use for each
     # =========================================================================
     # Only show Bonferroni-significant with max_ask > 0.45
     viable = [r for r in all_results if r["bonf_sig"] and r["max_ask"] > 0.45]
@@ -344,7 +471,60 @@ def main():
               f"${r['max_ask']:>.3f} {freq:>12} {note}")
 
     # =========================================================================
-    # OUTPUT 5: Summary statistics
+    # OUTPUT 5: Out-of-sample validation (optional)
+    # =========================================================================
+    survivors_oos = []
+    if oos_df is not None:
+        n_days_oos = infer_n_days(oos_df)
+        coin_data_oos = build_coin_data(oos_df)
+        oos_eval = []
+
+        for row in sig:
+            oos_m = eval_strategy_oos(row, coin_data_oos, n_days_oos)
+            if oos_m is None:
+                continue
+            out = dict(row)
+            out["oos_trades"] = oos_m["trades"]
+            out["oos_wins"] = oos_m["wins"]
+            out["oos_wr"] = oos_m["wr"]
+            out["oos_base"] = oos_m["base"]
+            out["oos_delta"] = oos_m["delta"]
+            out["oos_p"] = oos_m["p"]
+            out["oos_max_ask"] = oos_m["max_ask"]
+            out["oos_ev_at_50"] = oos_m["ev_at_50"]
+            out["oos_ev_at_48"] = oos_m["ev_at_48"]
+            oos_eval.append(out)
+
+        survivors_oos = [
+            r for r in oos_eval
+            if r["oos_trades"] >= args.oos_min_trades
+            and r["oos_wr"] > r["oos_base"]
+            and r["oos_ev_at_50"] > 0
+        ]
+        survivors_oos.sort(key=lambda x: -x["oos_ev_at_50"])
+
+        print(f"\n{'=' * 110}")
+        print(f"  OOS VALIDATION (last {args.oos_days} days holdout)")
+        print(f"  In-sample Bonferroni-significant tested on unseen data")
+        print(f"{'=' * 110}")
+        print(f"  OOS candidates tested: {len(oos_eval)}")
+        print(f"  OOS survivors (WR>base, EV@0.50>0, N>={args.oos_min_trades}): {len(survivors_oos)}")
+
+        if survivors_oos:
+            print(f"  {'Coin':<5} {'Pattern':<8} {'Side':<5} {'N_OOS':>7} {'WR_OOS':>7} {'Base':>5} "
+                  f"{'Delta':>6} {'EV@.50':>8} {'MaxAsk':>7}")
+            print(f"  {'-'*5} {'-'*8} {'-'*5} {'-'*7} {'-'*7} {'-'*5} {'-'*6} {'-'*8} {'-'*7}")
+            for r in survivors_oos:
+                print(
+                    f"  {r['coin']:<5} {r['pattern']:<8} {r['side']:<5} "
+                    f"{r['oos_trades']:>7,} {r['oos_wr']:>6.1%} {r['oos_base']:>4.1%} "
+                    f"{r['oos_delta']:>+5.1%} ${r['oos_ev_at_50']:>+7.4f} ${r['oos_max_ask']:>.3f}"
+                )
+        else:
+            print("  No OOS survivors under the current thresholds.")
+
+    # =========================================================================
+    # OUTPUT 6: Summary statistics
     # =========================================================================
     print(f"\n{'=' * 70}")
     print(f"  SUMMARY")
@@ -356,6 +536,8 @@ def main():
     print(f"  Profitable at ask=$0.48:     {len(profitable_48)}")
     print(f"  Max_ask > $0.50:             {len([r for r in sig if r['max_ask'] > 0.50])}")
     print(f"  Max_ask > $0.53:             {len([r for r in sig if r['max_ask'] > 0.53])}")
+    if oos_df is not None:
+        print(f"  OOS survivors:               {len(survivors_oos)}")
 
     # Best single strategy
     if sig:
@@ -364,7 +546,7 @@ def main():
         print(f"    WR={best['wr']:.1%}, N={best['trades']:,}, max_ask=${best['max_ask']:.3f}")
         print(f"    {best['trades_per_day']:.1f} trades/day")
         print(f"    At $5/trade, max_ask=${best['max_ask']:.2f}: "
-              f"EV ≈ ${best['wr'] * 0.985 * 5 - best['max_ask'] * 5:.2f}/trade")
+              f"EV ~ ${best['wr'] * 0.985 * 5 - best['max_ask'] * 5:.2f}/trade")
 
 
 if __name__ == "__main__":

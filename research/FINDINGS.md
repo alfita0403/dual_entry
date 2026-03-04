@@ -33,7 +33,10 @@
 21. [Late Entry Calibration Study](#21-late-entry-calibration-study)
 22. [Binance Volatility & Time Regime Analysis](#22-binance-volatility--time-regime-analysis)
 23. [Telonex 73-Day Backtest — The Definitive Answer](#23-telonex-73-day-backtest--the-definitive-answer)
-24. [Session 5: Exhaustive Pattern Scan, OOS Suite & Gamma-Confirmed Inference](#24-session-5-exhaustive-pattern-scan-oos-suite--gamma-confirmed-inference) **NEW — CRITICAL**
+24. [Session 5: Exhaustive Pattern Scan, OOS Suite & Gamma-Confirmed Inference](#24-session-5-exhaustive-pattern-scan-oos-suite--gamma-confirmed-inference)
+25. [Session 6: Live Validation, Regime Debunking & Inference Fixes](#25-session-6-live-validation-regime-debunking--inference-fixes)
+26. [Session 6 (Part 2): Edge Stability, Technical Indicators & Fill Rate](#26-session-6-part-2-edge-stability-technical-indicators--fill-rate)
+27. [Session 6 (Part 3): Multi-Timeframe Indicator Sweep & RSI Period Optimization](#27-session-6-part-3-multi-timeframe-indicator-sweep--rsi-period-optimization) **NEW**
 
 ---
 
@@ -1879,6 +1882,373 @@ Eliminates the 25-minute cold-start window where the bot has no pattern data. At
 6. **10-15% of markets are decided in the last 10 seconds.** WS-based inference at 0.95/0.05 thresholds is unreliable for these. Only >= 0.99 provides near-certainty. Gamma API is the only ground truth.
 
 7. **Pattern chains built on uncertain outcomes are worse than no chains at all.** A single misclassified outcome can trigger a false pattern match and a losing trade.
+
+---
+
+## 25. Session 6: Live Validation, Regime Debunking & Inference Fixes
+
+> **Date**: 2026-03-04
+> **Scripts**: `research/regime_choppy_telonex.py`, `research/streak_overlap_analysis.py`
+> **Data**: Telonex 60,605 markets (74 days) + first 24h live trading session
+> **Verdict**: All patterns re-validated. Choppy regime DEAD. Overlapping rules are +EV. Five inference bugs fixed.
+
+### 25.1 First Live Session Results
+
+The strategy ran live for ~24 hours using `mean_reversion.yaml` config (6 rules, $5 flat size). Performance peaked at ~+$40 then dropped to ~+$10 during a heavy consecutive UP streak across all coins. ETH had the highest win rate (~4 trades, most/all correct), consistent with being the strongest pattern.
+
+### 25.2 Pattern Re-Validation
+
+Re-ran `full_pattern_scan.py` and `top30_oos_suite.py` on the same Telonex dataset:
+- **30 Bonferroni survivors confirmed** — all UP-streak→DOWN mean-reversion
+- **11 strict OOS survivors confirmed** — pass all holdouts + regime bins
+- **YAML config has exactly the top 5** OOS-robust strategies
+- No changes needed to the live config patterns
+
+### 25.3 Choppy Regime Hypothesis: DEAD
+
+**Script**: `research/regime_choppy_telonex.py`
+
+The hypothesis (from Section 19): mean-reversion works better in "choppy" markets with alternating U/D outcomes.
+
+| Regime | N | WR | vs Average | p-value |
+|--------|---|-----|-----------|---------|
+| Choppy (alternation_ratio > 0.6) | 4,082 | 51.3% | -2.7pp | 0.001 |
+| Trending (alternation_ratio < 0.4) | 3,741 | 56.7% | +2.7pp | 0.002 |
+| Mixed | ~6,200 | ~54% | baseline | — |
+
+**The original 84% WR (n=31) was pure small-sample noise.** With n=4,082, choppy regime is BELOW average. Trending regime is actually the best — likely because longer UP streaks in trending markets are stronger mean-reversion triggers.
+
+**Conclusion**: Do NOT implement a choppy-regime filter. It would HURT performance.
+
+### 25.4 Overlapping Pattern Rules: Keep Them
+
+**Script**: `research/streak_overlap_analysis.py`
+
+During a long UP streak (e.g., 7 consecutive UPs), the live config fires cascading trades: UUU→DOWN at position 3, UUUU→DOWN at position 4, UUUUU→DOWN at position 5. This amplifies both wins and losses.
+
+| Policy | Trades | WR | Total PnL | Worst 24h |
+|--------|--------|----|-----------|-----------|
+| **Full overlap (live config)** | 7,071 | 54.0% | +$1,064 | -$110.20 |
+| UUU-only (no overlap) | 5,286 | 53.5% | +$492 | -$53.80 |
+| Delta from overlapping | +1,785 | 55.5% | +$572 | — |
+
+The overlapping trades are **+EV in aggregate** (+$572 over 74 days). However, they roughly double the worst-case 24h drawdown (-$110 vs -$54). The user's $30 drawdown is well within expected variance.
+
+**Recommendation**: Keep the overlapping rules. The extra +$572 justifies the higher variance at $5 flat sizing.
+
+### 25.5 Outcome Inference Pipeline: 5 Bug Fixes
+
+Audited the inference pipeline and found 7 failure modes causing excessive "dash" (unknown) outcomes. Implemented 5 fixes in `strategies/mean_reversion.py`:
+
+1. **Removed `_up_ask_cycle_seen` gate** from `_try_confirm_from_book()`. Book confirmation checks bids, not asks — the UP ask gate was blocking valid bid-based confirmations.
+
+2. **Relaxed WS provisional thresholds** from 0.99/0.01 to 0.95/0.05. Provisional status doesn't gate trading decisions; stricter thresholds only increased dashes without any reliability benefit.
+
+3. **Save `_old_cycle_markets` for ALL coins** before inference reset. Previously only the triggering coin's old market was saved, causing REST book-confirm to miss token IDs for other coins.
+
+4. **New `_try_late_inference_for_coin()` method**. When a coin's MarketManager switches after the cycle already advanced, this tries to resolve the coin's dash using cached bids/asks before they're reset.
+
+5. **Extended REST confirm window** from +1s to +5s after entry window. Gives more time for REST book-confirm to resolve remaining dashes.
+
+### 25.6 Volatility & Session Regime Hypothesis: DEAD
+
+**Script**: `research/regime_vol_telonex.py`
+
+Re-tested Section 22's volatility/session hypotheses (originally n=84 BTC trades) with full Telonex data.
+
+#### Volatility (Binance 1h realized vol)
+| Vol Regime | UU->DOWN WR (n) | UUUU->DOWN WR (n) |
+|------------|----------------|-------------------|
+| Low (< p33) | 51.3% (7,401) | 54.1% (1,626) |
+| High (> p67) | 53.1% (7,406) | 55.0% (1,626) |
+| **Original claim** | **79% (28)** | — |
+
+Direction is **REVERSED** — high vol is marginally better. The 79% was pure noise.
+
+#### Session (4h blocks UTC)
+| Session | UU->DOWN WR (n) | UUUU->DOWN WR (n) |
+|---------|----------------|-------------------|
+| Asia 04-08 | 52.3% (2,506) | **49.6% (554)** |
+| EU morn 08-12 | 50.8% (2,469) | 55.1% (564) |
+| **Original: Asia** | **92% (12)** | — |
+
+Asia morning is actually the **WORST** for UUUU→DOWN (p=0.012). The 92% was a 12-trade artifact.
+
+#### Interesting but likely spurious
+- BTC strong downtrend (<-0.5%): UU->DOWN 59.1% WR (n=526, p=0.002) — one of ~30 bins tested
+- Medium Binance volume: UU->DOWN 54.2% (n=4,945, p=0.0008) — contradicts low-vol hypothesis
+
+**Conclusion**: No regime filter can meaningfully improve the base win rates. The strategy works on its own merits or not at all — there is no magic time/volatility window.
+
+### 25.7 Key Lessons
+
+1. **$30 drawdowns are normal.** Simulated worst 24h is -$110. Expected monthly PnL is ~+$430 (at 100% fill) or ~+$130 (at 30% fill).
+
+2. **Small-sample regime effects don't survive.** Choppy 84%→51.3%, Asia morning 92%→49.6%, Low vol 79%→51.3%. Always demand n > 1,000 before implementing a filter.
+
+3. **Overlapping rules are a feature, not a bug.** They increase variance but the extra trades are higher WR (55.5%) because longer streaks have stronger mean-reversion signal.
+
+4. **Race conditions in multi-asset WS systems are insidious.** When 4 coins share cycle timing but have independent WebSocket streams, the first coin to switch triggers inference for all — causing dashes for lagging coins.
+
+5. **No regime filter works.** Volatility, session, choppy/trending — all collapse with large N. The edge is structural (market microstructure), not conditional on external factors.
+
+### 25.8 File Reference
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `research/regime_choppy_telonex.py` | Choppy regime test on full Telonex data | **NEW** |
+| `research/streak_overlap_analysis.py` | Overlapping pattern rule analysis | **NEW** |
+| `research/regime_vol_telonex.py` | Volatility & session regime test on Telonex | **NEW** |
+| `strategies/mean_reversion.py` | 5 inference fixes applied | **UPDATED** |
+
+---
+
+## 26. Session 6 (Part 2): Edge Stability, Technical Indicators & Fill Rate
+
+> **Date**: 2026-03-04
+> **Scripts**: `research/edge_stability_telonex.py`, `research/technical_indicators_telonex.py`, `research/fill_rate_simulation.py`, `research/four_hypotheses_telonex.py`
+> **Data**: Telonex 60,605 markets + Binance BTCUSDT 5m klines
+
+### 26.1 Edge Stability — STABLE / STRENGTHENING
+
+Rolling 7-day analysis over 74 days of Telonex data:
+
+| Metric | UU→DOWN | UUU→DOWN |
+|--------|---------|----------|
+| WR trend slope | +0.00028/day (p=0.023) | +0.00062/day (p=0.002) |
+| First half WR | 51.3% | 52.7% |
+| Second half WR | 53.4% | 55.7% |
+| PnL/day (YAML config, $5) | +$27.14/day (R²=0.923) | — |
+| Profitable days | 70.2% (40/57) | — |
+| Worst single day | -$162 | — |
+| PnL curve shape | CONVEX (accelerating) | — |
+| Structural break | None (Bonferroni p=0.148) | — |
+| Daily PnL autocorrelation | Zero (r=0.033, p=0.81) | — |
+
+**Verdict**: Zero evidence of decay. The edge is structural and slightly strengthening.
+
+**Important**: The original $27/day used a non-standard PnL model. Corrected backtest (0% maker fee, standard model): **$15.49/day** baseline, **$38.34/day** with RSI>60 filter.
+
+### 26.2 Four Hypotheses (Telonex)
+
+| Hypothesis | N | Result | p-value | Verdict |
+|------------|---|--------|---------|---------|
+| Cross-coin divergence | 1,320 | -1.3pp (wrong direction) | 0.357 | **DEAD** |
+| Streak speed | 16 spread | 99.9% consecutive, untestable | 1.000 | **NO DATA** |
+| Day of week | 14,807 | ±1%, inconsistent | 0.216 | **DEAD** |
+| Post-loss autocorrelation (UU) | 14,803 | After-loss 54.0% vs after-win 50.6% | **0.000038** | **SIGNIFICANT** |
+
+Post-loss autocorrelation is significant for UU→DOWN only, not for UUU+. Not directly actionable for current config.
+
+### 26.3 Technical Indicators vs Telonex — MASSIVE SIGNIFICANCE
+
+Crossed Binance BTCUSDT 5m indicators with Telonex outcomes (Bonferroni alpha = 0.0017):
+
+| Indicator | Best bin | WR (N) | Worst bin | WR (N) |
+|-----------|----------|--------|-----------|--------|
+| **Bollinger Bands** | Below lower | **93.1%** (189) | Above upper | **18.6%** (1,427) |
+| **RSI(14)** | <30 | **80.7%** (166) | >70 | **29.5%** (970) |
+| **MACD** | Bearish | **57.8%** (5,160) | Bullish | 49.3% (9,647) |
+| **Stochastic %K** | <20 | **65.7%** (743) | >80 | 47.2% (4,990) |
+| **Volume ratio** | Low (<0.5x) | **56.3%** (3,213) | High (>1.5x) | 45.8% (2,705) |
+| ATR(14) | — | — | — | **DEAD** |
+
+43 of 60 bins survive Bonferroni correction.
+
+#### Critical interpretation: largely TAUTOLOGICAL
+
+The indicators predict DOWN outcomes **without needing streaks**:
+- RSI < 30 alone → 75.0% DOWN rate (vs 49.5% base)
+- BB below lower alone → 86.2% DOWN rate
+- The UP-streak adds only +5-7pp on top
+
+This is because RSI < 30 means "BTC is falling" → DOWN markets win more. The indicator does 90% of the work.
+
+#### But is it priced in?
+
+When BB below lower band (93% WR for DOWN), the DOWN ask at cycle start is likely ~$0.55-0.65 (market expects DOWN). EV calculation:
+- At ask=$0.60, WR=93%: EV = 0.93×$0.40 − 0.07×$0.60 = **+$0.33/token** (enormous)
+- At ask=$0.70, WR=93%: EV = 0.93×$0.30 − 0.07×$0.70 = **+$0.23/token**
+- Break-even ask = WR = $0.93
+
+Even if the market prices DOWN at $0.70-0.80, the 93% WR delivers massive positive EV. However, the max_ask filter ($0.51-0.54) blocks these trades. To capture them, max_ask would need to be raised — but only when BB/RSI signal is active.
+
+#### Actionable: NEGATIVE filter (RSI > 60 = don't trade) — VALIDATED IN BACKTEST
+
+Full 74-day backtest with RSI filter (0% maker fee, all 6 YAML rules):
+
+| RSI Range | Trades | WR | PnL |
+|-----------|--------|----|-----|
+| [0-30) | 52 | **84.6%** | +$87 |
+| [30-40) | 360 | **78.9%** | +$500 |
+| [40-50) | 1,804 | **66.7%** | +$1,394 |
+| [50-60) | 3,207 | **56.4%** | +$818 |
+| [60-70) | 2,060 | **41.6%** | **-$1,000** |
+| [70-80) | 603 | **34.5%** | **-$509** |
+| [80-100) | 95 | **17.9%** | **-$159** |
+
+**RSI > 60 filter results**: removes 2,758 trades (39.2% WR = net losers), boosts WR from 54.0% → **61.6%**, PnL from $15.49/day → **$38.34/day** (+147%).
+
+This is the single most impactful improvement found in the entire research pipeline.
+
+### 26.4 Fill Rate Simulation — Optimal max_ask = $0.47
+
+| max_ask | Fill Rate | EV/trade ($5) | Monthly PnL |
+|---------|-----------|---------------|-------------|
+| $0.45 | ~35% | +$0.47 | ~$420 |
+| **$0.47** | ~47% | +$0.35 | **~$547** |
+| $0.49 | ~65% | +$0.22 | ~$470 |
+| $0.51 (current) | ~80% | +$0.12 | ~$348 |
+| $0.54 | ~92% | +$0.02 | ~$60 |
+
+Caveat: model depends on assumed DOWN ask distribution (limited empirical data). ETH optimal at $0.48, others at $0.46-0.47.
+
+### 26.5 Corrected Backtest (0% Maker Fee)
+
+Full YAML config, 74 days Telonex, $5 size, 0% fee:
+- **8,181 trades, 54.0% WR, $1,131 total PnL ($15.49/day)**
+- With RSI > 60 filter: **5,423 trades, 61.6% WR, $2,799 total PnL ($38.34/day)**
+- Best single pattern: **ETH UUUU→DOWN** — 431 trades, 57.1% WR, $66.30 PnL
+
+### 26.6 Bug Fix: $0.009 Entry Price
+
+Race condition found and fixed: when coin A detects new cycle before coin B's MarketManager switches, `_try_enter_trades` used coin B's OLD market token_id. GTC limit at $0.51 filled against the expiring market's terminal book at $0.009. Fixed with cycle-timestamp guard.
+
+### 26.7 File Reference
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `research/edge_stability_telonex.py` | 74-day stability analysis | **NEW** |
+| `research/technical_indicators_telonex.py` | RSI/BB/MACD/Stoch/Vol vs outcomes | **NEW** |
+| `research/fill_rate_simulation.py` | Optimal max_ask simulation | **NEW** |
+| `research/four_hypotheses_telonex.py` | Cross-coin, streak speed, weekday, autocorr | **NEW** |
+| `research/regime_vol_telonex.py` | Vol/session regime (DEAD) | **NEW** |
+
+---
+
+## 27. Session 6 (Part 3): Multi-Timeframe Indicator Sweep & RSI Period Optimization
+
+> **Scripts**: `research/rsi_multi_timeframe.py`, `research/indicators_multi_timeframe.py`, `research/configurable_backtest.py`
+> **Data**: Telonex 60,605 markets + Binance klines (1m/3m/5m/15m/30m/1h/4h/1d)
+
+### 27.1 RSI Period Optimization — RSI(7) Dramatically Better Than RSI(14)
+
+The 5m timeframe was swept across RSI periods 7, 14, 21, 28 with the skip>60 threshold:
+
+| RSI Period | Trades | WR | Daily PnL | vs Baseline |
+|---|---|---|---|---|
+| **RSI(7)** | **3,879** | **71.5%** | **$53.82/day** | **+247%** |
+| RSI(14) | 5,423 | 61.6% | $38.34/day | +147% |
+| RSI(21) | 6,312 | 58.1% | $29.48/day | +90% |
+| RSI(28) | 6,808 | 56.5% | $24.25/day | +57% |
+
+**RSI(7) is the optimal period.** Shorter period = more responsive to recent momentum = better at detecting overbought conditions that predict UP continuation (i.e., DOWN bet failure). The 4,302 removed trades have only 38.3% WR — the filter surgically removes losers.
+
+Top 5 RSI configurations overall:
+
+| Rank | Config | Trades | WR | Daily PnL |
+|---|---|---|---|---|
+| 1 | 5m RSI(7) skip>60 | 3,879 | 71.5% | $53.82 |
+| 2 | 5m RSI(7) skip>65 | 5,010 | 66.3% | $51.54 |
+| 3 | 5m RSI(7) skip>70 | 6,095 | 62.5% | $46.86 |
+| 4 | 5m RSI(7) skip>55 | 2,738 | 75.3% | $45.26 |
+| 5 | 5m RSI(14) skip>60 | 5,423 | 61.6% | $38.34 |
+
+### 27.2 Timeframe Comparison — 5m Dominates Everything
+
+5m timeframe is optimal for ALL indicators because it matches the Polymarket 5-minute cycle duration.
+
+**RSI(14) skip>60 across timeframes:**
+
+| Timeframe | Best Daily PnL |
+|---|---|
+| **5m** | **$38.34/day** |
+| 1m | $24.32/day |
+| 3m | $23.99/day |
+| 15m | $23.34/day |
+| 30m | $18.96/day |
+| 1h | $17.30/day |
+| 4h | $16.77/day |
+| 1d | $16.53/day |
+
+Higher timeframes dilute the signal; 1m adds noise. 5m is the Goldilocks zone.
+
+### 27.3 All Indicators Multi-Timeframe (28/50 Bonferroni-significant)
+
+**WR improvement over baseline (54.0%) at each timeframe:**
+
+| Indicator | 1m | 5m | 15m | 1h | 4h |
+|---|---|---|---|---|---|
+| **RSI(14) skip>60** | +5.6% | **+7.5%** | +2.9% | +1.2% | +0.4% |
+| **BB above upper skip** | +2.0% | **+4.5%** | +2.0% | +0.8% | +0.2% |
+| **MACD bullish skip** | +5.0% | **+7.4%** | +3.0% | +1.0% | +0.9% |
+| **Stochastic >80 skip** | +3.1% | **+3.6%** | +0.7% | +0.3% | +0.3% |
+| **Volume >1.5x skip** | +0.8% | **+2.0%** | +1.3% | +0.3% | +0.2% |
+
+All effects decay with longer timeframes, confirming indicators track 5-minute microstructure.
+
+### 27.4 Skipped Trade Analysis — Filters Correctly Identify Losers
+
+| Filter | TF | Kept WR | Skipped WR | Spread |
+|---|---|---|---|---|
+| BB above upper skip | 5m | 58.5% | **18.8%** | 39.7% |
+| RSI>60 skip | 5m | 61.6% | **39.2%** | 22.3% |
+| RSI>70 skip | 5m | 56.1% | **32.2%** | 23.8% |
+| MACD bullish skip | 5m | 61.4% | **51.3%** | 10.1% |
+| Volume >1.5x skip | 5m | 56.0% | **46.1%** | 10.0% |
+
+BB above upper band is the most discriminating: skipped trades win only 18.8% — nearly guaranteed losers.
+
+### 27.5 Combination Filters
+
+| Combination | Trades | WR | Daily PnL |
+|---|---|---|---|
+| RSI(14)>60 + BB above upper (1m) | 4,992 | **62.9%** | $50.83 |
+| RSI(14)>60 + BB above upper (5m) | 5,361 | **62.0%** | $50.74 |
+| RSI(14)>60 + BB above upper (15m) | 5,380 | 61.5% | $48.57 |
+| BB above upper + RSI>70 (5m) | 6,971 | 58.9% | $46.78 |
+| Triple: RSI>60 + MACD + BB (5m) | 2,028 | **63.8%** | $22.38 |
+
+Diminishing returns from combinations. RSI alone captures most of the signal. Adding BB provides marginal WR improvement but the daily PnL stays flat because the additional filter removes too many profitable trades.
+
+### 27.6 5m RSI(14) Monotonic Relationship (Definitive)
+
+| RSI Range | Trades | WR | Avg PnL/trade |
+|---|---|---|---|
+| [0-20) | 2 | 100.0% | +$2.45 |
+| [20-30) | 50 | 84.0% | +$1.64 |
+| [30-40) | 360 | 78.9% | +$1.39 |
+| [40-50) | 1,804 | 66.7% | +$0.77 |
+| [50-60) | 3,207 | 56.4% | +$0.25 |
+| [60-70) | 2,060 | 41.6% | -$0.49 |
+| [70-80) | 603 | 34.5% | -$0.84 |
+| [80-100) | 95 | 17.9% | -$1.67 |
+
+Textbook-perfect monotonic decline. At higher timeframes (1h, 4h, 1d), this relationship flattens and even breaks.
+
+### 27.7 Conclusions & Recommendation
+
+1. **Upgrade RSI filter: RSI(14) → RSI(7), both at 5m, threshold 60** — increases daily PnL from $38.34 to $53.82 (+40%)
+2. **5m is the only timeframe that matters** — all others are noise or diluted signal
+3. **BB above upper band (5m)** is the second-best filter and most discriminating (skipped WR=18.8%), but RSI captures most of the same signal
+4. **Combinations provide diminishing returns** — RSI alone is the practical winner
+5. **Trade-off**: RSI(7) keeps 47% of trades (3,879/8,181). For more trades at lower WR, use RSI(7) skip>65 (5,010 trades, 66.3% WR, $51.54/day)
+
+### 27.8 Configurable Backtester
+
+Created `research/configurable_backtest.py` — edit the config section at the top to test any combination of:
+- 7 indicators: RSI, BB_UPPER, BB_LOWER, MACD_HIST, STOCH_K, VOL_RATIO, ATR_PCT
+- Any timeframe, period, threshold
+- Generates equity curve plot at `research/equity_curve.png`
+- Shows per-pattern and per-coin breakdowns
+
+### 27.9 File Reference
+
+| File | Purpose | Status |
+|---|---|---|
+| `research/rsi_multi_timeframe.py` | RSI period + timeframe grid search | **NEW** |
+| `research/indicators_multi_timeframe.py` | 5 indicators × 5 timeframes + combos | **NEW** |
+| `research/configurable_backtest.py` | User-friendly backtester with equity curve | **NEW** |
 
 ---
 

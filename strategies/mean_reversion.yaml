@@ -1,17 +1,40 @@
 # Mean-Reversion Strategy Config (LIVE)
 #
-# Source: full_pattern_scan + top30_oos_suite + regime robustness.
-# This set keeps robust DOWN patterns with the best OOS consistency.
+# Source: full_pattern_scan + top30_oos_suite + regime robustness + RSI filter.
+# Per-pattern max_ask tuned by WR (tighter for lower-edge UUU).
 #
 # Execution model:
 # - Place GTC limit at max_ask around t=1s
 # - Cancel all unfilled after 10s
 # - Hold filled size to resolution
+#
+# RSI filter (implemented in mean_reversion.py):
+# - Fetch BTCUSDT 5m klines from Binance
+# - Skip ALL trades when RSI(7) >= 60
+# - Backtest: 71.5% WR, $53.82/day (Telonex 74d), 66.7% WR (real CSV 5d)
+#
+# Drawdown protection (implemented in mean_reversion.py):
+# - Pause trading if session drawdown exceeds max_drawdown
+# - Pause after max_consecutive_losses in a row
 
 entry_window_start: 1
 entry_window_end: 3
 cancel_timeout: 10.0
 size: 5.0
+
+# RSI filter config
+rsi_filter:
+  enabled: true
+  period: 7
+  timeframe: "5m"
+  threshold: 60        # skip trade when RSI >= this
+
+# Drawdown protection
+drawdown_protection:
+  enabled: true
+  max_drawdown: 30.0          # pause if session PnL drops below -$30
+  max_consecutive_losses: 8   # pause after 8 losses in a row
+  cooldown_minutes: 30        # auto-resume after cooldown (0 = manual restart)
 
 rules:
   # ---------------------------------------------------------------
@@ -48,12 +71,13 @@ rules:
   - pattern: "UDUU"
     side: "DOWN"
     coins: ["BTC"]
-    max_ask: 0.51
+    max_ask: 0.50
 
   # ---------------------------------------------------------------
-  # Length 3 fallback (high frequency)
+  # Length 3 fallback (tighter max_ask — lowest edge pattern)
+  # Telonex WR: 54.0%, breakeven ~$0.502
   # ---------------------------------------------------------------
   - pattern: "UUU"
     side: "DOWN"
     coins: ["BTC", "ETH", "SOL", "XRP"]
-    max_ask: 0.51
+    max_ask: 0.49

@@ -35,12 +35,14 @@ import logging
 import os
 import sys
 import time
+import urllib.request
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import numpy as np
 import yaml
 from dotenv import load_dotenv
 
@@ -92,6 +94,177 @@ ENTRY_WINDOW_END = 3       # seconds — orders placed once, not retried
 # Dry-run simulation penalties (match stat_arb.py)
 SIM_ENTRY_SLIP = 0.01
 SIM_FEE_RATE = 0.015       # 1.5% one-way taker fee
+
+# Binance REST klines URL
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_SYMBOL = "BTCUSDT"
+
+
+# ---------------------------------------------------------------------------
+# RSI filter — fetches Binance 5m klines and computes RSI(7)
+# ---------------------------------------------------------------------------
+def _compute_rsi(closes: np.ndarray, period: int = 7) -> float:
+    """Compute current RSI from an array of close prices.
+
+    Returns the most recent RSI value, or NaN if insufficient data.
+    """
+    n = len(closes)
+    if n < period + 1:
+        return float("nan")
+    delta = np.diff(closes)
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    avg_gain = np.mean(gain[:period])
+    avg_loss = np.mean(loss[:period])
+    for i in range(period, len(delta)):
+        avg_gain = (avg_gain * (period - 1) + gain[i]) / period
+        avg_loss = (avg_loss * (period - 1) + loss[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
+class RSIFilter:
+    """Fetches Binance BTCUSDT klines and provides real-time RSI(7).
+
+    Thread-safe: fetch runs in executor, result cached with timestamp.
+    Klines are fetched every 60s (one API call, ~50 candles).
+    """
+
+    def __init__(self, period: int = 7, timeframe: str = "5m",
+                 threshold: float = 60.0, enabled: bool = True):
+        self.period = period
+        self.timeframe = timeframe
+        self.threshold = threshold
+        self.enabled = enabled
+        self._last_rsi: float = float("nan")
+        self._last_fetch_ts: float = 0.0
+        self._fetch_interval: float = 60.0  # refresh every 60s
+        self._closes: np.ndarray = np.array([])
+        self._warmup_done: bool = False
+
+    @property
+    def current_rsi(self) -> float:
+        return self._last_rsi
+
+    @property
+    def should_skip(self) -> bool:
+        """True if RSI >= threshold (should NOT trade)."""
+        if not self.enabled:
+            return False
+        if np.isnan(self._last_rsi):
+            return False  # fail-open: trade if no data
+        return self._last_rsi >= self.threshold
+
+    def _fetch_and_compute(self) -> float:
+        """Synchronous: fetch klines from Binance and compute RSI.
+
+        Called from executor thread.
+        """
+        try:
+            n_candles = max(self.period * 3, 50)
+            url = (
+                f"{BINANCE_KLINES_URL}?symbol={BINANCE_SYMBOL}"
+                f"&interval={self.timeframe}&limit={n_candles}"
+            )
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            if not data:
+                return float("nan")
+            closes = np.array([float(candle[4]) for candle in data])
+            self._closes = closes
+            rsi = _compute_rsi(closes, self.period)
+            self._last_rsi = rsi
+            self._last_fetch_ts = time.time()
+            if not self._warmup_done and not np.isnan(rsi):
+                self._warmup_done = True
+                log(f"RSI filter warmed up: RSI({self.period})={rsi:.1f} "
+                    f"({len(closes)} candles, threshold={self.threshold})", "info")
+            return rsi
+        except Exception as exc:
+            log(f"RSI fetch error: {exc}", "warning")
+            return self._last_rsi  # keep last value on error
+
+    async def update(self, executor: concurrent.futures.ThreadPoolExecutor) -> float:
+        """Async: refresh RSI if stale. Call this from the main loop."""
+        if not self.enabled:
+            return float("nan")
+        now = time.time()
+        if now - self._last_fetch_ts < self._fetch_interval:
+            return self._last_rsi
+        loop = asyncio.get_running_loop()
+        rsi = await loop.run_in_executor(executor, self._fetch_and_compute)
+        return rsi
+
+
+# ---------------------------------------------------------------------------
+# Drawdown protection — circuit breaker
+# ---------------------------------------------------------------------------
+@dataclass
+class DrawdownProtection:
+    """Pauses trading when session drawdown exceeds limits."""
+    enabled: bool = True
+    max_drawdown: float = 30.0        # pause if session PnL < -max_drawdown
+    max_consecutive_losses: int = 8
+    cooldown_minutes: float = 30.0    # 0 = manual restart required
+    # Runtime state
+    consecutive_losses: int = 0
+    paused: bool = False
+    paused_at: float = 0.0
+    pause_reason: str = ""
+
+    def record_outcome(self, won: bool, session_pnl: float) -> None:
+        """Call after each trade resolution."""
+        if won:
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+
+        # Check triggers
+        if self.enabled and not self.paused:
+            if session_pnl < -self.max_drawdown:
+                self.paused = True
+                self.paused_at = time.time()
+                self.pause_reason = (
+                    f"Drawdown limit: PnL ${session_pnl:+.2f} "
+                    f"< -${self.max_drawdown:.0f}"
+                )
+                log(f"CIRCUIT BREAKER: {self.pause_reason}", "error")
+            elif self.consecutive_losses >= self.max_consecutive_losses:
+                self.paused = True
+                self.paused_at = time.time()
+                self.pause_reason = (
+                    f"Consecutive losses: {self.consecutive_losses} "
+                    f">= {self.max_consecutive_losses}"
+                )
+                log(f"CIRCUIT BREAKER: {self.pause_reason}", "error")
+
+    def check_resume(self) -> bool:
+        """Check if cooldown has elapsed and we can resume."""
+        if not self.paused:
+            return True
+        if self.cooldown_minutes <= 0:
+            return False  # manual restart required
+        elapsed = (time.time() - self.paused_at) / 60.0
+        if elapsed >= self.cooldown_minutes:
+            log(f"Circuit breaker cooldown elapsed ({self.cooldown_minutes:.0f}min). "
+                f"Resuming trading.", "success")
+            self.paused = False
+            self.consecutive_losses = 0
+            self.pause_reason = ""
+            return True
+        return False
+
+    @property
+    def should_skip(self) -> bool:
+        """True if trading is paused (should NOT trade)."""
+        if not self.enabled:
+            return False
+        if self.paused:
+            self.check_resume()
+        return self.paused
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +447,16 @@ class SequenceConfig:
     entry_window_start: int = ENTRY_WINDOW_START
     entry_window_end: int = ENTRY_WINDOW_END
     cancel_timeout: float = 10.0       # seconds after placing GTC to cancel unfilled
+    # RSI filter config
+    rsi_enabled: bool = True
+    rsi_period: int = 7
+    rsi_timeframe: str = "5m"
+    rsi_threshold: float = 60.0
+    # Drawdown protection config
+    dd_enabled: bool = True
+    dd_max_drawdown: float = 30.0
+    dd_max_consecutive_losses: int = 8
+    dd_cooldown_minutes: float = 30.0
 
     @classmethod
     def from_yaml(cls, path: str, dry_run: bool = False,
@@ -300,6 +483,20 @@ class SequenceConfig:
         # then by explicit priority
         rules.sort(key=lambda r: (-len(r.pattern), r.priority))
 
+        # RSI filter config
+        rsi_cfg = raw.get("rsi_filter", {})
+        rsi_enabled = bool(rsi_cfg.get("enabled", True))
+        rsi_period = int(rsi_cfg.get("period", 7))
+        rsi_timeframe = str(rsi_cfg.get("timeframe", "5m"))
+        rsi_threshold = float(rsi_cfg.get("threshold", 60.0))
+
+        # Drawdown protection config
+        dd_cfg = raw.get("drawdown_protection", {})
+        dd_enabled = bool(dd_cfg.get("enabled", True))
+        dd_max_drawdown = float(dd_cfg.get("max_drawdown", 30.0))
+        dd_max_consecutive_losses = int(dd_cfg.get("max_consecutive_losses", 8))
+        dd_cooldown_minutes = float(dd_cfg.get("cooldown_minutes", 30.0))
+
         cfg = cls(
             rules=rules,
             size=float(raw.get("size", 5.0)),
@@ -312,6 +509,14 @@ class SequenceConfig:
             entry_window_start=int(raw.get("entry_window_start", ENTRY_WINDOW_START)),
             entry_window_end=int(raw.get("entry_window_end", ENTRY_WINDOW_END)),
             cancel_timeout=float(raw.get("cancel_timeout", 10.0)),
+            rsi_enabled=rsi_enabled,
+            rsi_period=rsi_period,
+            rsi_timeframe=rsi_timeframe,
+            rsi_threshold=rsi_threshold,
+            dd_enabled=dd_enabled,
+            dd_max_drawdown=dd_max_drawdown,
+            dd_max_consecutive_losses=dd_max_consecutive_losses,
+            dd_cooldown_minutes=dd_cooldown_minutes,
         )
         cfg.validate()
         return cfg
@@ -496,6 +701,23 @@ class SequenceStrategy:
 
         self._load_stats_from_log()
 
+        # RSI filter
+        self._rsi_filter = RSIFilter(
+            period=cfg.rsi_period,
+            timeframe=cfg.rsi_timeframe,
+            threshold=cfg.rsi_threshold,
+            enabled=cfg.rsi_enabled,
+        )
+        self._rsi_skips: int = 0  # count of trades skipped by RSI
+
+        # Drawdown protection
+        self._drawdown = DrawdownProtection(
+            enabled=cfg.dd_enabled,
+            max_drawdown=cfg.dd_max_drawdown,
+            max_consecutive_losses=cfg.dd_max_consecutive_losses,
+            cooldown_minutes=cfg.dd_cooldown_minutes,
+        )
+
         # Sweep + heartbeat
         self._session_start: float = time.time()
         self._last_heartbeat_ts: float = 0.0
@@ -579,11 +801,27 @@ class SequenceStrategy:
         log(
             f"  infer:    t>={INFERENCE_TIME}s, UP>={CERTAIN_UP_ASK:.2f}, DOWN<={CERTAIN_DOWN_ASK:.2f}"
         )
+        if self._rsi_filter.enabled:
+            log(f"  RSI:      RSI({self._rsi_filter.period}) {self._rsi_filter.timeframe} "
+                f"skip>={self._rsi_filter.threshold:.0f}", "info")
+        if self._drawdown.enabled:
+            log(f"  DD prot:  max_dd=${self._drawdown.max_drawdown:.0f} "
+                f"max_consec_losses={self._drawdown.max_consecutive_losses} "
+                f"cooldown={self._drawdown.cooldown_minutes:.0f}min", "info")
         log(f"  dry_run:  {self.cfg.dry_run}")
         log(f"  log:      {self.log_file}")
         print()
 
         try:
+            # Warm up RSI filter before entering trades
+            if self._rsi_filter.enabled:
+                log("Warming up RSI filter (fetching Binance klines)...", "info")
+                await self._rsi_filter.update(self._clob_executor)
+                rsi = self._rsi_filter.current_rsi
+                if not np.isnan(rsi):
+                    skip_str = " -> WOULD SKIP" if rsi >= self._rsi_filter.threshold else " -> OK to trade"
+                    log(f"  RSI({self._rsi_filter.period}) = {rsi:.1f}{skip_str}", "info")
+
             await self._start_all_managers()
             _tui_active = True
 
@@ -1213,50 +1451,66 @@ class SequenceStrategy:
 
         If the upgrade creates new pattern matches and we're still inside
         the entry window, automatically transition to ENTRY_WINDOW.
+
+        Retries up to 3 times with 1s delay to handle settling markets.
         """
-        for coin in COINS:
-            entry = self._find_outcome_entry(coin, old_cycle_ts)
-            if entry is None:
-                continue
-            if entry.status in (
-                ConfirmationStatus.CONFIRMED,
-                ConfirmationStatus.BOOK_CONFIRMED,
-            ):
-                continue
+        # Small delay to let the market settle — MMs need a moment to
+        # post residual bids on the resolved market's book.
+        await asyncio.sleep(1.0)
 
-            token_ids = old_token_ids.get(coin)
-            if not token_ids:
-                continue
+        max_retries = 3
+        for attempt in range(max_retries):
+            all_confirmed = True
 
-            for side in ("up", "down"):
-                tid = token_ids.get(side, "")
-                if not tid:
+            for coin in COINS:
+                entry = self._find_outcome_entry(coin, old_cycle_ts)
+                if entry is None:
                     continue
-                try:
-                    book = await asyncio.to_thread(
-                        self.clob.get_order_book, tid,
-                    )
-                    bids = book.get("bids", [])
-                    if bids:
-                        best_bid = float(bids[0].get("price", 0))
-                        if best_bid >= BOOK_CONFIRM_BID:
-                            outcome = "U" if side == "up" else "D"
-                            prev = entry.outcome
-                            entry.outcome = outcome
-                            entry.status = ConfirmationStatus.BOOK_CONFIRMED
-                            log(
-                                f"  {coin} book-confirmed (REST): {outcome} "
-                                f"({side.upper()} bid={best_bid:.3f})"
-                                + (f" [was {prev}]" if prev != outcome else ""),
-                                "trade",
-                            )
-                            break  # found winner, skip other side
-                except Exception as exc:
-                    log(f"  REST book error {coin}/{side}: {exc}", "warning")
+                if entry.status in (
+                    ConfirmationStatus.CONFIRMED,
+                    ConfirmationStatus.BOOK_CONFIRMED,
+                ):
+                    continue
+
+                all_confirmed = False
+                token_ids = old_token_ids.get(coin)
+                if not token_ids:
+                    continue
+
+                for side in ("up", "down"):
+                    tid = token_ids.get(side, "")
+                    if not tid:
+                        continue
+                    try:
+                        book = await asyncio.to_thread(
+                            self.clob.get_order_book, tid,
+                        )
+                        bids = book.get("bids", [])
+                        if bids:
+                            best_bid = float(bids[0].get("price", 0))
+                            if best_bid >= BOOK_CONFIRM_BID:
+                                outcome = "U" if side == "up" else "D"
+                                prev = entry.outcome
+                                entry.outcome = outcome
+                                entry.status = ConfirmationStatus.BOOK_CONFIRMED
+                                log(
+                                    f"  {coin} book-confirmed (REST): {outcome} "
+                                    f"({side.upper()} bid={best_bid:.3f})"
+                                    + (f" [was {prev}]" if prev != outcome else ""),
+                                    "trade",
+                                )
+                                break  # found winner, skip other side
+                    except Exception as exc:
+                        log(f"  REST book error {coin}/{side}: {exc}", "warning")
+
+            if all_confirmed:
+                break
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2.0)  # wait before retry
 
         # Re-check patterns — if new matches appeared, enter trade window.
         cycle_age = time.time() - self._cycle_start_ts
-        if cycle_age <= self.cfg.entry_window_end + 5:
+        if cycle_age <= self.cfg.entry_window_end + 10:
             matches = self._find_pattern_matches()
             if matches and self.cycle_state == CycleState.OBSERVING:
                 match_strs = [
@@ -1326,7 +1580,31 @@ class SequenceStrategy:
         Orders are placed immediately and tracked in _pending_orders.
         After cancel_timeout seconds, unfilled orders are cancelled.
         Fills (immediate or partial) are recorded as positions.
+
+        Pre-trade filters (checked before any order placement):
+        1. RSI filter: skip all trades when RSI(7) >= threshold
+        2. Drawdown protection: skip when circuit breaker is active
         """
+        # --- Drawdown circuit breaker ---
+        if self._drawdown.should_skip:
+            remaining = ""
+            if self._drawdown.cooldown_minutes > 0:
+                elapsed = (time.time() - self._drawdown.paused_at) / 60.0
+                left = self._drawdown.cooldown_minutes - elapsed
+                remaining = f" ({left:.0f}min until resume)"
+            log(f"SKIP cycle: circuit breaker active — {self._drawdown.pause_reason}{remaining}",
+                "warning")
+            return
+
+        # --- RSI filter ---
+        if self._rsi_filter.should_skip:
+            rsi = self._rsi_filter.current_rsi
+            self._rsi_skips += 1
+            log(f"SKIP cycle: RSI({self._rsi_filter.period})={rsi:.1f} >= "
+                f"{self._rsi_filter.threshold:.0f} (skip #{self._rsi_skips})",
+                "warning")
+            return
+
         matches = self._find_pattern_matches()
         placed_any = False
 
@@ -1816,6 +2094,7 @@ class SequenceStrategy:
                     self.pattern_wins[pattern] += 1
                 self.session_pnl += profit
                 self.total_received += pos.payout
+                self._drawdown.record_outcome(True, self.session_pnl)
                 outcome_str = f"WIN +${profit:.4f}"
                 log(
                     f"WIN  {pos.coin}-{pos.side.upper()} @{pos.fill_price:.2f} "
@@ -1834,6 +2113,7 @@ class SequenceStrategy:
                 if pattern in self.pattern_losses:
                     self.pattern_losses[pattern] += 1
                 self.session_pnl -= effective_cost
+                self._drawdown.record_outcome(False, self.session_pnl)
                 outcome_str = f"LOSS -${effective_cost:.4f}"
                 log(
                     f"LOSS {pos.coin}-{pos.side.upper()} @{pos.fill_price:.2f} "
@@ -1928,12 +2208,14 @@ class SequenceStrategy:
                                 self.coin_wins[coin_key] += 1
                             self.session_pnl += profit
                             self.total_received += payout
+                            self._drawdown.record_outcome(True, self.session_pnl)
                         else:
                             outcome_str = f"LOSS -${cost:.4f}"
                             self.total_losses += 1
                             if coin_key in self.coin_losses:
                                 self.coin_losses[coin_key] += 1
                             self.session_pnl -= cost
+                            self._drawdown.record_outcome(False, self.session_pnl)
 
                         self.total_resolved += 1
                         if coin_key in self.coin_resolved:
@@ -1950,6 +2232,9 @@ class SequenceStrategy:
     # ------------------------------------------------------------------
     async def _tick(self) -> None:
         now = time.time()
+
+        # --- RSI filter: refresh periodically ---
+        await self._rsi_filter.update(self._clob_executor)
 
         # --- Outcome inference: near cycle end, read last tick prices ---
         if self._cycle_start_ts > 0:
@@ -2120,6 +2405,21 @@ class SequenceStrategy:
 
         rules_str = ", ".join(f"{r.pattern}->{r.buy_side[0].upper()}" for r in self.cfg.rules)
 
+        # RSI indicator
+        rsi_val = self._rsi_filter.current_rsi
+        if self._rsi_filter.enabled and not np.isnan(rsi_val):
+            rsi_c = R if rsi_val >= self._rsi_filter.threshold else G
+            rsi_str = f"   RSI({self._rsi_filter.period}):{rsi_c}{B}{rsi_val:.0f}{X}"
+        elif self._rsi_filter.enabled:
+            rsi_str = f"   RSI:{D}--{X}"
+        else:
+            rsi_str = ""
+
+        # Drawdown protection indicator
+        dd_str = ""
+        if self._drawdown.paused:
+            dd_str = f"   {R}{B}PAUSED{X}"
+
         lines.append("")
         lines.append(
             f"  {M}{B}SEQUENCE{X}{dry}"
@@ -2127,6 +2427,7 @@ class SequenceStrategy:
             f"   {countdown}"
             f"   {sc}{B}{st}{X}"
             f"   {D}{up_str}{X}"
+            f"{rsi_str}{dd_str}"
         )
         kelly_str = f"  kelly={self.cfg.kelly}" if self.cfg.kelly > 0 else ""
         lines.append(
@@ -2309,6 +2610,10 @@ class SequenceStrategy:
         print(f"  Total spent:   ${self.total_spent:.4f}")
         print(f"  Total received:${self.total_received:.4f}")
         print(f"  Session PnL:   ${self.session_pnl:+.4f}")
+        if self._rsi_filter.enabled:
+            print(f"  RSI skips:     {self._rsi_skips}")
+        if self._drawdown.paused:
+            print(f"  Circuit break: ACTIVE ({self._drawdown.pause_reason})")
 
         if self.total_resolved > 0:
             wr = (self.total_wins / self.total_resolved) * 100
@@ -2446,6 +2751,16 @@ def main() -> None:
     log(f"Cancel timeout: {cfg.cancel_timeout:.0f}s (GTC limit orders)", "info")
     log(f"Size: ${cfg.size:.0f} flat (no Kelly)", "info")
     log(f"Order type: GTC limit at max_ask (maker-friendly)", "info")
+    if cfg.rsi_enabled:
+        log(f"RSI filter: RSI({cfg.rsi_period}) {cfg.rsi_timeframe} skip >= {cfg.rsi_threshold:.0f}", "info")
+    else:
+        log("RSI filter: DISABLED", "warning")
+    if cfg.dd_enabled:
+        log(f"Drawdown protection: max_dd=${cfg.dd_max_drawdown:.0f} "
+            f"max_consec={cfg.dd_max_consecutive_losses} "
+            f"cooldown={cfg.dd_cooldown_minutes:.0f}min", "info")
+    else:
+        log("Drawdown protection: DISABLED", "warning")
     print()
 
     log("Rules (priority order, longest pattern first):", "info")
