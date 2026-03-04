@@ -58,36 +58,32 @@ warnings.filterwarnings("ignore")
 # ============================================================================
 # CUSTOM CONFIG — edit this section to test your own strategy
 # ============================================================================
-CUSTOM_LABEL = "Top 7 Bonferroni (no filter)"
+CUSTOM_LABEL = "Bonferroni @0.55 (CSV-optimized)"
 
 CUSTOM_RULES = [
     # --- Longest patterns first (first match wins) ---
-    # #2: DUDUDD->UP ALL (57.7% WR, N=958, bonf_p=0.0012)
-    {
-        "pattern": "DUDUDD",
-        "side": "UP",
-        "coins": ["BTC", "ETH", "SOL", "XRP"],
-        "max_ask": 0.51,
-    },
-    # #13: DDDDD->UP ETH (60.3% WR, N=292, p=0.000266)
-    {"pattern": "DDDDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.51},
-    # #1: DDDD->UP ETH (58.3% WR, N=701, bonf_p=0.0070)
-    {"pattern": "DDDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.51},
-    # #6: UUUU->DOWN ETH (57.4% WR, N=751, bonf_p=0.036)
-    {"pattern": "UUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.51},
-    # #6: UUUU->DOWN others (54.5% WR)
+    # max_ask raised from 0.51 to 0.55 based on CSV real-price backtest.
+    # DUDUDD removed — marginal on CSV (50% WR, +$0.75 at best).
+    #
+    # DDDDD->UP ETH (60.3% WR Telonex, 62.5% CSV@0.55)
+    {"pattern": "DDDDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.55},
+    # DDDD->UP ETH (58.3% WR Telonex, 54.5% CSV@0.55)
+    {"pattern": "DDDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.55},
+    # UUUU->DOWN ETH (57.4% WR Telonex, 58.8% CSV@0.54)
+    {"pattern": "UUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.55},
+    # UUUU->DOWN others (54.5% WR Telonex)
     {
         "pattern": "UUUU",
         "side": "DOWN",
         "coins": ["BTC", "SOL", "XRP"],
-        "max_ask": 0.51,
+        "max_ask": 0.55,
     },
-    # #3: UUU->DOWN ETH (55.8% WR, N=1698, bonf_p=0.0013)
-    {"pattern": "UUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.51},
-    # #5: UUU->DOWN others (54.0% WR, N=5373)
-    {"pattern": "UUU", "side": "DOWN", "coins": ["BTC", "SOL", "XRP"], "max_ask": 0.51},
-    # #4: DDD->UP ETH (55.6% WR, N=1580, bonf_p=0.0051)
-    {"pattern": "DDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.51},
+    # UUU->DOWN ETH (55.8% WR Telonex, 54.9% CSV@0.57)
+    {"pattern": "UUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.55},
+    # UUU->DOWN others (54.0% WR Telonex)
+    {"pattern": "UUU", "side": "DOWN", "coins": ["BTC", "SOL", "XRP"], "max_ask": 0.55},
+    # DDD->UP ETH (55.6% WR Telonex, 54.8% CSV@0.57)
+    {"pattern": "DDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.55},
 ]
 
 CUSTOM_FILTERS = []  # No filters — RSI proven useless after look-ahead fix

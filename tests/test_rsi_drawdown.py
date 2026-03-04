@@ -224,23 +224,39 @@ class TestYAMLConfig:
         assert cfg.dd_max_consecutive_losses == 8
         assert cfg.dd_cooldown_minutes == 30.0
 
-    def test_loads_tighter_maxask(self):
-        """YAML should have updated max_ask values."""
+    def test_loads_maxask_055(self):
+        """YAML should have max_ask=0.55 for all rules (raised from 0.51)."""
         cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
-        # All rules now use max_ask 0.51
-        uuu_rule = next(r for r in cfg.rules if r.pattern == "UUU")
-        assert uuu_rule.max_ask == 0.51
+        # All 7 rules use max_ask 0.55
+        assert len(cfg.rules) == 7
+        for r in cfg.rules:
+            assert r.max_ask == 0.55, (
+                f"Rule {r.pattern} has max_ask={r.max_ask}, expected 0.55"
+            )
 
-        # DDDD->UP ETH should exist (new bidirectional pattern)
-        dddd_rule = next(r for r in cfg.rules if r.pattern == "DDDD")
-        assert dddd_rule.buy_side == "up"
-        assert dddd_rule.max_ask == 0.51
+    def test_bidirectional_rules(self):
+        """YAML should have both UP and DOWN side rules."""
+        cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
 
-        # ETH UUUU now also 0.51 (uniform max_ask)
+        # DOWN-streak reversals bet UP: DDDDD, DDDD, DDD (all ETH)
+        up_rules = [r for r in cfg.rules if r.buy_side == "up"]
+        assert len(up_rules) == 3
+        up_patterns = sorted([r.pattern for r in up_rules])
+        assert up_patterns == ["DDD", "DDDD", "DDDDD"]
+        for r in up_rules:
+            assert r.coins == ["ETH"]
+
+        # UP-streak reversals bet DOWN: UUUU(ETH), UUUU(BTC/SOL/XRP), UUU(ETH), UUU(BTC/SOL/XRP)
+        dn_rules = [r for r in cfg.rules if r.buy_side == "down"]
+        assert len(dn_rules) == 4
         eth_uuuu = next(
-            r for r in cfg.rules if r.pattern == "UUUU" and "ETH" in (r.coins or [])
+            r for r in dn_rules if r.pattern == "UUUU" and "ETH" in (r.coins or [])
         )
-        assert eth_uuuu.max_ask == 0.51
+        assert eth_uuuu.max_ask == 0.55
+        others_uuuu = next(
+            r for r in dn_rules if r.pattern == "UUUU" and "BTC" in (r.coins or [])
+        )
+        assert set(others_uuuu.coins or []) == {"BTC", "SOL", "XRP"}
 
     def test_rules_sorted_longest_first(self):
         """Rules should be sorted by pattern length (longest first)."""
