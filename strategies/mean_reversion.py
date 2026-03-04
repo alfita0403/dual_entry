@@ -73,13 +73,13 @@ DEFAULT_CONFIG = Path(__file__).resolve().parent / "mean_reversion.yaml"
 INFERENCE_TIME = 295               # seconds into cycle to read outcome
 CERTAIN_UP_ASK = 0.99             # UP ask >= this => provisional UP
 CERTAIN_DOWN_ASK = 0.01           # UP ask <= this => provisional DOWN
-GAMMA_RECHECK_INITIAL_DELAY = 210  # ~3.5 min after cycle closes
+GAMMA_RECHECK_INITIAL_DELAY = 45   # ~45s after cycle closes (markets settle in 15-30s)
 GAMMA_RECHECK_RETRY_DELAY = 300    # retry every cycle if unresolved
 
 # Book-confirm threshold: if a side's bid >= this after cycle ends, that side won.
 # Market makers leave residual bids near $1 for resolved shares; checking this
 # at cycle rollover gives near-instant confirmation without waiting for Gamma.
-BOOK_CONFIRM_BID = 0.99
+BOOK_CONFIRM_BID = 0.95
 
 # Max ask price filter — don't buy when ask is too expensive (bad risk/reward)
 DEFAULT_MAX_ASK = 0.60     # only enter if ask <= this
@@ -433,6 +433,10 @@ class SequenceStrategy:
         self._old_cycle_markets: Dict[str, Optional[MarketInfo]] = {
             c: None for c in COINS
         }
+        # Pre-reset snapshots so late-switching coins can still infer outcomes
+        self._pre_reset_asks: Dict[str, Dict[str, float]] = {}
+        self._pre_reset_bids: Dict[str, Dict[str, float]] = {}
+        self._pre_reset_up_ask_seen: Dict[str, Optional[int]] = {}
 
         # Outcome confirmation queue (Gamma recheck for every inferred cycle)
         # key=(coin, cycle_ts), value={"slug": str, "next_check": float}
@@ -771,6 +775,11 @@ class SequenceStrategy:
         self._fee_rate_cache.clear()
         self.cycles_seen += 1
 
+        # Save pre-reset snapshot so late-switching coins can still infer
+        self._pre_reset_asks = {c: dict(v) for c, v in self._best_asks.items()}
+        self._pre_reset_bids = {c: dict(v) for c, v in self._best_bids.items()}
+        self._pre_reset_up_ask_seen = dict(self._up_ask_cycle_seen)
+
         # Reset orderbook caches
         self._best_asks = {c: {"up": 1.0, "down": 1.0} for c in COINS}
         self._best_bids = {c: {"up": 0.0, "down": 0.0} for c in COINS}
@@ -969,27 +978,31 @@ class SequenceStrategy:
         return "".join(e.outcome for e in entries)
 
     def _try_infer_outcomes_from_prices(self) -> None:
-        """At end of cycle, infer provisional outcome from last UP ask.
+        """At end of cycle, infer provisional outcome from last UP/DOWN asks.
 
-        Always records one symbol per coin:
-        - U / D when last tick is near-certain
-        - - when ambiguous or missing
-        Every recorded result is then rechecked with Gamma until confirmed.
+        First call records an entry (U, D, or dash).  Subsequent calls can
+        UPGRADE a dash to U/D as prices converge toward cycle end, but never
+        downgrade a committed U/D.  Uses both UP ask and DOWN ask for
+        multi-signal confirmation.
         """
         if self._cycle_ts is None:
             return
 
         for coin in COINS:
-            # Don't double-record for same cycle
-            if self._last_inference_ts[coin] == self._cycle_ts:
-                continue
-
             cycle_ts = self._cycle_ts
             slug = self._slug_for_cycle(coin, cycle_ts)
 
+            # Check if we already have an entry for this cycle
+            existing = self._find_outcome_entry(coin, cycle_ts)
+
+            # If already committed (U or D), skip — don't downgrade
+            if existing and existing.outcome != "-":
+                continue
+
             # Require at least one UP snapshot from this cycle.
-            # Prevents false inference from default ask placeholders.
             if self._up_ask_cycle_seen[coin] != cycle_ts:
+                if existing:
+                    continue  # already have a dash, can't improve without data
                 entry = OutcomeEntry(
                     outcome="-",
                     status=ConfirmationStatus.UNKNOWN,
@@ -1004,35 +1017,37 @@ class SequenceStrategy:
                 continue
 
             up_ask = self._best_asks[coin]["up"]
+            down_ask = self._best_asks[coin]["down"]
 
-            if up_ask >= CERTAIN_UP_ASK:
-                entry = OutcomeEntry(
-                    outcome="U",
-                    status=ConfirmationStatus.PROVISIONAL,
-                    cycle_ts=cycle_ts,
-                    market_slug=slug,
-                    observed_up_ask=up_ask,
-                )
-                self._outcome_history[coin].append(entry)
-                self._last_inference_ts[coin] = cycle_ts
-                self._queue_outcome_recheck(coin, cycle_ts, slug)
-                log(f"  {coin} outcome provisional: U (ask={up_ask:.3f})", "trade")
-            elif up_ask <= CERTAIN_DOWN_ASK:
-                entry = OutcomeEntry(
-                    outcome="D",
-                    status=ConfirmationStatus.PROVISIONAL,
-                    cycle_ts=cycle_ts,
-                    market_slug=slug,
-                    observed_up_ask=up_ask,
-                )
-                self._outcome_history[coin].append(entry)
-                self._last_inference_ts[coin] = cycle_ts
-                self._queue_outcome_recheck(coin, cycle_ts, slug)
-                log(f"  {coin} outcome provisional: D (ask={up_ask:.3f})", "trade")
+            # Multi-signal: use both UP and DOWN asks
+            is_up = up_ask >= CERTAIN_UP_ASK or down_ask <= CERTAIN_DOWN_ASK
+            is_down = up_ask <= CERTAIN_DOWN_ASK or down_ask >= CERTAIN_UP_ASK
+
+            if is_up:
+                outcome, label = "U", "U"
+            elif is_down:
+                outcome, label = "D", "D"
             else:
+                outcome, label = "-", "-"
+
+            if existing:
+                # Upgrade existing dash -> U/D
+                if outcome != "-":
+                    existing.outcome = outcome
+                    existing.status = ConfirmationStatus.PROVISIONAL
+                    existing.observed_up_ask = up_ask
+                    log(
+                        f"  {coin} outcome UPGRADED: {outcome} "
+                        f"(up_ask={up_ask:.3f}, down_ask={down_ask:.3f})",
+                        "trade",
+                    )
+                # else: still ambiguous, leave as dash
+            else:
+                # First record for this cycle
                 entry = OutcomeEntry(
-                    outcome="-",
-                    status=ConfirmationStatus.UNKNOWN,
+                    outcome=outcome,
+                    status=(ConfirmationStatus.PROVISIONAL if outcome != "-"
+                            else ConfirmationStatus.UNKNOWN),
                     cycle_ts=cycle_ts,
                     market_slug=slug,
                     observed_up_ask=up_ask,
@@ -1040,10 +1055,18 @@ class SequenceStrategy:
                 self._outcome_history[coin].append(entry)
                 self._last_inference_ts[coin] = cycle_ts
                 self._queue_outcome_recheck(coin, cycle_ts, slug)
-                log(
-                    f"  {coin} outcome provisional: - (ask={up_ask:.3f}, ambiguous)",
-                    "warning",
-                )
+                if outcome != "-":
+                    log(
+                        f"  {coin} outcome provisional: {outcome} "
+                        f"(up_ask={up_ask:.3f}, down_ask={down_ask:.3f})",
+                        "trade",
+                    )
+                else:
+                    log(
+                        f"  {coin} outcome provisional: - "
+                        f"(up_ask={up_ask:.3f}, down_ask={down_ask:.3f}, ambiguous)",
+                        "warning",
+                    )
 
     # ------------------------------------------------------------------
     # Book confirmation — check residual bids at cycle rollover
@@ -1119,15 +1142,29 @@ class SequenceStrategy:
         if entry.outcome != "-" and entry.status != ConfirmationStatus.UNKNOWN:
             return
 
-        # Try bid-based confirmation first (most reliable)
-        up_bid = self._best_bids[coin]["up"]
-        down_bid = self._best_bids[coin]["down"]
+        # Use pre-reset snapshot if live cache was already cleared
+        pre = getattr(self, "_pre_reset_asks", None)
+        if pre and self._best_asks[coin]["up"] == 1.0 and self._up_ask_cycle_seen[coin] is None:
+            up_bid = self._pre_reset_bids.get(coin, {}).get("up", 0.0)
+            down_bid = self._pre_reset_bids.get(coin, {}).get("down", 0.0)
+            up_ask = pre.get(coin, {}).get("up", 1.0)
+            down_ask = pre.get(coin, {}).get("down", 1.0)
+            had_data = self._pre_reset_up_ask_seen.get(coin) is not None
+            source = "pre-reset"
+        else:
+            up_bid = self._best_bids[coin]["up"]
+            down_bid = self._best_bids[coin]["down"]
+            up_ask = self._best_asks[coin]["up"]
+            down_ask = self._best_asks[coin]["down"]
+            had_data = self._up_ask_cycle_seen[coin] is not None
+            source = "live"
 
+        # Try bid-based confirmation first (most reliable, post-resolution)
         if up_bid >= BOOK_CONFIRM_BID:
             entry.outcome = "U"
             entry.status = ConfirmationStatus.BOOK_CONFIRMED
             log(
-                f"  {coin} late book-confirmed: U (UP bid={up_bid:.3f})",
+                f"  {coin} late book-confirmed: U (UP bid={up_bid:.3f}, {source})",
                 "trade",
             )
             return
@@ -1135,29 +1172,27 @@ class SequenceStrategy:
             entry.outcome = "D"
             entry.status = ConfirmationStatus.BOOK_CONFIRMED
             log(
-                f"  {coin} late book-confirmed: D (DOWN bid={down_bid:.3f})",
+                f"  {coin} late book-confirmed: D (DOWN bid={down_bid:.3f}, {source})",
                 "trade",
             )
             return
 
-        # Try ask-based provisional inference
-        up_ask = self._best_asks[coin]["up"]
-        if up_ask == 1.0 and self._up_ask_cycle_seen[coin] is None:
-            # No real data — can't infer
+        if not had_data:
             return
 
-        if up_ask >= CERTAIN_UP_ASK:
+        # Multi-signal inference: use UP ask, DOWN ask, and bids together
+        if up_ask >= CERTAIN_UP_ASK or down_ask <= CERTAIN_DOWN_ASK:
             entry.outcome = "U"
             entry.status = ConfirmationStatus.PROVISIONAL
             log(
-                f"  {coin} late inferred: U (ask={up_ask:.3f})",
+                f"  {coin} late inferred: U (up_ask={up_ask:.3f}, down_ask={down_ask:.3f}, {source})",
                 "trade",
             )
-        elif up_ask <= CERTAIN_DOWN_ASK:
+        elif up_ask <= CERTAIN_DOWN_ASK or down_ask >= CERTAIN_UP_ASK:
             entry.outcome = "D"
             entry.status = ConfirmationStatus.PROVISIONAL
             log(
-                f"  {coin} late inferred: D (ask={up_ask:.3f})",
+                f"  {coin} late inferred: D (up_ask={up_ask:.3f}, down_ask={down_ask:.3f}, {source})",
                 "trade",
             )
 
@@ -1304,6 +1339,19 @@ class SequenceStrategy:
 
             market = self._coin_markets.get(coin)
             if not market:
+                continue
+
+            # Guard: skip coins whose MarketManager hasn't switched to the
+            # current cycle yet.  Without this, we'd place orders using the
+            # OLD market's token_id, which can fill at terminal prices
+            # (e.g. $0.009 DOWN when UP is about to win the old cycle).
+            ms = market.start_timestamp()
+            if ms is not None and ms != self._cycle_ts:
+                log(
+                    f"SKIP {coin}: market {market.slug} belongs to cycle "
+                    f"{ms}, not current cycle {self._cycle_ts}",
+                    "warning",
+                )
                 continue
 
             buy_side = rule.buy_side
