@@ -7,6 +7,7 @@ Two data modes:
   (default): Use Telonex 74-day parquet (outcomes only, assumes entry at max_ask)
 
 Usage:
+    # Preset comparison mode (multiple configs on one chart)
     python research/backtest.py --csv                      # CSV mode, default preset
     python research/backtest.py --csv --preset rsi7        # CSV mode, RSI sweep
     python research/backtest.py --csv --preset maxask      # CSV mode, max_ask sweep
@@ -18,6 +19,13 @@ Usage:
 
     python research/backtest.py --custom                   # custom config (edit top of file)
     python research/backtest.py --list                     # list presets
+
+    # Single-pattern backtest mode (max_ask sweep + per-coin + weekly stability)
+    python research/backtest.py --pattern UUU              # All coins, auto side (DOWN)
+    python research/backtest.py --pattern UUU --coin ETH   # ETH only
+    python research/backtest.py --pattern DDD              # Auto side: bet UP
+    python research/backtest.py --pattern UUU --max-ask 0.49  # Fixed max_ask + RSI comparison
+    python research/backtest.py --pattern DUDUDD --csv     # CSV data
 """
 
 import json
@@ -691,9 +699,12 @@ class IndicatorEngine:
             return np.nan
         tf_s = self._TF_SECONDS.get(tf, 300)
         # Snap to the kline boundary at or before this timestamp.
-        # The most recent *completed* candle is one boundary back.
+        # The candle at `snapped` opens at T and covers [T, T+tf_s) — it is
+        # NOT yet complete at trade decision time.  The last COMPLETED candle
+        # opened at snapped - tf_s and closed at snapped.
         snapped = (ts // tf_s) * tf_s
-        for candidate in [snapped, snapped - tf_s, snapped + tf_s]:
+        last_completed = snapped - tf_s
+        for candidate in [last_completed, last_completed - tf_s]:
             row = lk.get(candidate)
             if row is not None:
                 v = row.get(col, np.nan)
@@ -799,6 +810,11 @@ COLORS = [
 ]
 
 
+def _esc(s: str) -> str:
+    """Escape $ for matplotlib labels (prevents mathtext parsing)."""
+    return s.replace("$", "\\$")
+
+
 def plot_curves(
     results: List[Tuple[str, pd.DataFrame]], output_file: Path, title: str = ""
 ):
@@ -830,7 +846,9 @@ def plot_curves(
 
             color = COLORS[i % len(COLORS)]
             s = stats(tdf)
-            short = f"{label} ({s['n']:,}tr, {s['wr'] * 100:.0f}%WR, ${s['pnl']:+.1f})"
+            short = _esc(
+                f"{label} ({s['n']:,}tr, {s['wr'] * 100:.0f}%WR, ${s['pnl']:+.1f})"
+            )
             ax.plot(
                 cum_pnl.index,
                 cum_pnl.values,
@@ -875,7 +893,7 @@ def plot_curves(
             dates = pd.to_datetime(daily["date"])
             color = COLORS[i % len(COLORS)]
             s = stats(tdf)
-            short = (
+            short = _esc(
                 f"{label} ({s['n']:,}tr, {s['wr'] * 100:.0f}%WR, ${s['daily']:+.1f}/d)"
             )
             ax_eq.plot(
@@ -1121,6 +1139,7 @@ PRESETS = {
             ("max_ask=$0.49", make_rules_with_maxask(0.49), []),
             ("max_ask=$0.51 (current)", DEFAULT_RULES, []),
             ("max_ask=$0.54", make_rules_with_maxask(0.54), []),
+            ("max_ask=$0.60", make_rules_with_maxask(0.60), []),
         ],
     },
     "indicators": {
@@ -1203,6 +1222,259 @@ PRESETS = {
 
 
 # ---------------------------------------------------------------------------
+# Single-pattern backtest mode
+# ---------------------------------------------------------------------------
+def _run_pattern_mode(args):
+    """Run a detailed backtest for a single pattern.
+
+    Usage:
+        python research/backtest.py --pattern UUU                      # All coins, auto side, max_ask sweep
+        python research/backtest.py --pattern UUU --coin ETH           # ETH only
+        python research/backtest.py --pattern UUU --max-ask 0.49       # Fixed max_ask
+        python research/backtest.py --pattern DDD                      # Auto-detects: bet UP
+        python research/backtest.py --pattern DUDUDD --coin ALL        # Explicit ALL coins
+        python research/backtest.py --pattern UUU --csv                # Use CSV data
+    """
+    from scipy.stats import binomtest
+
+    pattern = args.pattern.upper()
+    use_csv = args.csv
+    mode_str = "CSV (real prices)" if use_csv else "Telonex (74 days)"
+    size = args.size
+    fee = args.fee
+
+    # Auto-detect bet side: bet AGAINST the last character (reversal)
+    last_char = pattern[-1]
+    side = "DOWN" if last_char == "U" else "UP"
+
+    # Coin filter
+    if args.coin and args.coin.upper() != "ALL":
+        coins = [args.coin.upper()]
+        if coins[0] not in COINS:
+            print(f"  ERROR: Unknown coin '{coins[0]}'. Must be one of {COINS}")
+            return
+    else:
+        coins = COINS
+    coins_str = ",".join(coins) if len(coins) < 4 else "ALL"
+
+    print("=" * 80)
+    print(f"  SINGLE PATTERN BACKTEST — {mode_str}")
+    print(f"  Pattern: {pattern} -> Bet {side}  |  Coins: {coins_str}")
+    print("=" * 80)
+
+    # Load data
+    if use_csv:
+        print(f"\n  Loading CSV data...")
+        raw = load_csvs()
+        seqs = csv_build_cycles(raw)
+        all_ts = []
+        for c in COINS:
+            all_ts.extend(seqs[c]["start_ts"])
+        ts_min, ts_max = min(all_ts), max(all_ts)
+        trade_finder = find_trades_csv
+    else:
+        print(f"\n  Loading Telonex data...")
+        tdf = load_telonex()
+        seqs = build_sequences(tdf)
+        n_markets = len(tdf)
+        date_min, date_max = tdf["date"].min(), tdf["date"].max()
+        ndays_total = (date_max - date_min).days + 1
+        print(
+            f"  {n_markets:,} markets | {date_min} to {date_max} ({ndays_total} days)"
+        )
+        ts_min = int(tdf["start_ts"].min())
+        ts_max = int(tdf["start_ts"].max())
+        trade_finder = find_trades
+
+    engine = IndicatorEngine(ts_min, ts_max)
+
+    # --- Max ask sweep ---
+    if args.max_ask is not None:
+        # Single max_ask: show baseline + RSI variants
+        ma_values = [args.max_ask]
+        show_rsi_comparison = not args.no_rsi
+    else:
+        # Sweep: find the profitable range
+        ma_values = [0.45, 0.47, 0.49, 0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.57, 0.60]
+        show_rsi_comparison = False
+
+    print(
+        f"\n  {'MaxAsk':>8} {'Trades':>7} {'Wins':>6} {'WR':>6} {'PnL':>10} {'$/day':>8} {'MaxDD':>8} {'p-value':>10} {'Sig?':>5}"
+    )
+    print(
+        f"  {'-' * 8} {'-' * 7} {'-' * 6} {'-' * 6} {'-' * 10} {'-' * 8} {'-' * 8} {'-' * 10} {'-' * 5}"
+    )
+
+    best_pnl = -9999
+    best_ma = None
+    best_trades_df = None
+
+    for ma in ma_values:
+        rules = [{"pattern": pattern, "side": side, "coins": coins, "max_ask": ma}]
+        trades = trade_finder(seqs, rules, size=size, fee=fee)
+        s = stats(trades)
+        n, wr = s["n"], s["wr"]
+
+        # Statistical significance via binomial test
+        if n > 0:
+            wins = int(trades["hit"].sum())
+            bt = binomtest(wins, n, 0.5, alternative="greater")
+            pval = bt.pvalue
+            sig = (
+                "***"
+                if pval < 0.001
+                else "**"
+                if pval < 0.01
+                else "*"
+                if pval < 0.05
+                else ""
+            )
+        else:
+            pval = 1.0
+            sig = ""
+
+        marker = " <--" if s["pnl"] > best_pnl and n > 0 else ""
+        print(
+            f"  ${ma:.2f}   {n:>7,} {int(n * wr):>6} {wr * 100:>5.1f}% ${s['pnl']:>+9.2f} "
+            f"${s['daily']:>+7.2f} ${s['dd']:>7.2f}  {pval:>9.6f} {sig:>5}{marker}"
+        )
+
+        if n > 0 and s["pnl"] > best_pnl:
+            best_pnl = s["pnl"]
+            best_ma = ma
+            best_trades_df = trades
+
+    # --- Per-coin breakdown at best max_ask ---
+    if best_trades_df is not None and not best_trades_df.empty:
+        print(f"\n  Best max_ask: ${best_ma:.2f}")
+
+        if len(coins) > 1:
+            print(f"\n  Per-coin breakdown (max_ask=${best_ma:.2f}):")
+            print(
+                f"  {'Coin':<6} {'Trades':>7} {'Wins':>6} {'WR':>6} {'PnL':>10} {'p-value':>10}"
+            )
+            print(f"  {'-' * 6} {'-' * 7} {'-' * 6} {'-' * 6} {'-' * 10} {'-' * 10}")
+            for coin in coins:
+                sub = best_trades_df[best_trades_df["coin"] == coin]
+                if sub.empty:
+                    continue
+                n = len(sub)
+                w = int(sub["hit"].sum())
+                wr = w / n
+                pnl = sub["pnl"].sum()
+                bt = binomtest(w, n, 0.5, alternative="greater")
+                sig = (
+                    "***"
+                    if bt.pvalue < 0.001
+                    else "**"
+                    if bt.pvalue < 0.01
+                    else "*"
+                    if bt.pvalue < 0.05
+                    else ""
+                )
+                print(
+                    f"  {coin:<6} {n:>7} {w:>6} {wr * 100:>5.1f}% ${pnl:>+9.2f}  {bt.pvalue:>9.6f} {sig}"
+                )
+
+        # --- Weekly stability ---
+        daily = (
+            best_trades_df.groupby("date")
+            .agg(pnl=("pnl", "sum"), n=("pnl", "count"), wins=("hit", "sum"))
+            .reset_index()
+        )
+        daily["date"] = pd.to_datetime(daily["date"])
+        daily = daily.sort_values("date")
+
+        # Group by week
+        daily["week"] = daily["date"].dt.isocalendar().week.astype(int)
+        daily["year"] = daily["date"].dt.isocalendar().year.astype(int)
+        weekly = (
+            daily.groupby(["year", "week"])
+            .agg(
+                pnl=("pnl", "sum"),
+                n=("n", "sum"),
+                wins=("wins", "sum"),
+                days=("date", "count"),
+            )
+            .reset_index()
+        )
+
+        if len(weekly) >= 3:
+            print(f"\n  Weekly stability (max_ask=${best_ma:.2f}):")
+            print(f"  {'Week':>8} {'Trades':>7} {'WR':>6} {'PnL':>10} {'Green?':>7}")
+            print(f"  {'-' * 8} {'-' * 7} {'-' * 6} {'-' * 10} {'-' * 7}")
+            green_weeks = 0
+            for _, row in weekly.iterrows():
+                n = int(row["n"])
+                w = int(row["wins"])
+                wr = w / n if n > 0 else 0
+                pnl = row["pnl"]
+                green = "YES" if pnl > 0 else "no"
+                if pnl > 0:
+                    green_weeks += 1
+                print(
+                    f"  W{int(row['week']):02d}     {n:>7} {wr * 100:>5.1f}% ${pnl:>+9.2f} {green:>7}"
+                )
+            print(
+                f"\n  Green weeks: {green_weeks}/{len(weekly)} ({green_weeks / len(weekly) * 100:.0f}%)"
+            )
+
+        # --- RSI comparison (if applicable and not --no-rsi) ---
+        if show_rsi_comparison and args.max_ask is not None:
+            ma = args.max_ask
+            rules = [{"pattern": pattern, "side": side, "coins": coins, "max_ask": ma}]
+            base_trades = trade_finder(seqs, rules, size=size, fee=fee)
+
+            rsi_configs = [
+                ("No filter", []),
+                (
+                    "RSI(7)<55",
+                    [
+                        {
+                            "indicator": "RSI",
+                            "period": 7,
+                            "timeframe": "5m",
+                            "condition": "<",
+                            "threshold": 55,
+                        }
+                    ],
+                ),
+                ("RSI(7)<60", RSI7_60),
+                ("RSI(7)<65", RSI7_65),
+                ("RSI(14)<60", RSI14_60),
+            ]
+
+            print(f"\n  RSI filter comparison (max_ask=${ma:.2f}):")
+            print(f"  {'Filter':<16} {'Trades':>7} {'WR':>6} {'PnL':>10} {'$/day':>8}")
+            print(f"  {'-' * 16} {'-' * 7} {'-' * 6} {'-' * 10} {'-' * 8}")
+
+            for flabel, filt in rsi_configs:
+                if filt:
+                    ft = apply_filters(base_trades, filt, engine)
+                else:
+                    ft = base_trades
+                s = stats(ft)
+                print(
+                    f"  {flabel:<16} {s['n']:>7,} {s['wr'] * 100:>5.1f}% ${s['pnl']:>+9.2f} ${s['daily']:>+7.2f}"
+                )
+
+    # --- Plot equity curve ---
+    if best_trades_df is not None and not best_trades_df.empty and HAS_MPL:
+        out = (
+            Path(args.output)
+            if args.output
+            else OUTPUT_DIR / f"equity_pattern_{pattern}_{coins_str}.png"
+        )
+        coin_tag = f" ({coins_str})" if len(coins) < 4 else ""
+        title = f"Pattern {pattern} -> {side}{coin_tag} -- max_ask=${best_ma:.2f} ({mode_str})"
+        plot_curves(
+            [(f"{pattern}->{side} ma=${best_ma:.2f}", best_trades_df)], out, title
+        )
+
+    print(f"\n  Done!")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -1232,6 +1504,29 @@ def main():
     )
     parser.add_argument("--fee", type=float, default=0.0, help="Fee rate (default 0%%)")
     parser.add_argument("--output", type=str, default=None, help="Output PNG path")
+    parser.add_argument(
+        "--max-ask",
+        type=float,
+        default=None,
+        help="Override max_ask for ALL rules (e.g. --max-ask 0.60). Applies RSI(7)<60 by default.",
+    )
+    parser.add_argument(
+        "--no-rsi",
+        action="store_true",
+        help="Disable RSI filter (only with --max-ask)",
+    )
+    parser.add_argument(
+        "--pattern",
+        type=str,
+        default=None,
+        help="Single pattern to test, e.g. UUU, DDD, UUUU. Auto-detects bet side (reversal).",
+    )
+    parser.add_argument(
+        "--coin",
+        type=str,
+        default=None,
+        help="Single coin to test (BTC, ETH, SOL, XRP). Default: ALL coins.",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -1240,7 +1535,18 @@ def main():
             configs = preset["configs"]
             print(f"  --preset {name:12s}  {preset['title']}  ({len(configs)} curves)")
         print(f"\n  --custom              Run the CUSTOM_* config at top of file")
+        print(
+            f"\n  --pattern UUU         Single-pattern backtest (max_ask sweep, per-coin, weekly)"
+        )
+        print(
+            f"  --pattern UUU --coin ETH --max-ask 0.49   (with coin filter and RSI comparison)"
+        )
         print(f"\n  --csv                 Use real CSV data instead of Telonex")
+        return
+
+    # --pattern mode: single-pattern backtest with detailed output
+    if args.pattern is not None:
+        _run_pattern_mode(args)
         return
 
     use_csv = args.csv
@@ -1281,8 +1587,46 @@ def main():
 
     engine = IndicatorEngine(ts_min, ts_max)
 
-    # Determine configs to run
-    if args.custom:
+    # --max-ask override: multiple curves at that max_ask with different filters
+    if args.max_ask is not None:
+        ma = args.max_ask
+        rules_ma = make_rules_with_maxask(ma)
+        configs = [
+            (f"No filter (baseline)", rules_ma, []),
+            (f"RSI(7)<60", rules_ma, RSI7_60),
+            (f"RSI(7)<65", rules_ma, RSI7_65),
+            (
+                f"RSI(7)<55",
+                rules_ma,
+                [
+                    {
+                        "indicator": "RSI",
+                        "period": 7,
+                        "timeframe": "5m",
+                        "condition": "<",
+                        "threshold": 55,
+                    },
+                ],
+            ),
+            (
+                f"RSI(14)<60",
+                rules_ma,
+                [
+                    {
+                        "indicator": "RSI",
+                        "period": 14,
+                        "timeframe": "5m",
+                        "condition": "<",
+                        "threshold": 60,
+                    },
+                ],
+            ),
+        ]
+        title = f"Backtest max_ask={ma:.2f} — Filter Comparison ({mode_str})"
+        preset_name = f"csv_maxask_{ma:.2f}" if use_csv else f"maxask_{ma:.2f}"
+        size = args.size
+        fee = args.fee
+    elif args.custom:
         configs = [
             ("Baseline (no filter)", DEFAULT_RULES, []),
             (CUSTOM_LABEL, CUSTOM_RULES, CUSTOM_FILTERS),
