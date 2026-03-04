@@ -98,7 +98,7 @@ SIM_FEE_RATE = 0.015  # 1.5% one-way taker fee
 
 # Binance REST klines URL
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
-BINANCE_SYMBOL = "BTCUSDT"
+BINANCE_SYMBOL = "ETHUSDT"
 
 
 # ---------------------------------------------------------------------------
@@ -126,14 +126,33 @@ def _compute_rsi(closes: np.ndarray, period: int = 7) -> float:
     return 100.0 - 100.0 / (1.0 + rs)
 
 
+@dataclass
+class RSIBoostZone:
+    """A single RSI threshold zone that maps to a bet size.
+
+    For UP bets: triggered when RSI < ``below`` (oversold).
+    For DOWN bets: triggered when RSI > ``above`` (overbought).
+    Only one of ``below`` / ``above`` should be set per zone.
+    """
+
+    size: float  # dollar amount to bet when this zone is active
+    below: Optional[float] = None  # RSI < below  (for UP bets)
+    above: Optional[float] = None  # RSI > above  (for DOWN bets)
+
+
 class RSIFilter:
-    """Fetches Binance BTCUSDT klines and provides real-time RSI(7).
+    """Fetches Binance ETHUSDT klines and provides real-time RSI(7).
+
+    Dual role:
+      1. Legacy skip-filter (``should_skip``): disabled by default.
+      2. Boost advisor (``get_trade_size``): returns boosted size when RSI
+         falls in a configured zone, otherwise returns ``base_size``.
 
     Thread-safe: fetch runs in executor, result cached with timestamp.
     Klines are fetched every 60s (one API call, ~50 candles).
     """
 
-    # Max age (seconds) before cached RSI is considered stale and we skip.
+    # Max age (seconds) before cached RSI is considered stale.
     MAX_STALENESS: float = 300.0  # 5 minutes
 
     def __init__(
@@ -142,17 +161,32 @@ class RSIFilter:
         timeframe: str = "5m",
         threshold: float = 60.0,
         enabled: bool = True,
+        boost_enabled: bool = False,
+        up_zones: Optional[List[RSIBoostZone]] = None,
+        down_zones: Optional[List[RSIBoostZone]] = None,
     ):
         self.period = period
         self.timeframe = timeframe
         self.threshold = threshold
         self.enabled = enabled
+        # Boost config
+        self.boost_enabled = boost_enabled
+        # Sort zones so the tightest threshold (highest conviction) comes first
+        self.up_zones: List[RSIBoostZone] = sorted(
+            up_zones or [], key=lambda z: z.below or 0
+        )
+        self.down_zones: List[RSIBoostZone] = sorted(
+            down_zones or [], key=lambda z: -(z.above or 100)
+        )
         self._last_rsi: float = float("nan")
         self._last_fetch_ts: float = 0.0
         self._fetch_interval: float = 60.0  # refresh every 60s
         self._closes: np.ndarray = np.array([])
         self._warmup_done: bool = False
         self._consecutive_failures: int = 0
+        # Boost stats
+        self.boost_count: int = 0
+        self.base_count: int = 0
 
     @property
     def current_rsi(self) -> float:
@@ -179,6 +213,37 @@ class RSIFilter:
         if self.rsi_age > self.MAX_STALENESS:
             return True  # stale RSI: do NOT trade with old data
         return self._last_rsi >= self.threshold
+
+    def get_trade_size(self, side: str, base_size: float) -> float:
+        """Return the appropriate trade size based on current RSI and side.
+
+        - UP bets: boost when RSI < zone.below (oversold confirms reversal)
+        - DOWN bets: boost when RSI > zone.above (overbought confirms reversal)
+        - If boost is disabled or RSI unavailable, returns base_size.
+        - Never skips trades -- always returns at least base_size.
+
+        Zones are checked from tightest to widest; first match wins.
+        """
+        if not self.boost_enabled:
+            return base_size
+        rsi = self._last_rsi
+        if np.isnan(rsi) or self.rsi_age > self.MAX_STALENESS:
+            self.base_count += 1
+            return base_size
+
+        if side in ("up", "UP"):
+            for zone in self.up_zones:
+                if zone.below is not None and rsi < zone.below:
+                    self.boost_count += 1
+                    return zone.size
+        elif side in ("down", "DOWN"):
+            for zone in self.down_zones:
+                if zone.above is not None and rsi > zone.above:
+                    self.boost_count += 1
+                    return zone.size
+
+        self.base_count += 1
+        return base_size
 
     def _fetch_and_compute(self) -> float:
         """Synchronous: fetch klines from Binance and compute RSI.
@@ -211,8 +276,8 @@ class RSIFilter:
             if not self._warmup_done and not np.isnan(rsi):
                 self._warmup_done = True
                 log(
-                    f"RSI filter warmed up: RSI({self.period})={rsi:.1f} "
-                    f"({len(closes)} candles, threshold={self.threshold})",
+                    f"RSI warmed up: RSI({self.period})={rsi:.1f} "
+                    f"({len(closes)} candles)",
                     "info",
                 )
             return rsi
@@ -235,7 +300,7 @@ class RSIFilter:
 
     async def update(self, executor: concurrent.futures.ThreadPoolExecutor) -> float:
         """Async: refresh RSI if stale. Call this from the main loop."""
-        if not self.enabled:
+        if not self.enabled and not self.boost_enabled:
             return float("nan")
         now = time.time()
         if now - self._last_fetch_ts < self._fetch_interval:
@@ -521,11 +586,15 @@ class SequenceConfig:
     entry_window_start: int = ENTRY_WINDOW_START
     entry_window_end: int = ENTRY_WINDOW_END
     cancel_timeout: float = 10.0  # seconds after placing GTC to cancel unfilled
-    # RSI filter config
+    # RSI filter config (legacy skip-filter)
     rsi_enabled: bool = True
     rsi_period: int = 7
     rsi_timeframe: str = "5m"
     rsi_threshold: float = 60.0
+    # RSI boost config (size advisor)
+    rsi_boost_enabled: bool = False
+    rsi_boost_up_zones: Optional[List[RSIBoostZone]] = None
+    rsi_boost_down_zones: Optional[List[RSIBoostZone]] = None
     # Drawdown protection config
     dd_enabled: bool = True
     dd_max_drawdown: float = 30.0
@@ -560,12 +629,32 @@ class SequenceConfig:
         # then by explicit priority
         rules.sort(key=lambda r: (-len(r.pattern), r.priority))
 
-        # RSI filter config
+        # RSI filter config (legacy skip-filter)
         rsi_cfg = raw.get("rsi_filter", {})
         rsi_enabled = bool(rsi_cfg.get("enabled", True))
         rsi_period = int(rsi_cfg.get("period", 7))
         rsi_timeframe = str(rsi_cfg.get("timeframe", "5m"))
         rsi_threshold = float(rsi_cfg.get("threshold", 60.0))
+
+        # RSI boost config (size advisor)
+        boost_cfg = raw.get("rsi_boost", {})
+        rsi_boost_enabled = bool(boost_cfg.get("enabled", False))
+        # Override RSI period/timeframe from boost section if present
+        if boost_cfg.get("period"):
+            rsi_period = int(boost_cfg["period"])
+        if boost_cfg.get("timeframe"):
+            rsi_timeframe = str(boost_cfg["timeframe"])
+
+        rsi_boost_up_zones: List[RSIBoostZone] = []
+        for z in boost_cfg.get("up_zones", []):
+            rsi_boost_up_zones.append(
+                RSIBoostZone(size=float(z["size"]), below=float(z["below"]))
+            )
+        rsi_boost_down_zones: List[RSIBoostZone] = []
+        for z in boost_cfg.get("down_zones", []):
+            rsi_boost_down_zones.append(
+                RSIBoostZone(size=float(z["size"]), above=float(z["above"]))
+            )
 
         # Drawdown protection config
         dd_cfg = raw.get("drawdown_protection", {})
@@ -590,6 +679,9 @@ class SequenceConfig:
             rsi_period=rsi_period,
             rsi_timeframe=rsi_timeframe,
             rsi_threshold=rsi_threshold,
+            rsi_boost_enabled=rsi_boost_enabled,
+            rsi_boost_up_zones=rsi_boost_up_zones or None,
+            rsi_boost_down_zones=rsi_boost_down_zones or None,
             dd_enabled=dd_enabled,
             dd_max_drawdown=dd_max_drawdown,
             dd_max_consecutive_losses=dd_max_consecutive_losses,
@@ -785,6 +877,9 @@ class SequenceStrategy:
             timeframe=cfg.rsi_timeframe,
             threshold=cfg.rsi_threshold,
             enabled=cfg.rsi_enabled,
+            boost_enabled=cfg.rsi_boost_enabled,
+            up_zones=cfg.rsi_boost_up_zones,
+            down_zones=cfg.rsi_boost_down_zones,
         )
         self._rsi_skips: int = 0  # count of trades skipped by RSI
 
@@ -895,6 +990,24 @@ class SequenceStrategy:
                 f"skip>={self._rsi_filter.threshold:.0f}",
                 "info",
             )
+        if self._rsi_filter.boost_enabled:
+            up_z = self._rsi_filter.up_zones
+            dn_z = self._rsi_filter.down_zones
+            up_str = (
+                ", ".join(f"RSI<{z.below:.0f}->${z.size:.0f}" for z in up_z)
+                if up_z
+                else "none"
+            )
+            dn_str = (
+                ", ".join(f"RSI>{z.above:.0f}->${z.size:.0f}" for z in dn_z)
+                if dn_z
+                else "none"
+            )
+            log(
+                f"  RSI boost: UP=[{up_str}] DOWN=[{dn_str}] "
+                f"(base=${self.cfg.size:.0f})",
+                "info",
+            )
         if self._drawdown.enabled:
             log(
                 f"  DD prot:  max_dd=${self._drawdown.max_drawdown:.0f} "
@@ -907,21 +1020,26 @@ class SequenceStrategy:
         print()
 
         try:
-            # Warm up RSI filter before entering trades
-            if self._rsi_filter.enabled:
-                log("Warming up RSI filter (fetching Binance klines)...", "info")
+            # Warm up RSI filter/boost before entering trades
+            if self._rsi_filter.enabled or self._rsi_filter.boost_enabled:
+                log("Warming up RSI (fetching Binance klines)...", "info")
                 await self._rsi_filter.update(self._clob_executor)
                 rsi = self._rsi_filter.current_rsi
                 if not np.isnan(rsi):
-                    skip_str = (
-                        " -> WOULD SKIP"
-                        if rsi >= self._rsi_filter.threshold
-                        else " -> OK to trade"
-                    )
-                    log(
-                        f"  RSI({self._rsi_filter.period}) = {rsi:.1f}{skip_str}",
-                        "info",
-                    )
+                    parts = [f"RSI({self._rsi_filter.period}) = {rsi:.1f}"]
+                    if self._rsi_filter.enabled:
+                        if rsi >= self._rsi_filter.threshold:
+                            parts.append("-> WOULD SKIP")
+                        else:
+                            parts.append("-> OK to trade")
+                    if self._rsi_filter.boost_enabled:
+                        up_sz = self._rsi_filter.get_trade_size("up", self.cfg.size)
+                        dn_sz = self._rsi_filter.get_trade_size("down", self.cfg.size)
+                        parts.append(f"| UP size=${up_sz:.0f}, DOWN size=${dn_sz:.0f}")
+                        # Reset counters (warmup calls shouldn't count)
+                        self._rsi_filter.boost_count = 0
+                        self._rsi_filter.base_count = 0
+                    log(f"  {' '.join(parts)}", "info")
 
             await self._start_all_managers()
             _tui_active = True
@@ -1772,14 +1890,18 @@ class SequenceStrategy:
 
             # Use rule.max_ask as the limit price (no slippage needed)
             limit_price = rule.max_ask
-            trade_size = self.cfg.size
+            trade_size = self._rsi_filter.get_trade_size(buy_side, self.cfg.size)
+            boosted = trade_size > self.cfg.size
 
             hist_str = self._history_values(list(self._outcome_history[coin]))
             current_ask = self._best_asks[coin][buy_side]
+            rsi = self._rsi_filter.current_rsi
+            rsi_str = f" RSI={rsi:.1f}" if not np.isnan(rsi) else ""
+            boost_str = f" BOOSTED ${trade_size:.0f}" if boosted else ""
             log(
                 f"SIGNAL: {coin} [{hist_str}] -> {rule.pattern} -> "
                 f"GTC LIMIT BUY {buy_side.upper()} @ {limit_price:.3f} "
-                f"(ask={current_ask:.3f})",
+                f"(ask={current_ask:.3f}){rsi_str}{boost_str}",
                 "trade",
             )
 

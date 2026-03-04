@@ -3,9 +3,15 @@
 # ETH-only, bidirectional: bet DOWN after UP streaks, UP after DOWN streaks.
 # All 5 patterns Bonferroni-significant on Telonex 74-day dataset.
 # BTC/SOL/XRP removed: 53% WR below 55% breakeven, net -$530 on Telonex.
-# max_ask=0.60 — CSV sweep shows $0.60-0.67 optimal zone (+$37-46/5d).
+# max_ask=0.60 -- CSV sweep shows $0.60-0.67 optimal zone (+$37-46/5d).
 # Avg entry $0.51-0.53 regardless of max_ask (orderbook ceiling).
 # Telonex WR=55.7% confirmed on 3,278 trades.
+#
+# RSI boost: increase bet size when RSI confirms the trade direction.
+# UP bets: RSI < 35 (oversold) -> $8 (from $5 base). Telonex: 772 trades, 58.9% WR.
+# DOWN bets: RSI > 55 (overbought) -> $8. Telonex: 1,362 trades, 56.7% WR.
+# Never skips trades -- base size $5 when RSI doesn't confirm.
+# Validated on Telonex 74 days (no look-ahead bias: uses T-300s candle).
 #
 # Execution model:
 # - Place GTC limit at max_ask around t=1s
@@ -17,12 +23,26 @@ entry_window_end: 3
 cancel_timeout: 10.0
 size: 5.0
 
-# RSI filter — disabled (look-ahead bias proved it doesn't help WR)
+# RSI filter -- disabled (look-ahead bias proved skip-filter doesn't help WR)
 rsi_filter:
   enabled: false
   period: 7
   timeframe: "5m"
   threshold: 60
+
+# RSI boost -- increase size when RSI confirms direction
+# Uses ETHUSDT 5m klines from Binance. RSI(7).
+# UP bets: oversold (RSI<35) = higher conviction -> boost to $8
+# DOWN bets: overbought (RSI>55) = higher conviction -> boost to $8
+# Telonex backtest @0.55: UP boost +$76, DOWN boost +$57 (x1.6)
+rsi_boost:
+  enabled: true
+  period: 7
+  timeframe: "5m"
+  up_zones:
+    - {below: 35, size: 8.0}
+  down_zones:
+    - {above: 55, size: 8.0}
 
 # Drawdown protection
 drawdown_protection:
@@ -33,7 +53,7 @@ drawdown_protection:
 
 rules:
   # ---------------------------------------------------------------
-  # DOWN-streak reversals (bet UP) — ETH only
+  # DOWN-streak reversals (bet UP) -- ETH only
   # ---------------------------------------------------------------
 
   # DDDDD->UP ETH (60.3% WR Telonex, 61.5% CSV@0.55, N=292)
@@ -55,7 +75,7 @@ rules:
     max_ask: 0.60
 
   # ---------------------------------------------------------------
-  # UP-streak reversals (bet DOWN) — ETH only
+  # UP-streak reversals (bet DOWN) -- ETH only
   # ---------------------------------------------------------------
 
   # UUUU->DOWN ETH (57.4% WR Telonex, 57.1% CSV@0.55, N=751)

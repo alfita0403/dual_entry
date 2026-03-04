@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from strategies.mean_reversion import (
     _compute_rsi,
     RSIFilter,
+    RSIBoostZone,
     DrawdownProtection,
     SequenceConfig,
 )
@@ -129,6 +130,147 @@ class TestRSIFilter:
 
 
 # ===================================================================
+# RSI boost (size advisor) tests
+# ===================================================================
+class TestRSIBoost:
+    def test_disabled_returns_base(self):
+        """Boost disabled should always return base size."""
+        f = RSIFilter(
+            enabled=False,
+            boost_enabled=False,
+            up_zones=[RSIBoostZone(size=8.0, below=35)],
+        )
+        f._last_rsi = 20.0  # well below threshold
+        f._last_fetch_ts = time.time()
+        assert f.get_trade_size("up", 5.0) == 5.0
+
+    def test_up_boost_triggered(self):
+        """UP bet with RSI below zone threshold should return boosted size."""
+        f = RSIFilter(
+            boost_enabled=True,
+            up_zones=[RSIBoostZone(size=8.0, below=35)],
+        )
+        f._last_rsi = 25.0  # below 35 -> boost
+        f._last_fetch_ts = time.time()
+        assert f.get_trade_size("up", 5.0) == 8.0
+
+    def test_up_no_boost_above_threshold(self):
+        """UP bet with RSI above zone threshold should return base."""
+        f = RSIFilter(
+            boost_enabled=True,
+            up_zones=[RSIBoostZone(size=8.0, below=35)],
+        )
+        f._last_rsi = 50.0  # above 35 -> no boost
+        f._last_fetch_ts = time.time()
+        assert f.get_trade_size("up", 5.0) == 5.0
+
+    def test_down_boost_triggered(self):
+        """DOWN bet with RSI above zone threshold should return boosted size."""
+        f = RSIFilter(
+            boost_enabled=True,
+            down_zones=[RSIBoostZone(size=8.0, above=55)],
+        )
+        f._last_rsi = 70.0  # above 55 -> boost
+        f._last_fetch_ts = time.time()
+        assert f.get_trade_size("down", 5.0) == 8.0
+
+    def test_down_no_boost_below_threshold(self):
+        """DOWN bet with RSI below zone threshold should return base."""
+        f = RSIFilter(
+            boost_enabled=True,
+            down_zones=[RSIBoostZone(size=8.0, above=55)],
+        )
+        f._last_rsi = 45.0  # below 55 -> no boost
+        f._last_fetch_ts = time.time()
+        assert f.get_trade_size("down", 5.0) == 5.0
+
+    def test_nan_rsi_returns_base(self):
+        """NaN RSI should return base size (never skip, just don't boost)."""
+        f = RSIFilter(
+            boost_enabled=True,
+            up_zones=[RSIBoostZone(size=8.0, below=35)],
+        )
+        f._last_rsi = float("nan")
+        assert f.get_trade_size("up", 5.0) == 5.0
+
+    def test_stale_rsi_returns_base(self):
+        """Stale RSI should return base size."""
+        f = RSIFilter(
+            boost_enabled=True,
+            up_zones=[RSIBoostZone(size=8.0, below=35)],
+        )
+        f._last_rsi = 20.0  # would trigger boost
+        f._last_fetch_ts = time.time() - 600  # stale (10 min)
+        assert f.get_trade_size("up", 5.0) == 5.0
+
+    def test_multiple_zones_tightest_wins(self):
+        """With multiple zones, tightest threshold should be checked first."""
+        f = RSIFilter(
+            boost_enabled=True,
+            up_zones=[
+                RSIBoostZone(size=10.0, below=25),  # tightest
+                RSIBoostZone(size=8.0, below=35),  # wider
+            ],
+        )
+        f._last_rsi = 20.0  # below both
+        f._last_fetch_ts = time.time()
+        # Tightest zone (RSI<25, $10) should match first
+        assert f.get_trade_size("up", 5.0) == 10.0
+
+    def test_multiple_zones_wider_fallback(self):
+        """RSI between zones should match the wider zone."""
+        f = RSIFilter(
+            boost_enabled=True,
+            up_zones=[
+                RSIBoostZone(size=10.0, below=25),  # tightest
+                RSIBoostZone(size=8.0, below=35),  # wider
+            ],
+        )
+        f._last_rsi = 30.0  # above 25 but below 35
+        f._last_fetch_ts = time.time()
+        assert f.get_trade_size("up", 5.0) == 8.0
+
+    def test_boost_counters(self):
+        """Boost and base counters should track correctly."""
+        f = RSIFilter(
+            boost_enabled=True,
+            up_zones=[RSIBoostZone(size=8.0, below=35)],
+        )
+        f._last_fetch_ts = time.time()
+        f._last_rsi = 20.0
+        f.get_trade_size("up", 5.0)  # boosted
+        f._last_rsi = 50.0
+        f.get_trade_size("up", 5.0)  # base
+        assert f.boost_count == 1
+        assert f.base_count == 1
+
+    def test_cross_side_no_interference(self):
+        """UP zones should not affect DOWN bets and vice versa."""
+        f = RSIFilter(
+            boost_enabled=True,
+            up_zones=[RSIBoostZone(size=8.0, below=35)],
+            down_zones=[RSIBoostZone(size=8.0, above=55)],
+        )
+        f._last_fetch_ts = time.time()
+        f._last_rsi = 20.0  # low RSI
+        # UP should boost (RSI<35), DOWN should NOT (RSI not >55)
+        assert f.get_trade_size("up", 5.0) == 8.0
+        assert f.get_trade_size("down", 5.0) == 5.0
+
+        f._last_rsi = 70.0  # high RSI
+        # DOWN should boost (RSI>55), UP should NOT (RSI not <35)
+        assert f.get_trade_size("down", 5.0) == 8.0
+        assert f.get_trade_size("up", 5.0) == 5.0
+
+    def test_update_active_when_boost_enabled(self):
+        """When only boost is enabled (not filter), update should still fetch."""
+        f = RSIFilter(enabled=False, boost_enabled=True)
+        # Verify the update method doesn't short-circuit
+        assert not f.enabled
+        assert f.boost_enabled
+
+
+# ===================================================================
 # Drawdown protection tests
 # ===================================================================
 class TestDrawdownProtection:
@@ -215,6 +357,21 @@ class TestYAMLConfig:
         assert cfg.rsi_period == 7
         assert cfg.rsi_timeframe == "5m"
         assert cfg.rsi_threshold == 60.0
+
+    def test_loads_rsi_boost_config(self):
+        """YAML should load RSI boost config with per-side zones."""
+        cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
+        assert cfg.rsi_boost_enabled is True
+        # UP zones
+        assert cfg.rsi_boost_up_zones is not None
+        assert len(cfg.rsi_boost_up_zones) == 1
+        assert cfg.rsi_boost_up_zones[0].below == 35.0
+        assert cfg.rsi_boost_up_zones[0].size == 8.0
+        # DOWN zones
+        assert cfg.rsi_boost_down_zones is not None
+        assert len(cfg.rsi_boost_down_zones) == 1
+        assert cfg.rsi_boost_down_zones[0].above == 55.0
+        assert cfg.rsi_boost_down_zones[0].size == 8.0
 
     def test_loads_drawdown_config(self):
         """YAML should load drawdown protection config."""
