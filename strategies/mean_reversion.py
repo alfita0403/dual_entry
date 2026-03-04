@@ -72,11 +72,11 @@ DEFAULT_CONFIG = Path(__file__).resolve().parent / "mean_reversion.yaml"
 
 # Outcome inference thresholds (applied at t >= INFERENCE_TIME)
 # Last 5 seconds of the 300s cycle — use only near-certain terminal ticks.
-INFERENCE_TIME = 295               # seconds into cycle to read outcome
-CERTAIN_UP_ASK = 0.99             # UP ask >= this => provisional UP
-CERTAIN_DOWN_ASK = 0.01           # UP ask <= this => provisional DOWN
-GAMMA_RECHECK_INITIAL_DELAY = 45   # ~45s after cycle closes (markets settle in 15-30s)
-GAMMA_RECHECK_RETRY_DELAY = 300    # retry every cycle if unresolved
+INFERENCE_TIME = 295  # seconds into cycle to read outcome
+CERTAIN_UP_ASK = 0.99  # UP ask >= this => provisional UP
+CERTAIN_DOWN_ASK = 0.01  # UP ask <= this => provisional DOWN
+GAMMA_RECHECK_INITIAL_DELAY = 45  # ~45s after cycle closes (markets settle in 15-30s)
+GAMMA_RECHECK_RETRY_DELAY = 300  # retry every cycle if unresolved
 
 # Book-confirm threshold: if a side's bid >= this after cycle ends, that side won.
 # Market makers leave residual bids near $1 for resolved shares; checking this
@@ -84,16 +84,16 @@ GAMMA_RECHECK_RETRY_DELAY = 300    # retry every cycle if unresolved
 BOOK_CONFIRM_BID = 0.95
 
 # Max ask price filter — don't buy when ask is too expensive (bad risk/reward)
-DEFAULT_MAX_ASK = 0.60     # only enter if ask <= this
+DEFAULT_MAX_ASK = 0.60  # only enter if ask <= this
 
 # How long after cycle start to look for pattern-match entries
 # (overridden by YAML config; these are fallback defaults)
-ENTRY_WINDOW_START = 1     # seconds after cycle start (place limit ASAP)
-ENTRY_WINDOW_END = 3       # seconds — orders placed once, not retried
+ENTRY_WINDOW_START = 1  # seconds after cycle start (place limit ASAP)
+ENTRY_WINDOW_END = 3  # seconds — orders placed once, not retried
 
-# Dry-run simulation penalties (match stat_arb.py)
+# Dry-run simulation penalties
 SIM_ENTRY_SLIP = 0.01
-SIM_FEE_RATE = 0.015       # 1.5% one-way taker fee
+SIM_FEE_RATE = 0.015  # 1.5% one-way taker fee
 
 # Binance REST klines URL
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
@@ -132,8 +132,16 @@ class RSIFilter:
     Klines are fetched every 60s (one API call, ~50 candles).
     """
 
-    def __init__(self, period: int = 7, timeframe: str = "5m",
-                 threshold: float = 60.0, enabled: bool = True):
+    # Max age (seconds) before cached RSI is considered stale and we skip.
+    MAX_STALENESS: float = 300.0  # 5 minutes
+
+    def __init__(
+        self,
+        period: int = 7,
+        timeframe: str = "5m",
+        threshold: float = 60.0,
+        enabled: bool = True,
+    ):
         self.period = period
         self.timeframe = timeframe
         self.threshold = threshold
@@ -143,18 +151,32 @@ class RSIFilter:
         self._fetch_interval: float = 60.0  # refresh every 60s
         self._closes: np.ndarray = np.array([])
         self._warmup_done: bool = False
+        self._consecutive_failures: int = 0
 
     @property
     def current_rsi(self) -> float:
         return self._last_rsi
 
     @property
+    def rsi_age(self) -> float:
+        """Seconds since last successful RSI fetch."""
+        if self._last_fetch_ts == 0.0:
+            return float("inf")
+        return time.time() - self._last_fetch_ts
+
+    @property
     def should_skip(self) -> bool:
-        """True if RSI >= threshold (should NOT trade)."""
+        """True if RSI >= threshold (should NOT trade).
+
+        FAIL-CLOSED: if RSI is NaN or stale (>5min), skip trades.
+        This prevents trading without RSI protection if Binance is down.
+        """
         if not self.enabled:
             return False
         if np.isnan(self._last_rsi):
-            return False  # fail-open: trade if no data
+            return True  # fail-closed: do NOT trade without RSI data
+        if self.rsi_age > self.MAX_STALENESS:
+            return True  # stale RSI: do NOT trade with old data
         return self._last_rsi >= self.threshold
 
     def _fetch_and_compute(self) -> float:
@@ -178,13 +200,36 @@ class RSIFilter:
             rsi = _compute_rsi(closes, self.period)
             self._last_rsi = rsi
             self._last_fetch_ts = time.time()
+            if self._consecutive_failures > 0:
+                log(
+                    f"RSI fetch recovered after {self._consecutive_failures} failures. "
+                    f"RSI({self.period})={rsi:.1f}",
+                    "info",
+                )
+                self._consecutive_failures = 0
             if not self._warmup_done and not np.isnan(rsi):
                 self._warmup_done = True
-                log(f"RSI filter warmed up: RSI({self.period})={rsi:.1f} "
-                    f"({len(closes)} candles, threshold={self.threshold})", "info")
+                log(
+                    f"RSI filter warmed up: RSI({self.period})={rsi:.1f} "
+                    f"({len(closes)} candles, threshold={self.threshold})",
+                    "info",
+                )
             return rsi
         except Exception as exc:
-            log(f"RSI fetch error: {exc}", "warning")
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 10:
+                log(
+                    f"RSI fetch FAILING ({self._consecutive_failures}x in a row): {exc}. "
+                    f"Trading is BLOCKED (fail-closed) until Binance responds.",
+                    "error",
+                )
+            elif self._consecutive_failures >= 3:
+                log(
+                    f"RSI fetch error ({self._consecutive_failures}x): {exc}",
+                    "warning",
+                )
+            else:
+                log(f"RSI fetch error: {exc}", "warning")
             return self._last_rsi  # keep last value on error
 
     async def update(self, executor: concurrent.futures.ThreadPoolExecutor) -> float:
@@ -205,10 +250,11 @@ class RSIFilter:
 @dataclass
 class DrawdownProtection:
     """Pauses trading when session drawdown exceeds limits."""
+
     enabled: bool = True
-    max_drawdown: float = 30.0        # pause if session PnL < -max_drawdown
+    max_drawdown: float = 30.0  # pause if session PnL < -max_drawdown
     max_consecutive_losses: int = 8
-    cooldown_minutes: float = 30.0    # 0 = manual restart required
+    cooldown_minutes: float = 30.0  # 0 = manual restart required
     # Runtime state
     consecutive_losses: int = 0
     paused: bool = False
@@ -249,8 +295,11 @@ class DrawdownProtection:
             return False  # manual restart required
         elapsed = (time.time() - self.paused_at) / 60.0
         if elapsed >= self.cooldown_minutes:
-            log(f"Circuit breaker cooldown elapsed ({self.cooldown_minutes:.0f}min). "
-                f"Resuming trading.", "success")
+            log(
+                f"Circuit breaker cooldown elapsed ({self.cooldown_minutes:.0f}min). "
+                f"Resuming trading.",
+                "success",
+            )
             self.paused = False
             self.consecutive_losses = 0
             self.pause_reason = ""
@@ -272,8 +321,8 @@ class DrawdownProtection:
 # ---------------------------------------------------------------------------
 BUILTIN_PATTERNS: Dict[str, Tuple[str, str]] = {
     "UUUU": ("UUUU", "DOWN"),
-    "UUU":  ("UUU",  "DOWN"),
-    "UU":   ("UU",   "DOWN"),
+    "UUU": ("UUU", "DOWN"),
+    "UU": ("UU", "DOWN"),
 }
 
 
@@ -313,33 +362,34 @@ def log(msg: str, level: str = "info") -> None:
 @dataclass
 class PositionRecord:
     coin: str
-    side: str                 # "up" or "down"
+    side: str  # "up" or "down"
     fill_price: float
     fill_size: float
     fill_time: float
     market_slug: str
     order_id: str = ""
     cost: float = 0.0
-    pattern: str = ""         # which pattern triggered this
+    pattern: str = ""  # which pattern triggered this
     # Resolution
     resolved: bool = False
     won: Optional[bool] = None
     payout: float = 0.0
     pnl: Optional[float] = None
-    exit_type: Optional[str] = None   # "EXPIRY_WIN" or "EXPIRY_LOSS"
+    exit_type: Optional[str] = None  # "EXPIRY_WIN" or "EXPIRY_LOSS"
     exit_time: Optional[float] = None
 
 
 @dataclass
 class PendingOrder:
     """Tracks a GTC limit order waiting for fill or cancellation."""
+
     coin: str
-    side: str                     # "up" or "down"
+    side: str  # "up" or "down"
     token_id: str
     order_id: str
-    limit_price: float            # the max_ask we placed at
+    limit_price: float  # the max_ask we placed at
     size: float
-    placed_at: float              # time.time() when placed
+    placed_at: float  # time.time() when placed
     market_slug: str
     pattern: str
     neg_risk: bool = False
@@ -351,12 +401,18 @@ def _append_trade_log(
     cfg: "SequenceConfig",
     outcome: str = "PENDING",
     log_file: Optional[Path] = None,
+    rsi_value: Optional[float] = None,
 ) -> None:
     target = log_file or TRADE_LOG_FILE
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     now_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     pnl_str = f"${pos.pnl:+.4f}" if pos.pnl is not None else "--"
+    rsi_str = (
+        f" | rsi={rsi_value:.1f}"
+        if rsi_value is not None and not np.isnan(rsi_value)
+        else ""
+    )
     line = (
         f"{now_utc} | {now_local} | "
         f"order_id={pos.order_id} | "
@@ -364,7 +420,7 @@ def _append_trade_log(
         f"entry={pos.fill_price:.4f} | "
         f"size={pos.fill_size:.4f} | pnl={pnl_str} | "
         f"pattern={pos.pattern} | "
-        f"dry_run={cfg.dry_run} | outcome={outcome}"
+        f"dry_run={cfg.dry_run} | outcome={outcome}{rsi_str}"
     )
     try:
         with open(target, "a", encoding="utf-8") as f:
@@ -374,7 +430,11 @@ def _append_trade_log(
 
 
 def _update_trade_log_outcome(
-    order_id: str, market_slug: str, coin: str, side: str, outcome: str,
+    order_id: str,
+    market_slug: str,
+    coin: str,
+    side: str,
+    outcome: str,
     log_file: Optional[Path] = None,
 ) -> None:
     target = log_file or TRADE_LOG_FILE
@@ -425,20 +485,21 @@ def _streak_length(history, direction: str) -> int:
 @dataclass
 class PatternRule:
     """One pattern->action rule with per-rule max_ask and coin filter."""
-    pattern: str                        # e.g. "UUUU"
-    buy_side: str                       # "up" or "down"
-    max_ask: float = DEFAULT_MAX_ASK    # per-rule max ask
-    coins: Optional[List[str]] = None   # coins this rule applies to (None = all)
-    priority: int = 0                   # lower = higher priority
+
+    pattern: str  # e.g. "UUUU"
+    buy_side: str  # "up" or "down"
+    max_ask: float = DEFAULT_MAX_ASK  # per-rule max ask
+    coins: Optional[List[str]] = None  # coins this rule applies to (None = all)
+    priority: int = 0  # lower = higher priority
 
 
 @dataclass
 class SequenceConfig:
     rules: List[PatternRule]
     size: float = 5.0
-    slippage: float = 0.03             # legacy (unused with GTC limits)
-    max_ask: float = DEFAULT_MAX_ASK   # global fallback max ask
-    max_trades_per_cycle: int = 4      # one per coin
+    slippage: float = 0.03  # legacy (unused with GTC limits)
+    max_ask: float = DEFAULT_MAX_ASK  # global fallback max ask
+    max_trades_per_cycle: int = 4  # one per coin
     dry_run: bool = False
     market_check_interval: float = 5.0
     name: str = ""
@@ -446,7 +507,7 @@ class SequenceConfig:
     kelly: float = 0.0
     entry_window_start: int = ENTRY_WINDOW_START
     entry_window_end: int = ENTRY_WINDOW_END
-    cancel_timeout: float = 10.0       # seconds after placing GTC to cancel unfilled
+    cancel_timeout: float = 10.0  # seconds after placing GTC to cancel unfilled
     # RSI filter config
     rsi_enabled: bool = True
     rsi_period: int = 7
@@ -459,8 +520,9 @@ class SequenceConfig:
     dd_cooldown_minutes: float = 30.0
 
     @classmethod
-    def from_yaml(cls, path: str, dry_run: bool = False,
-                  name: str = "") -> "SequenceConfig":
+    def from_yaml(
+        cls, path: str, dry_run: bool = False, name: str = ""
+    ) -> "SequenceConfig":
         """Load config from YAML file."""
         with open(path) as f:
             raw = yaml.safe_load(f)
@@ -471,13 +533,15 @@ class SequenceConfig:
             side = r["side"].lower()
             rule_coins = [c.upper() for c in r["coins"]] if "coins" in r else None
             rule_max_ask = float(r.get("max_ask", DEFAULT_MAX_ASK))
-            rules.append(PatternRule(
-                pattern=pattern,
-                buy_side=side,
-                max_ask=rule_max_ask,
-                coins=rule_coins,
-                priority=r.get("priority", i),
-            ))
+            rules.append(
+                PatternRule(
+                    pattern=pattern,
+                    buy_side=side,
+                    max_ask=rule_max_ask,
+                    coins=rule_coins,
+                    priority=r.get("priority", i),
+                )
+            )
 
         # Sort rules: longest pattern first (highest priority for hierarchy),
         # then by explicit priority
@@ -528,17 +592,13 @@ class SequenceConfig:
             raise ValueError("At least one pattern rule is required")
         for rule in self.rules:
             if not all(c in "UD" for c in rule.pattern):
-                raise ValueError(
-                    f"Pattern must contain only U/D, got '{rule.pattern}'"
-                )
+                raise ValueError(f"Pattern must contain only U/D, got '{rule.pattern}'")
             if rule.buy_side not in ("up", "down"):
                 raise ValueError(
                     f"buy_side must be 'up' or 'down', got '{rule.buy_side}'"
                 )
             if not 0.30 <= rule.max_ask <= 0.90:
-                raise ValueError(
-                    f"max_ask must be 0.30-0.90, got {rule.max_ask}"
-                )
+                raise ValueError(f"max_ask must be 0.30-0.90, got {rule.max_ask}")
 
 
 # ===================================================================
@@ -546,18 +606,18 @@ class SequenceConfig:
 # ===================================================================
 class CycleState(enum.Enum):
     WAITING_MARKET = "WAITING_MARKET"
-    OBSERVING = "OBSERVING"       # Watching cycle, inferring outcomes at end
-    ENTRY_WINDOW = "ENTRY_WINDOW" # New cycle, checking for pattern matches
-    PENDING_ORDERS = "PENDING"    # GTC limits placed, waiting for fills/cancel
-    TRADED = "TRADED"             # Bought, holding to resolution
+    OBSERVING = "OBSERVING"  # Watching cycle, inferring outcomes at end
+    ENTRY_WINDOW = "ENTRY_WINDOW"  # New cycle, checking for pattern matches
+    PENDING_ORDERS = "PENDING"  # GTC limits placed, waiting for fills/cancel
+    TRADED = "TRADED"  # Bought, holding to resolution
     DONE = "DONE"
 
 
 class ConfirmationStatus(enum.Enum):
-    UNKNOWN = "UNKNOWN"             # ambiguous / no data
-    PROVISIONAL = "PROVISIONAL"     # inferred from ask at cycle end (white, NOT tradeable)
+    UNKNOWN = "UNKNOWN"  # ambiguous / no data
+    PROVISIONAL = "PROVISIONAL"  # inferred from ask at cycle end (white, NOT tradeable)
     BOOK_CONFIRMED = "BOOK_CONFIRMED"  # bid >= 0.99 on residual book (blue, tradeable)
-    CONFIRMED = "CONFIRMED"         # Gamma API verified (orange, tradeable)
+    CONFIRMED = "CONFIRMED"  # Gamma API verified (orange, tradeable)
 
 
 @dataclass
@@ -610,9 +670,7 @@ class SequenceStrategy:
 
         # Rolling outcome history per coin with confirmation status.
         # maxlen=6 supports patterns up to length 6
-        self._outcome_history: Dict[str, deque] = {
-            c: deque(maxlen=6) for c in COINS
-        }
+        self._outcome_history: Dict[str, deque] = {c: deque(maxlen=6) for c in COINS}
         # Track which cycle_ts each coin's last inference was from
         # (prevent double-recording from same cycle)
         self._last_inference_ts: Dict[str, Optional[int]] = {c: None for c in COINS}
@@ -630,9 +688,7 @@ class SequenceStrategy:
         # Last cycle_ts where we saw an UP-ask snapshot for each coin.
         # Used to avoid inferring outcomes from default/stale ask placeholders.
         self._up_ask_cycle_seen: Dict[str, Optional[int]] = {c: None for c in COINS}
-        self._coin_markets: Dict[str, Optional[MarketInfo]] = {
-            c: None for c in COINS
-        }
+        self._coin_markets: Dict[str, Optional[MarketInfo]] = {c: None for c in COINS}
         # Previous cycle's markets — saved before overwrite so REST book
         # confirmation can look up old token IDs after the WS switches.
         self._old_cycle_markets: Dict[str, Optional[MarketInfo]] = {
@@ -793,7 +849,9 @@ class SequenceStrategy:
         global _tui_active
 
         log("Sequence Pattern Strategy started (4-coin WebSocket)", "success")
-        log(f"  rules:    {', '.join(f'{r.pattern}->BUY {r.buy_side.upper()}' for r in self.cfg.rules)}")
+        log(
+            f"  rules:    {', '.join(f'{r.pattern}->BUY {r.buy_side.upper()}' for r in self.cfg.rules)}"
+        )
         log(f"  size:     {self.cfg.size} shares")
         if self.cfg.kelly > 0:
             log(f"  kelly:    {self.cfg.kelly} (streak scaling enabled)")
@@ -802,12 +860,18 @@ class SequenceStrategy:
             f"  infer:    t>={INFERENCE_TIME}s, UP>={CERTAIN_UP_ASK:.2f}, DOWN<={CERTAIN_DOWN_ASK:.2f}"
         )
         if self._rsi_filter.enabled:
-            log(f"  RSI:      RSI({self._rsi_filter.period}) {self._rsi_filter.timeframe} "
-                f"skip>={self._rsi_filter.threshold:.0f}", "info")
+            log(
+                f"  RSI:      RSI({self._rsi_filter.period}) {self._rsi_filter.timeframe} "
+                f"skip>={self._rsi_filter.threshold:.0f}",
+                "info",
+            )
         if self._drawdown.enabled:
-            log(f"  DD prot:  max_dd=${self._drawdown.max_drawdown:.0f} "
+            log(
+                f"  DD prot:  max_dd=${self._drawdown.max_drawdown:.0f} "
                 f"max_consec_losses={self._drawdown.max_consecutive_losses} "
-                f"cooldown={self._drawdown.cooldown_minutes:.0f}min", "info")
+                f"cooldown={self._drawdown.cooldown_minutes:.0f}min",
+                "info",
+            )
         log(f"  dry_run:  {self.cfg.dry_run}")
         log(f"  log:      {self.log_file}")
         print()
@@ -819,8 +883,15 @@ class SequenceStrategy:
                 await self._rsi_filter.update(self._clob_executor)
                 rsi = self._rsi_filter.current_rsi
                 if not np.isnan(rsi):
-                    skip_str = " -> WOULD SKIP" if rsi >= self._rsi_filter.threshold else " -> OK to trade"
-                    log(f"  RSI({self._rsi_filter.period}) = {rsi:.1f}{skip_str}", "info")
+                    skip_str = (
+                        " -> WOULD SKIP"
+                        if rsi >= self._rsi_filter.threshold
+                        else " -> OK to trade"
+                    )
+                    log(
+                        f"  RSI({self._rsi_filter.period}) = {rsi:.1f}{skip_str}",
+                        "info",
+                    )
 
             await self._start_all_managers()
             _tui_active = True
@@ -853,9 +924,7 @@ class SequenceStrategy:
             mgr.on_market_change(
                 lambda old, new, c=coin: self._on_market_change(c, old, new)
             )
-            mgr.on_book_update(
-                lambda snap, c=coin: self._on_book_update(c, snap)
-            )
+            mgr.on_book_update(lambda snap, c=coin: self._on_book_update(c, snap))
 
             attempts = 0
             while True:
@@ -1000,8 +1069,12 @@ class SequenceStrategy:
                         old_token_ids[c] = dict(m.token_ids)
 
         # Schedule resolution for any positions from old cycle
-        if self.cycle_state in (CycleState.OBSERVING, CycleState.ENTRY_WINDOW,
-                                CycleState.PENDING_ORDERS, CycleState.TRADED):
+        if self.cycle_state in (
+            CycleState.OBSERVING,
+            CycleState.ENTRY_WINDOW,
+            CycleState.PENDING_ORDERS,
+            CycleState.TRADED,
+        ):
             self._transition_to_done()
 
         self._cycle_ts = market_start
@@ -1030,7 +1103,9 @@ class SequenceStrategy:
         matches = self._find_pattern_matches()
 
         if matches:
-            match_strs = [f"{c}:{r.pattern}->BUY {r.buy_side.upper()}" for c, r in matches]
+            match_strs = [
+                f"{c}:{r.pattern}->BUY {r.buy_side.upper()}" for c, r in matches
+            ]
             log(
                 f"NEW CYCLE #{self.cycles_seen}: "
                 f"MATCHES: {', '.join(match_strs)}  age={cycle_age:.0f}s",
@@ -1067,7 +1142,8 @@ class SequenceStrategy:
         if old_cycle_ts is not None and old_token_ids:
             any_unconfirmed = any(
                 (e := self._find_outcome_entry(c, old_cycle_ts)) is not None
-                and e.status not in (
+                and e.status
+                not in (
                     ConfirmationStatus.CONFIRMED,
                     ConfirmationStatus.BOOK_CONFIRMED,
                 )
@@ -1075,9 +1151,7 @@ class SequenceStrategy:
             )
             if any_unconfirmed:
                 loop = asyncio.get_running_loop()
-                loop.create_task(
-                    self._rest_book_confirm(old_token_ids, old_cycle_ts)
-                )
+                loop.create_task(self._rest_book_confirm(old_token_ids, old_cycle_ts))
 
     def _transition_to_done(self) -> None:
         self.cycle_state = CycleState.DONE
@@ -1132,7 +1206,9 @@ class SequenceStrategy:
         raw_prices = market_data.get("outcomePrices", "[]")
         raw_outcomes = market_data.get("outcomes", "[]")
         prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-        outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+        outcomes = (
+            json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+        )
 
         for idx, price in enumerate(prices):
             if str(price) == "1" and idx < len(outcomes):
@@ -1181,13 +1257,17 @@ class SequenceStrategy:
                     self._gamma_client.get_market_by_slug, slug
                 )
                 if not market_data or not market_data.get("closed", False):
-                    self._pending_outcome_rechecks[key]["next_check"] = now + GAMMA_RECHECK_RETRY_DELAY
+                    self._pending_outcome_rechecks[key]["next_check"] = (
+                        now + GAMMA_RECHECK_RETRY_DELAY
+                    )
                     continue
 
                 winner = self._parse_gamma_winner(market_data)
                 outcome = self._winner_to_outcome(winner)
                 if outcome is None:
-                    self._pending_outcome_rechecks[key]["next_check"] = now + GAMMA_RECHECK_RETRY_DELAY
+                    self._pending_outcome_rechecks[key]["next_check"] = (
+                        now + GAMMA_RECHECK_RETRY_DELAY
+                    )
                     continue
 
                 prev = entry.outcome
@@ -1202,11 +1282,16 @@ class SequenceStrategy:
                         "warning",
                     )
                 else:
-                    log(f"  {coin} outcome confirmed by Gamma: {outcome} ({slug})", "info")
+                    log(
+                        f"  {coin} outcome confirmed by Gamma: {outcome} ({slug})",
+                        "info",
+                    )
 
             except Exception as exc:
                 if key in self._pending_outcome_rechecks:
-                    self._pending_outcome_rechecks[key]["next_check"] = now + GAMMA_RECHECK_RETRY_DELAY
+                    self._pending_outcome_rechecks[key]["next_check"] = (
+                        now + GAMMA_RECHECK_RETRY_DELAY
+                    )
                 log(f"  Gamma recheck error for {slug}: {exc}", "warning")
             finally:
                 self._outcome_recheck_inflight.discard(key)
@@ -1251,7 +1336,9 @@ class SequenceStrategy:
                 self._outcome_history[coin].append(entry)
                 self._last_inference_ts[coin] = cycle_ts
                 self._queue_outcome_recheck(coin, cycle_ts, slug)
-                log(f"  {coin} outcome provisional: - (no fresh UP snapshot)", "warning")
+                log(
+                    f"  {coin} outcome provisional: - (no fresh UP snapshot)", "warning"
+                )
                 continue
 
             up_ask = self._best_asks[coin]["up"]
@@ -1284,8 +1371,11 @@ class SequenceStrategy:
                 # First record for this cycle
                 entry = OutcomeEntry(
                     outcome=outcome,
-                    status=(ConfirmationStatus.PROVISIONAL if outcome != "-"
-                            else ConfirmationStatus.UNKNOWN),
+                    status=(
+                        ConfirmationStatus.PROVISIONAL
+                        if outcome != "-"
+                        else ConfirmationStatus.UNKNOWN
+                    ),
                     cycle_ts=cycle_ts,
                     market_slug=slug,
                     observed_up_ask=up_ask,
@@ -1382,7 +1472,11 @@ class SequenceStrategy:
 
         # Use pre-reset snapshot if live cache was already cleared
         pre = getattr(self, "_pre_reset_asks", None)
-        if pre and self._best_asks[coin]["up"] == 1.0 and self._up_ask_cycle_seen[coin] is None:
+        if (
+            pre
+            and self._best_asks[coin]["up"] == 1.0
+            and self._up_ask_cycle_seen[coin] is None
+        ):
             up_bid = self._pre_reset_bids.get(coin, {}).get("up", 0.0)
             down_bid = self._pre_reset_bids.get(coin, {}).get("down", 0.0)
             up_ask = pre.get(coin, {}).get("up", 1.0)
@@ -1483,7 +1577,8 @@ class SequenceStrategy:
                         continue
                     try:
                         book = await asyncio.to_thread(
-                            self.clob.get_order_book, tid,
+                            self.clob.get_order_book,
+                            tid,
                         )
                         bids = book.get("bids", [])
                         if bids:
@@ -1514,8 +1609,7 @@ class SequenceStrategy:
             matches = self._find_pattern_matches()
             if matches and self.cycle_state == CycleState.OBSERVING:
                 match_strs = [
-                    f"{c}:{r.pattern}->BUY {r.buy_side.upper()}"
-                    for c, r in matches
+                    f"{c}:{r.pattern}->BUY {r.buy_side.upper()}" for c, r in matches
                 ]
                 log(
                     f"REST book-confirm MATCHES: {', '.join(match_strs)}",
@@ -1563,7 +1657,10 @@ class SequenceStrategy:
                 if recent == rule.pattern:
                     # ALL entries must be at least book-confirmed (blue) to trade.
                     # PROVISIONAL (white) is not sufficient.
-                    _TRADEABLE = {ConfirmationStatus.BOOK_CONFIRMED, ConfirmationStatus.CONFIRMED}
+                    _TRADEABLE = {
+                        ConfirmationStatus.BOOK_CONFIRMED,
+                        ConfirmationStatus.CONFIRMED,
+                    }
                     if any(e.status not in _TRADEABLE for e in recent_entries):
                         continue
                     matches.append((coin, rule))
@@ -1592,17 +1689,21 @@ class SequenceStrategy:
                 elapsed = (time.time() - self._drawdown.paused_at) / 60.0
                 left = self._drawdown.cooldown_minutes - elapsed
                 remaining = f" ({left:.0f}min until resume)"
-            log(f"SKIP cycle: circuit breaker active — {self._drawdown.pause_reason}{remaining}",
-                "warning")
+            log(
+                f"SKIP cycle: circuit breaker active — {self._drawdown.pause_reason}{remaining}",
+                "warning",
+            )
             return
 
         # --- RSI filter ---
         if self._rsi_filter.should_skip:
             rsi = self._rsi_filter.current_rsi
             self._rsi_skips += 1
-            log(f"SKIP cycle: RSI({self._rsi_filter.period})={rsi:.1f} >= "
+            log(
+                f"SKIP cycle: RSI({self._rsi_filter.period})={rsi:.1f} >= "
                 f"{self._rsi_filter.threshold:.0f} (skip #{self._rsi_skips})",
-                "warning")
+                "warning",
+            )
             return
 
         matches = self._find_pattern_matches()
@@ -1611,8 +1712,10 @@ class SequenceStrategy:
         for coin, rule in matches:
             if coin in self._traded_coins:
                 continue
-            if (len(self._current_positions) + len(self._pending_orders)
-                    >= self.cfg.max_trades_per_cycle):
+            if (
+                len(self._current_positions) + len(self._pending_orders)
+                >= self.cfg.max_trades_per_cycle
+            ):
                 break
 
             market = self._coin_markets.get(coin)
@@ -1652,15 +1755,25 @@ class SequenceStrategy:
 
             if self.cfg.dry_run:
                 tracker = self._simulate_buy(
-                    coin, buy_side, current_ask, market, rule.pattern, trade_size,
+                    coin,
+                    buy_side,
+                    current_ask,
+                    market,
+                    rule.pattern,
+                    trade_size,
                 )
                 if tracker:
                     self._traded_coins.add(coin)
                     placed_any = True
             else:
                 result = await self._submit_limit_buy(
-                    coin, buy_side, token_id, market, limit_price,
-                    rule.pattern, trade_size,
+                    coin,
+                    buy_side,
+                    token_id,
+                    market,
+                    limit_price,
+                    rule.pattern,
+                    trade_size,
                 )
                 if result is not None:
                     placed_any = True
@@ -1680,7 +1793,12 @@ class SequenceStrategy:
             )
 
     def _simulate_buy(
-        self, coin: str, side: str, ask_price: float, market: MarketInfo, pattern: str,
+        self,
+        coin: str,
+        side: str,
+        ask_price: float,
+        market: MarketInfo,
+        pattern: str,
         trade_size: Optional[float] = None,
     ) -> Optional[PositionRecord]:
         """Simulate a fill for dry-run mode."""
@@ -1708,7 +1826,14 @@ class SequenceStrategy:
         if pattern in self.pattern_fills:
             self.pattern_fills[pattern] += 1
 
-        _append_trade_log(pos, self.cfg, outcome="PENDING", log_file=self.log_file)
+        _append_trade_log(
+            pos,
+            self.cfg,
+            outcome="PENDING",
+            log_file=self.log_file,
+            rsi_value=self._rsi_filter.current_rsi,
+        )
+
         log(
             f"SIM FILL {coin}-{side.upper()} @ {sim_price:.4f} x{sim_size:.2f} "
             f"(pattern={pattern})",
@@ -1761,7 +1886,9 @@ class SequenceStrategy:
             loop = asyncio.get_running_loop()
             response, t_sign_us, t_post_us = await loop.run_in_executor(
                 self._clob_executor,
-                self._sync_sign_and_post, order, "GTC",
+                self._sync_sign_and_post,
+                order,
+                "GTC",
             )
             t_total_us = (time.perf_counter() - t_start) * 1_000_000
 
@@ -1809,7 +1936,13 @@ class SequenceStrategy:
                 if pattern in self.pattern_fills:
                     self.pattern_fills[pattern] += 1
 
-                _append_trade_log(pos, self.cfg, outcome="PENDING", log_file=self.log_file)
+                _append_trade_log(
+                    pos,
+                    self.cfg,
+                    outcome="PENDING",
+                    log_file=self.log_file,
+                    rsi_value=self._rsi_filter.current_rsi,
+                )
                 log(
                     f"GTC IMMEDIATE FILL {label} @ {fp:.4f} x{fill_size:.2f} "
                     f"(pattern={pattern}) {timing}",
@@ -1904,9 +2037,7 @@ class SequenceStrategy:
             if not p.order_id:
                 continue
             try:
-                order_data = await asyncio.to_thread(
-                    self.clob.get_order, p.order_id
-                )
+                order_data = await asyncio.to_thread(self.clob.get_order, p.order_id)
                 size_matched = _to_float(order_data.get("size_matched", 0))
                 original_size = _to_float(order_data.get("original_size", p.size))
                 price = _to_float(order_data.get("price", p.limit_price))
@@ -1938,7 +2069,13 @@ class SequenceStrategy:
                         self.pattern_fills[p.pattern] += 1
                     self._traded_coins.add(p.coin)
 
-                    _append_trade_log(pos, self.cfg, outcome="PENDING", log_file=self.log_file)
+                    _append_trade_log(
+                        pos,
+                        self.cfg,
+                        outcome="PENDING",
+                        log_file=self.log_file,
+                        rsi_value=self._rsi_filter.current_rsi,
+                    )
 
                     partial = "" if size_matched >= original_size else " (PARTIAL)"
                     log(
@@ -1967,7 +2104,10 @@ class SequenceStrategy:
 
         t1 = time.perf_counter()
         response = self.clob.post_order(
-            signed, order_type, timeout=5, retry_count=1,
+            signed,
+            order_type,
+            timeout=5,
+            retry_count=1,
         )
         t_post = (time.perf_counter() - t1) * 1_000_000
 
@@ -2024,7 +2164,8 @@ class SequenceStrategy:
 
             # Re-snapshot positions each attempt to catch late fills
             positions = [
-                p for p in self._all_positions
+                p
+                for p in self._all_positions
                 if p.market_slug == old_slug and not p.resolved
             ]
             if not positions:
@@ -2053,12 +2194,16 @@ class SequenceStrategy:
                     log(f"Resolve error ({old_slug}): {exc}", "error")
 
         if winner is None:
-            log(f"Resolve: {old_slug} not closed after {len(delays)} attempts", "warning")
+            log(
+                f"Resolve: {old_slug} not closed after {len(delays)} attempts",
+                "warning",
+            )
             return
 
         # Final snapshot to catch any positions added during resolution attempts
         final_positions = [
-            p for p in self._all_positions
+            p
+            for p in self._all_positions
             if p.market_slug == old_slug and not p.resolved
         ]
         self._apply_resolution(final_positions, winner)
@@ -2122,7 +2267,11 @@ class SequenceStrategy:
                 )
 
             _update_trade_log_outcome(
-                pos.order_id, pos.market_slug, pos.coin, pos.side, outcome_str,
+                pos.order_id,
+                pos.market_slug,
+                pos.coin,
+                pos.side,
+                outcome_str,
                 log_file=self.log_file,
             )
 
@@ -2197,7 +2346,7 @@ class SequenceStrategy:
                         cost = entry_price * fill_size
                         pattern = entry.get("pattern", "?")
 
-                        is_win = (side == winner)
+                        is_win = side == winner
                         coin_key = coin.upper()
                         if is_win:
                             payout = fill_size
@@ -2221,7 +2370,11 @@ class SequenceStrategy:
                         if coin_key in self.coin_resolved:
                             self.coin_resolved[coin_key] += 1
                         _update_trade_log_outcome(
-                            oid, slug, coin, side, outcome_str,
+                            oid,
+                            slug,
+                            coin,
+                            side,
+                            outcome_str,
                             log_file=self.log_file,
                         )
             except Exception as exc:
@@ -2286,10 +2439,15 @@ class SequenceStrategy:
                     self.cycle_state = CycleState.OBSERVING
 
         # --- Check if all markets ended ---
-        if self.cycle_state in (CycleState.OBSERVING, CycleState.ENTRY_WINDOW,
-                                CycleState.PENDING_ORDERS, CycleState.TRADED):
+        if self.cycle_state in (
+            CycleState.OBSERVING,
+            CycleState.ENTRY_WINDOW,
+            CycleState.PENDING_ORDERS,
+            CycleState.TRADED,
+        ):
             all_ended = all(
-                m.has_ended() for c in COINS
+                m.has_ended()
+                for c in COINS
                 if (m := self._coin_markets.get(c)) is not None
             ) and any(self._coin_markets.get(c) for c in COINS)
             if all_ended and self.cycle_state != CycleState.DONE:
@@ -2362,7 +2520,7 @@ class SequenceStrategy:
         X = Colors.RESET
         M = Colors.MAGENTA
         O = "\033[38;5;214m"
-        BL = "\033[94m"       # bright blue — book-confirmed
+        BL = "\033[94m"  # bright blue — book-confirmed
         W = 72
 
         lines: list[str] = []
@@ -2403,7 +2561,9 @@ class SequenceStrategy:
         else:
             dry = ""
 
-        rules_str = ", ".join(f"{r.pattern}->{r.buy_side[0].upper()}" for r in self.cfg.rules)
+        rules_str = ", ".join(
+            f"{r.pattern}->{r.buy_side[0].upper()}" for r in self.cfg.rules
+        )
 
         # RSI indicator
         rsi_val = self._rsi_filter.current_rsi
@@ -2443,9 +2603,15 @@ class SequenceStrategy:
             if hist:
                 rendered = []
                 for entry in hist:
-                    if entry.status == ConfirmationStatus.CONFIRMED and entry.outcome in {"U", "D"}:
+                    if (
+                        entry.status == ConfirmationStatus.CONFIRMED
+                        and entry.outcome in {"U", "D"}
+                    ):
                         rendered.append(f"{O}{entry.outcome}{X}")
-                    elif entry.status == ConfirmationStatus.BOOK_CONFIRMED and entry.outcome in {"U", "D"}:
+                    elif (
+                        entry.status == ConfirmationStatus.BOOK_CONFIRMED
+                        and entry.outcome in {"U", "D"}
+                    ):
                         rendered.append(f"{BL}{entry.outcome}{X}")
                     else:
                         rendered.append(f"{Colors.WHITE}{entry.outcome}{X}")
@@ -2463,7 +2629,10 @@ class SequenceStrategy:
                 recent = self._history_values(recent_entries)
                 if recent != rule.pattern:
                     continue
-                _TRADEABLE = {ConfirmationStatus.BOOK_CONFIRMED, ConfirmationStatus.CONFIRMED}
+                _TRADEABLE = {
+                    ConfirmationStatus.BOOK_CONFIRMED,
+                    ConfirmationStatus.CONFIRMED,
+                }
                 if any(e.status not in _TRADEABLE for e in recent_entries):
                     continue
                 matches.append(f"{rule.pattern}->{rule.buy_side[0].upper()}")
@@ -2476,9 +2645,7 @@ class SequenceStrategy:
         hsep()
 
         # --- Price grid ---
-        lines.append(
-            f"  {D}{'':>5}    {'UP ask':>8}    {'DOWN ask':>8}{X}"
-        )
+        lines.append(f"  {D}{'':>5}    {'UP ask':>8}    {'DOWN ask':>8}{X}")
         for coin in COINS:
             ua = self._best_asks[coin]["up"]
             da = self._best_asks[coin]["down"]
@@ -2508,7 +2675,8 @@ class SequenceStrategy:
         pnl_c = G if self.session_pnl >= 0 else R
         wr = (
             f"{(self.total_wins / self.total_resolved) * 100:.0f}%"
-            if self.total_resolved > 0 else "--"
+            if self.total_resolved > 0
+            else "--"
         )
         lines.append(
             f"  {B}{self.total_fills}{X} fills"
@@ -2628,7 +2796,9 @@ class SequenceStrategy:
             pl = self.pattern_losses.get(p, 0)
             pr = pw + pl
             pwr = f"{(pw / pr) * 100:.1f}%" if pr > 0 else "--"
-            print(f"    {p} -> BUY {rule.buy_side.upper()}: {pw}W / {pl}L (win rate: {pwr})")
+            print(
+                f"    {p} -> BUY {rule.buy_side.upper()}: {pw}W / {pl}L (win rate: {pwr})"
+            )
 
         # Coin breakdown
         print()
@@ -2706,15 +2876,20 @@ def main() -> None:
         description="Mean-Reversion: config-driven multi-pattern strategy for 5-min Up/Down markets"
     )
     parser.add_argument(
-        "--config", type=str, default=str(DEFAULT_CONFIG),
+        "--config",
+        type=str,
+        default=str(DEFAULT_CONFIG),
         help=f"Path to YAML config file (default: {DEFAULT_CONFIG.name})",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Simulate without placing real orders",
     )
     parser.add_argument(
-        "--name", type=str, default="",
+        "--name",
+        type=str,
+        default="",
         help="Instance name for sim log files",
     )
     args = parser.parse_args()
@@ -2752,13 +2927,19 @@ def main() -> None:
     log(f"Size: ${cfg.size:.0f} flat (no Kelly)", "info")
     log(f"Order type: GTC limit at max_ask (maker-friendly)", "info")
     if cfg.rsi_enabled:
-        log(f"RSI filter: RSI({cfg.rsi_period}) {cfg.rsi_timeframe} skip >= {cfg.rsi_threshold:.0f}", "info")
+        log(
+            f"RSI filter: RSI({cfg.rsi_period}) {cfg.rsi_timeframe} skip >= {cfg.rsi_threshold:.0f}",
+            "info",
+        )
     else:
         log("RSI filter: DISABLED", "warning")
     if cfg.dd_enabled:
-        log(f"Drawdown protection: max_dd=${cfg.dd_max_drawdown:.0f} "
+        log(
+            f"Drawdown protection: max_dd=${cfg.dd_max_drawdown:.0f} "
             f"max_consec={cfg.dd_max_consecutive_losses} "
-            f"cooldown={cfg.dd_cooldown_minutes:.0f}min", "info")
+            f"cooldown={cfg.dd_cooldown_minutes:.0f}min",
+            "info",
+        )
     else:
         log("Drawdown protection: DISABLED", "warning")
     print()

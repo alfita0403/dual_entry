@@ -34,8 +34,10 @@ class TestComputeRSI:
 
     def test_mixed_gives_midrange(self):
         """Alternating prices should give RSI around 50."""
-        prices = np.array([100, 101, 100, 101, 100, 101, 100, 101,
-                           100, 101, 100, 101, 100, 101, 100], dtype=float)
+        prices = np.array(
+            [100, 101, 100, 101, 100, 101, 100, 101, 100, 101, 100, 101, 100, 101, 100],
+            dtype=float,
+        )
         rsi = _compute_rsi(prices, 7)
         assert 40 <= rsi <= 60
 
@@ -70,27 +72,37 @@ class TestRSIFilter:
         f._last_rsi = 90.0  # High RSI
         assert f.should_skip is False
 
-    def test_no_data_does_not_skip(self):
-        """Fail-open: with no data, should allow trading."""
+    def test_no_data_skips_fail_closed(self):
+        """Fail-closed: with no RSI data, should block trading."""
         f = RSIFilter(enabled=True, threshold=60.0)
-        assert f.should_skip is False  # _last_rsi = NaN
+        assert f.should_skip is True  # _last_rsi = NaN -> fail-closed
 
     def test_below_threshold_allows(self):
         """RSI below threshold should allow trading."""
         f = RSIFilter(enabled=True, threshold=60.0)
         f._last_rsi = 45.0
+        f._last_fetch_ts = time.time()  # mark as fresh
         assert f.should_skip is False
+
+    def test_stale_rsi_skips(self):
+        """RSI older than MAX_STALENESS should block trading."""
+        f = RSIFilter(enabled=True, threshold=60.0)
+        f._last_rsi = 45.0  # below threshold, would normally allow
+        f._last_fetch_ts = time.time() - 600  # 10 minutes ago
+        assert f.should_skip is True  # stale -> fail-closed
 
     def test_at_threshold_skips(self):
         """RSI exactly at threshold should skip."""
         f = RSIFilter(enabled=True, threshold=60.0)
         f._last_rsi = 60.0
+        f._last_fetch_ts = time.time()  # fresh data
         assert f.should_skip is True
 
     def test_above_threshold_skips(self):
         """RSI above threshold should skip."""
         f = RSIFilter(enabled=True, threshold=60.0)
         f._last_rsi = 75.0
+        f._last_fetch_ts = time.time()  # fresh data
         assert f.should_skip is True
 
     def test_current_rsi_property(self):
@@ -128,8 +140,9 @@ class TestDrawdownProtection:
 
     def test_within_limits_no_pause(self):
         """Losses within limits should not trigger pause."""
-        dd = DrawdownProtection(enabled=True, max_drawdown=30.0,
-                                max_consecutive_losses=5)
+        dd = DrawdownProtection(
+            enabled=True, max_drawdown=30.0, max_consecutive_losses=5
+        )
         dd.record_outcome(False, -10.0)
         dd.record_outcome(False, -20.0)
         assert dd.should_skip is False
@@ -145,8 +158,9 @@ class TestDrawdownProtection:
 
     def test_consecutive_losses_triggers_pause(self):
         """Exceeding max consecutive losses should pause."""
-        dd = DrawdownProtection(enabled=True, max_drawdown=1000.0,
-                                max_consecutive_losses=3)
+        dd = DrawdownProtection(
+            enabled=True, max_drawdown=1000.0, max_consecutive_losses=3
+        )
         dd.record_outcome(False, -5.0)
         dd.record_outcome(False, -10.0)
         assert dd.paused is False
@@ -165,8 +179,9 @@ class TestDrawdownProtection:
 
     def test_cooldown_resumes(self):
         """After cooldown, trading should resume."""
-        dd = DrawdownProtection(enabled=True, max_drawdown=10.0,
-                                cooldown_minutes=0.01)  # 0.6 seconds
+        dd = DrawdownProtection(
+            enabled=True, max_drawdown=10.0, cooldown_minutes=0.01
+        )  # 0.6 seconds
         dd.record_outcome(False, -15.0)
         assert dd.paused is True
         # Simulate time passing
@@ -176,8 +191,7 @@ class TestDrawdownProtection:
 
     def test_zero_cooldown_requires_restart(self):
         """With cooldown=0, should stay paused (manual restart)."""
-        dd = DrawdownProtection(enabled=True, max_drawdown=10.0,
-                                cooldown_minutes=0)
+        dd = DrawdownProtection(enabled=True, max_drawdown=10.0, cooldown_minutes=0)
         dd.record_outcome(False, -15.0)
         assert dd.paused is True
         dd.paused_at = time.time() - 3600  # 1 hour ago
@@ -196,9 +210,7 @@ class TestDrawdownProtection:
 class TestYAMLConfig:
     def test_loads_rsi_config(self):
         """YAML should load RSI filter config."""
-        cfg = SequenceConfig.from_yaml(
-            "strategies/mean_reversion.yaml", dry_run=True
-        )
+        cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
         assert cfg.rsi_enabled is True
         assert cfg.rsi_period == 7
         assert cfg.rsi_timeframe == "5m"
@@ -206,9 +218,7 @@ class TestYAMLConfig:
 
     def test_loads_drawdown_config(self):
         """YAML should load drawdown protection config."""
-        cfg = SequenceConfig.from_yaml(
-            "strategies/mean_reversion.yaml", dry_run=True
-        )
+        cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
         assert cfg.dd_enabled is True
         assert cfg.dd_max_drawdown == 30.0
         assert cfg.dd_max_consecutive_losses == 8
@@ -216,9 +226,7 @@ class TestYAMLConfig:
 
     def test_loads_tighter_maxask(self):
         """YAML should have updated max_ask values."""
-        cfg = SequenceConfig.from_yaml(
-            "strategies/mean_reversion.yaml", dry_run=True
-        )
+        cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
         # Find UUU rule
         uuu_rule = next(r for r in cfg.rules if r.pattern == "UUU")
         assert uuu_rule.max_ask == 0.49  # tightened from 0.51
@@ -228,15 +236,14 @@ class TestYAMLConfig:
         assert uduu_rule.max_ask == 0.50  # tightened from 0.51
 
         # ETH UUUU should still be 0.54
-        eth_uuuu = next(r for r in cfg.rules
-                        if r.pattern == "UUUU" and "ETH" in (r.coins or []))
+        eth_uuuu = next(
+            r for r in cfg.rules if r.pattern == "UUUU" and "ETH" in (r.coins or [])
+        )
         assert eth_uuuu.max_ask == 0.54
 
     def test_rules_sorted_longest_first(self):
         """Rules should be sorted by pattern length (longest first)."""
-        cfg = SequenceConfig.from_yaml(
-            "strategies/mean_reversion.yaml", dry_run=True
-        )
+        cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
         lengths = [len(r.pattern) for r in cfg.rules]
         assert lengths == sorted(lengths, reverse=True)
 
