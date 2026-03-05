@@ -366,12 +366,12 @@ class TestYAMLConfig:
         assert cfg.rsi_boost_up_zones is not None
         assert len(cfg.rsi_boost_up_zones) == 1
         assert cfg.rsi_boost_up_zones[0].below == 35.0
-        assert cfg.rsi_boost_up_zones[0].size == 8.0
+        assert cfg.rsi_boost_up_zones[0].size == 6.0
         # DOWN zones
         assert cfg.rsi_boost_down_zones is not None
         assert len(cfg.rsi_boost_down_zones) == 1
         assert cfg.rsi_boost_down_zones[0].above == 55.0
-        assert cfg.rsi_boost_down_zones[0].size == 8.0
+        assert cfg.rsi_boost_down_zones[0].size == 6.0
 
     def test_loads_drawdown_config(self):
         """YAML should load drawdown protection config."""

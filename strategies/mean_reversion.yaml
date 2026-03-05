@@ -45,9 +45,9 @@ rsi_boost:
   period: 7
   timeframe: "5m"
   up_zones:
-    - {below: 35, size: 8.0}
+    - {below: 35, size: 6.0}
   down_zones:
-    - {above: 55, size: 8.0}
+    - {above: 55, size: 6.0}
 
 # Drawdown protection
 drawdown_protection:

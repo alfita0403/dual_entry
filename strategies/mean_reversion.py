@@ -638,6 +638,39 @@ class LiveIndicatorEngine:
 
         return True
 
+    def get_regime_info(self, coin: str) -> Dict[str, str]:
+        """Get volatility regime and volume info for TUI display.
+
+        Returns dict with keys: vol_regime, vol_pct, vol_sum_pct, rsi7, rsi14
+        """
+        info: Dict[str, str] = {}
+        # Volatility regime
+        vol = self._current_vol_1h.get(coin)
+        if vol is not None:
+            pct = self._get_percentile_rank(coin, "VOL_1H", vol)
+            if pct < 20:
+                info["vol_regime"] = "VERY LOW"
+            elif pct < 40:
+                info["vol_regime"] = "LOW"
+            elif pct < 60:
+                info["vol_regime"] = "MID"
+            elif pct < 80:
+                info["vol_regime"] = "HIGH"
+            else:
+                info["vol_regime"] = "VERY HIGH"
+            info["vol_pct"] = f"{pct:.0f}"
+        # Volume
+        vsum = self._current_vol_sum_1h.get(coin)
+        if vsum is not None:
+            pct_v = self._get_percentile_rank(coin, "VOL_SUM_1H", vsum)
+            info["vol_sum_pct"] = f"{pct_v:.0f}"
+        # RSI
+        for p in (7, 14):
+            rsi = self._rsi_cache.get((coin, p))
+            if rsi is not None and not np.isnan(rsi):
+                info[f"rsi{p}"] = f"{rsi:.0f}"
+        return info
+
     @property
     def status_str(self) -> str:
         """Short TUI status string."""
@@ -3390,14 +3423,38 @@ class SequenceStrategy:
             f"{B}{c}{X}:{G}{v.get('UP', 0)}U{X}/{R}{v.get('DN', 0)}D{X}"
             for c, v in sorted(coin_rule_counts.items())
         )
-        ind_str = ""
-        if self._indicator_engine.has_conditions:
-            ind_str = f"  {D}IND:{self._indicator_engine.status_str}{X}"
         lines.append(
             f"  {D}Rules ({n_rules}, {n_cond} cond)  size=${self.cfg.size:.0f}"
-            f"{kelly_str}  cycle #{self.cycles_seen}{X}{ind_str}"
+            f"{kelly_str}  cycle #{self.cycles_seen}{X}"
         )
         lines.append(f"  {coin_summary}")
+
+        # Regime & indicator status line
+        if self._indicator_engine.has_conditions:
+            regime_parts = []
+            for ic in sorted(self._indicator_engine._needed_coins):
+                ri = self._indicator_engine.get_regime_info(ic)
+                if ri.get("vol_regime"):
+                    vol_r = ri["vol_regime"]
+                    vp = ri.get("vol_pct", "?")
+                    # Color code regime
+                    if vol_r in ("VERY LOW", "LOW"):
+                        vc = G
+                    elif vol_r == "MID":
+                        vc = Y
+                    else:
+                        vc = R
+                    rsi_s = ""
+                    r7 = ri.get("rsi7")
+                    if r7:
+                        rsi_s = f" r{r7}"
+                    vs = ri.get("vol_sum_pct", "")
+                    vs_s = f" v{vs}p" if vs else ""
+                    regime_parts.append(
+                        f"{B}{ic}{X}:{vc}{vol_r}{X}({D}p{vp}{vs_s}{rsi_s}{X})"
+                    )
+            if regime_parts:
+                lines.append(f"  {D}regime:{X} " + "  ".join(regime_parts))
         hsep()
 
         # --- Outcome history ---
