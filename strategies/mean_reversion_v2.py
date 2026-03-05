@@ -66,6 +66,9 @@ GAMMA_RECHECK_RETRY_DELAY = 60
 
 # Book-confirm: bid >= this after cycle ends => that side won
 BOOK_CONFIRM_BID = 0.90
+# REST book data is delayed/stale — require higher threshold + gap between sides
+REST_BOOK_CONFIRM_BID = 0.95
+BOOK_CONFIRM_MIN_GAP = 0.30  # winner bid must exceed loser bid by this much
 
 # Entry timing defaults (overridden by YAML)
 ENTRY_WINDOW_START = 1
@@ -259,6 +262,7 @@ class PositionRecord:
     market_slug: str
     order_id: str = ""
     cost: float = 0.0
+    fee_rate_bps: int = 0  # fee rate in basis points at order time
     pattern: str = ""
     rule_id: str = ""
     resolved: bool = False
@@ -282,6 +286,7 @@ class PendingOrder:
     market_slug: str
     pattern: str
     rule_id: str = ""
+    fee_rate_bps: int = 0
     neg_risk: bool = False
     tick_size: str = "0.01"
 
@@ -343,8 +348,9 @@ def _update_trade_log_outcome(
                 line = line.replace("outcome=PENDING", f"outcome={outcome}")
             updated.append(line)
         target.write_text("\n".join(updated) + "\n", encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        log(f"Trade log update error for {order_id}: {exc}", "warning")
+
 
 
 # ===================================================================
@@ -447,9 +453,10 @@ class PatternStrategy:
         self._cycle_ts: Optional[int] = None
         self._cycle_start_ts: float = 0.0
 
-        # Outcome history per coin (maxlen=6 supports patterns up to length 6)
+        # Outcome history per coin — derive maxlen from longest rule pattern
+        _max_pl = max((len(r.pattern) for r in self.cfg.rules), default=6)
         self._outcome_history: Dict[str, deque] = {
-            c: deque(maxlen=6) for c in active_coins
+            c: deque(maxlen=_max_pl) for c in active_coins
         }
         self._last_inference_ts: Dict[str, Optional[int]] = {
             c: None for c in active_coins
@@ -501,6 +508,7 @@ class PatternStrategy:
         # Pending GTC limit orders
         self._pending_orders: List[PendingOrder] = []
         self._orders_placed_ts: float = 0.0
+        self._entry_in_progress: bool = False  # guard against concurrent entry
 
         # Positions
         self._current_positions: List[PositionRecord] = []
@@ -591,6 +599,10 @@ class PatternStrategy:
                 outcome = fields.get("outcome", "")
                 pattern = fields.get("pattern", "")
                 coin = fields.get("coin", "").upper()
+
+                # Skip PENDING entries — they haven't been resolved yet
+                if outcome == "PENDING":
+                    continue
 
                 self.total_fills += 1
                 self.total_spent += cost
@@ -908,17 +920,21 @@ class PatternStrategy:
         self.cycle_state = CycleState.DONE
 
         if self._pending_orders:
+            # Snapshot and clear IMMEDIATELY — the background task will use the
+            # snapshot.  Without this, _maybe_enter_cycle's .clear() at line 842
+            # races with the create_task and the task would find an empty list.
+            snapshot = list(self._pending_orders)
+            self._pending_orders.clear()
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(self._cancel_and_settle_pending())
+                loop.create_task(self._cancel_and_settle_pending(snapshot))
             except RuntimeError:
-                order_ids = [p.order_id for p in self._pending_orders if p.order_id]
+                order_ids = [p.order_id for p in snapshot if p.order_id]
                 if order_ids:
                     try:
                         self.clob.cancel_orders(order_ids)
                     except Exception:
                         pass
-                self._pending_orders.clear()
 
         seen_slugs: Set[str] = set()
         for pos in self._current_positions:
@@ -1095,22 +1111,29 @@ class PatternStrategy:
             up_bid = self._best_bids[coin]["up"]
             down_bid = self._best_bids[coin]["down"]
 
-            if up_bid >= BOOK_CONFIRM_BID:
+            # Pick the side with the higher bid; require threshold AND gap
+            # to avoid false confirmation when both sides have residual bids
+            winner_bid = max(up_bid, down_bid)
+            loser_bid = min(up_bid, down_bid)
+            gap = winner_bid - loser_bid
+
+            if winner_bid >= BOOK_CONFIRM_BID and gap >= BOOK_CONFIRM_MIN_GAP:
+                outcome = "U" if up_bid >= down_bid else "D"
+                side_label = "UP" if outcome == "U" else "DOWN"
                 prev = entry.outcome
-                entry.outcome = "U"
+                entry.outcome = outcome
                 entry.status = ConfirmationStatus.BOOK_CONFIRMED
                 log(
-                    f"  {coin} book-confirmed: U (UP bid={up_bid:.3f})"
-                    + (f" [was {prev}]" if prev != "U" else ""),
+                    f"  {coin} book-confirmed: {outcome} "
+                    f"({side_label} bid={winner_bid:.3f}, other={loser_bid:.3f}, gap={gap:.3f})"
+                    + (f" [was {prev}]" if prev != outcome else ""),
                     "trade",
                 )
-            elif down_bid >= BOOK_CONFIRM_BID:
-                prev = entry.outcome
-                entry.outcome = "D"
-                entry.status = ConfirmationStatus.BOOK_CONFIRMED
+            elif winner_bid >= BOOK_CONFIRM_BID:
+                # Both sides have high bids — ambiguous, skip and wait for Gamma
                 log(
-                    f"  {coin} book-confirmed: D (DOWN bid={down_bid:.3f})"
-                    + (f" [was {prev}]" if prev != "D" else ""),
+                    f"  {coin} book-confirm SKIPPED: ambiguous "
+                    f"(UP bid={up_bid:.3f}, DOWN bid={down_bid:.3f}, gap={gap:.3f})",
                     "trade",
                 )
 
@@ -1149,29 +1172,53 @@ class PatternStrategy:
             source = "live"
 
         # Try bid-based confirmation first (most reliable)
-        if up_bid >= BOOK_CONFIRM_BID:
-            entry.outcome = "U"
+        # Compare both sides with gap requirement to avoid UP-first bias
+        winner_bid = max(up_bid, down_bid)
+        loser_bid = min(up_bid, down_bid)
+        bid_gap = winner_bid - loser_bid
+
+        if winner_bid >= BOOK_CONFIRM_BID and bid_gap >= BOOK_CONFIRM_MIN_GAP:
+            outcome = "U" if up_bid >= down_bid else "D"
+            side_label = "UP" if outcome == "U" else "DOWN"
+            entry.outcome = outcome
             entry.status = ConfirmationStatus.BOOK_CONFIRMED
-            log(f"  {coin} late book-confirmed: U (UP bid={up_bid:.3f}, {source})", "trade")
+            log(
+                f"  {coin} late book-confirmed: {outcome} "
+                f"({side_label} bid={winner_bid:.3f}, other={loser_bid:.3f}, gap={bid_gap:.3f}, {source})",
+                "trade",
+            )
             return
-        if down_bid >= BOOK_CONFIRM_BID:
-            entry.outcome = "D"
-            entry.status = ConfirmationStatus.BOOK_CONFIRMED
-            log(f"  {coin} late book-confirmed: D (DOWN bid={down_bid:.3f}, {source})", "trade")
+        if winner_bid >= BOOK_CONFIRM_BID:
+            log(
+                f"  {coin} late book-confirm SKIPPED: ambiguous "
+                f"(UP bid={up_bid:.3f}, DOWN bid={down_bid:.3f}, gap={bid_gap:.3f}, {source})",
+                "trade",
+            )
             return
 
         if not had_data:
             return
 
-        # Multi-signal inference
-        if up_ask >= CERTAIN_UP_ASK or down_ask <= CERTAIN_DOWN_ASK:
+        # Multi-signal inference with conflict detection
+        is_up = up_ask >= CERTAIN_UP_ASK or down_ask <= CERTAIN_DOWN_ASK
+        is_down = up_ask <= CERTAIN_DOWN_ASK or down_ask >= CERTAIN_UP_ASK
+
+        if is_up and is_down:
+            log(
+                f"  {coin} late CONFLICT: both sides signal "
+                f"(up_ask={up_ask:.3f}, down_ask={down_ask:.3f}, {source})",
+                "warning",
+            )
+            return  # leave as dash, wait for Gamma
+
+        if is_up:
             entry.outcome = "U"
             entry.status = ConfirmationStatus.PROVISIONAL
             log(
                 f"  {coin} late inferred: U (up_ask={up_ask:.3f}, down_ask={down_ask:.3f}, {source})",
                 "trade",
             )
-        elif up_ask <= CERTAIN_DOWN_ASK or down_ask >= CERTAIN_UP_ASK:
+        elif is_down:
             entry.outcome = "D"
             entry.status = ConfirmationStatus.PROVISIONAL
             log(
@@ -1188,6 +1235,16 @@ class PatternStrategy:
         old_cycle_ts: int,
     ) -> None:
         """Fetch old market's orderbook via REST and upgrade outcomes."""
+        try:
+            await self._rest_book_confirm_inner(old_token_ids, old_cycle_ts)
+        except Exception as exc:
+            log(f"REST book-confirm task failed: {exc}", "error")
+
+    async def _rest_book_confirm_inner(
+        self,
+        old_token_ids: Dict[str, Dict[str, str]],
+        old_cycle_ts: int,
+    ) -> None:
         await asyncio.sleep(2.0)
 
         max_retries = 6
@@ -1209,6 +1266,8 @@ class PatternStrategy:
                 if not token_ids:
                     continue
 
+                # Fetch BOTH sides' best bids before deciding
+                side_bids: Dict[str, float] = {}
                 for side in ("up", "down"):
                     tid = token_ids.get(side, "")
                     if not tid:
@@ -1217,21 +1276,35 @@ class PatternStrategy:
                         book = await asyncio.to_thread(self.clob.get_order_book, tid)
                         bids = book.get("bids", [])
                         if bids:
-                            best_bid = float(bids[0].get("price", 0))
-                            if best_bid >= BOOK_CONFIRM_BID:
-                                outcome = "U" if side == "up" else "D"
-                                prev = entry.outcome
-                                entry.outcome = outcome
-                                entry.status = ConfirmationStatus.BOOK_CONFIRMED
-                                log(
-                                    f"  {coin} book-confirmed (REST): {outcome} "
-                                    f"({side.upper()} bid={best_bid:.3f})"
-                                    + (f" [was {prev}]" if prev != outcome else ""),
-                                    "trade",
-                                )
-                                break
+                            side_bids[side] = float(bids[0].get("price", 0))
                     except Exception as exc:
                         log(f"  REST book error {coin}/{side}: {exc}", "warning")
+
+                up_bid = side_bids.get("up", 0.0)
+                down_bid = side_bids.get("down", 0.0)
+                winner_bid = max(up_bid, down_bid)
+                loser_bid = min(up_bid, down_bid)
+                gap = winner_bid - loser_bid
+
+                # Use stricter REST threshold + require gap between sides
+                if winner_bid >= REST_BOOK_CONFIRM_BID and gap >= BOOK_CONFIRM_MIN_GAP:
+                    outcome = "U" if up_bid >= down_bid else "D"
+                    side_label = "UP" if outcome == "U" else "DOWN"
+                    prev = entry.outcome
+                    entry.outcome = outcome
+                    entry.status = ConfirmationStatus.BOOK_CONFIRMED
+                    log(
+                        f"  {coin} book-confirmed (REST): {outcome} "
+                        f"({side_label} bid={winner_bid:.3f}, other={loser_bid:.3f}, gap={gap:.3f})"
+                        + (f" [was {prev}]" if prev != outcome else ""),
+                        "trade",
+                    )
+                elif winner_bid >= REST_BOOK_CONFIRM_BID:
+                    log(
+                        f"  {coin} REST book-confirm SKIPPED: ambiguous "
+                        f"(UP bid={up_bid:.3f}, DOWN bid={down_bid:.3f}, gap={gap:.3f})",
+                        "trade",
+                    )
 
             if all_confirmed:
                 break
@@ -1378,6 +1451,15 @@ class PatternStrategy:
     # ------------------------------------------------------------------
     async def _try_enter_trades(self) -> None:
         """Place GTC limit orders for all pattern matches."""
+        if self._entry_in_progress:
+            return  # another coroutine is already placing orders
+        self._entry_in_progress = True
+        try:
+            await self._try_enter_trades_inner()
+        finally:
+            self._entry_in_progress = False
+
+    async def _try_enter_trades_inner(self) -> None:
         # Drawdown circuit breaker
         if self._drawdown.should_skip:
             remaining = ""
@@ -1584,7 +1666,8 @@ class PatternStrategy:
                 pos = PositionRecord(
                     coin=coin, side=side, fill_price=fp, fill_size=fill_size,
                     fill_time=time.time(), market_slug=market.slug,
-                    order_id=order_id, cost=cost, pattern=pattern, rule_id=rule_id,
+                    order_id=order_id, cost=cost, fee_rate_bps=fee_rate_bps,
+                    pattern=pattern, rule_id=rule_id,
                 )
                 self._current_positions.append(pos)
                 self._all_positions.append(pos)
@@ -1608,6 +1691,7 @@ class PatternStrategy:
                     coin=coin, side=side, token_id=token_id, order_id=order_id,
                     limit_price=limit_price, size=trade_size, placed_at=time.time(),
                     market_slug=market.slug, pattern=pattern, rule_id=rule_id,
+                    fee_rate_bps=fee_rate_bps,
                     neg_risk=market.neg_risk, tick_size=market.tick_size,
                 )
                 self._pending_orders.append(pending)
@@ -1629,6 +1713,7 @@ class PatternStrategy:
                     coin=coin, side=side, token_id=token_id, order_id=order_id,
                     limit_price=limit_price, size=trade_size, placed_at=time.time(),
                     market_slug=market.slug, pattern=pattern, rule_id=rule_id,
+                    fee_rate_bps=fee_rate_bps,
                     neg_risk=market.neg_risk, tick_size=market.tick_size,
                 )
                 self._pending_orders.append(pending)
@@ -1673,13 +1758,28 @@ class PatternStrategy:
     # ------------------------------------------------------------------
     # Cancel + settle pending orders
     # ------------------------------------------------------------------
-    async def _cancel_and_settle_pending(self) -> None:
-        """Cancel unfilled GTC orders and record any fills as positions."""
-        if not self._pending_orders:
-            return
+    async def _cancel_and_settle_pending(
+        self, snapshot: Optional[list] = None,
+    ) -> None:
+        """Cancel unfilled GTC orders and record any fills as positions.
 
-        pending = list(self._pending_orders)
-        self._pending_orders.clear()
+        Args:
+            snapshot: Pre-captured list of PendingOrder objects.  When called
+                from _transition_to_done the list is snapshotted before the
+                instance variable is cleared to avoid the create_task race.
+                When called from _tick (cancel_timeout path) we still read
+                self._pending_orders directly as there is no race.
+        """
+        if snapshot is not None:
+            pending = snapshot
+        else:
+            if not self._pending_orders:
+                return
+            pending = list(self._pending_orders)
+            self._pending_orders.clear()
+
+        if not pending:
+            return
 
         # Batch cancel
         order_ids = [p.order_id for p in pending if p.order_id]
@@ -1726,7 +1826,8 @@ class PatternStrategy:
                         coin=p.coin, side=p.side, fill_price=fill_price,
                         fill_size=size_matched, fill_time=time.time(),
                         market_slug=p.market_slug, order_id=p.order_id,
-                        cost=cost, pattern=p.pattern, rule_id=p.rule_id,
+                        cost=cost, fee_rate_bps=p.fee_rate_bps,
+                        pattern=p.pattern, rule_id=p.rule_id,
                     )
                     self._current_positions.append(pos)
                     self._all_positions.append(pos)
@@ -1837,9 +1938,12 @@ class PatternStrategy:
             pos.resolved = True
             self.total_resolved += 1
 
-            effective_cost = pos.cost
             if self.cfg.dry_run:
                 effective_cost = pos.cost * (1.0 + SIM_FEE_RATE)
+            else:
+                # Live mode: apply actual fee from order time
+                fee_frac = pos.fee_rate_bps / 10_000.0 if pos.fee_rate_bps else 0.0
+                effective_cost = pos.cost * (1.0 + fee_frac)
 
             coin_key = pos.coin.upper()
             rid = pos.rule_id
@@ -1966,6 +2070,8 @@ class PatternStrategy:
 
                         is_win = side == winner
                         coin_key = coin.upper()
+                        pattern = entry.get("pattern", "")
+                        rid = self._rule_id_map.get((pattern, coin_key), "")
                         if is_win:
                             payout = fill_size
                             profit = payout - cost
@@ -1973,6 +2079,8 @@ class PatternStrategy:
                             self.total_wins += 1
                             if coin_key in self.coin_wins:
                                 self.coin_wins[coin_key] += 1
+                            if rid in self.pattern_wins:
+                                self.pattern_wins[rid] += 1
                             self.session_pnl += profit
                             self.total_received += payout
                             self._drawdown.record_outcome(True, self.session_pnl)
@@ -1981,6 +2089,8 @@ class PatternStrategy:
                             self.total_losses += 1
                             if coin_key in self.coin_losses:
                                 self.coin_losses[coin_key] += 1
+                            if rid in self.pattern_losses:
+                                self.pattern_losses[rid] += 1
                             self.session_pnl -= cost
                             self._drawdown.record_outcome(False, self.session_pnl)
 
@@ -2076,6 +2186,22 @@ class PatternStrategy:
                             log(f"[poll] New market detected via {coin}", "info")
                             self._maybe_enter_cycle(coin, market)
                             break
+
+        # Recovery poll for WAITING_MARKET (re-check every 5s)
+        if self.cycle_state == CycleState.WAITING_MARKET:
+            if now - self._last_done_poll >= 5.0:
+                self._last_done_poll = now
+                for coin in self.active_coins:
+                    mgr = self.managers.get(coin)
+                    if not mgr or not mgr.current_market:
+                        continue
+                    market = mgr.current_market
+                    ms = market.start_timestamp()
+                    if ms is not None:
+                        self._coin_markets[coin] = market
+                        log(f"[wait-recovery] Market found via {coin}", "info")
+                        self._maybe_enter_cycle(coin, market)
+                        break
 
         # Sweep pending (every 2 min)
         if now - self._last_sweep_ts >= 120.0:
@@ -2338,10 +2464,11 @@ class PatternStrategy:
                 tag = f"{D}...{X}"
                 if p.resolved:
                     if p.won:
-                        profit = (p.payout or 0) - p.cost
+                        profit = p.pnl if p.pnl is not None else (p.payout or 0) - p.cost
                         tag = f"{G}{B}WIN{X} {G}+${profit:.2f}{X}"
                     else:
-                        tag = f"{R}LOSS{X} {R}-${p.cost:.2f}{X}"
+                        loss_amt = abs(p.pnl) if p.pnl is not None else p.cost
+                        tag = f"{R}LOSS{X} {R}-${loss_amt:.2f}{X}"
                 lines.append(
                     f"  {D}{ts}{X}"
                     f"  {B}{p.coin}{X}-{p.side.upper():<4}"
@@ -2385,6 +2512,16 @@ class PatternStrategy:
                 await mgr.stop()
             except Exception:
                 pass
+
+        # Shut down thread pool executors to avoid resource leak warnings
+        try:
+            self._clob_executor.shutdown(wait=False)
+        except Exception:
+            pass
+        try:
+            self._http_executor.shutdown(wait=False)
+        except Exception:
+            pass
 
     def _print_summary(self) -> None:
         print()
@@ -2458,10 +2595,11 @@ class PatternStrategy:
                 res = ""
                 if p.resolved:
                     if p.won:
-                        profit = (p.payout or 0) - p.cost
+                        profit = p.pnl if p.pnl is not None else (p.payout or 0) - p.cost
                         res = f"  WIN +${profit:.4f}"
                     else:
-                        res = f"  LOSS -${p.cost:.4f}"
+                        loss_amt = abs(p.pnl) if p.pnl is not None else p.cost
+                        res = f"  LOSS -${loss_amt:.4f}"
                 ts = datetime.fromtimestamp(p.fill_time).strftime("%H:%M:%S")
                 print(
                     f"    {ts}  {p.coin}-{p.side.upper():>4}"
