@@ -17,11 +17,11 @@ entry_window_end: 3
 cancel_timeout: 10.0
 max_trades_per_cycle: 4
 
-# Drawdown protection
+# Drawdown protection (backtest MaxDD=$40, max consec losses=6)
 drawdown_protection:
   enabled: true
-  max_drawdown: 15.0
-  max_consecutive_losses: 6
+  max_drawdown: 45.0
+  max_consecutive_losses: 8
   cooldown_minutes: 15
 
 # Trade log (separate from v1)
