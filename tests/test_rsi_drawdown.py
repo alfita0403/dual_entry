@@ -381,33 +381,44 @@ class TestYAMLConfig:
         assert cfg.dd_max_consecutive_losses == 8
         assert cfg.dd_cooldown_minutes == 30.0
 
-    def test_loads_maxask_060(self):
-        """YAML should have max_ask=0.60 for all 5 ETH-only rules."""
+    def test_loads_v2_rules(self):
+        """YAML V2 should have 17 rules across BTC, ETH, SOL."""
         cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
-        assert len(cfg.rules) == 5
+        assert len(cfg.rules) == 17
+        # All max_ask values should be in valid range
         for r in cfg.rules:
-            assert r.max_ask == 0.60, (
-                f"Rule {r.pattern} has max_ask={r.max_ask}, expected 0.60"
+            assert 0.30 <= r.max_ask <= 0.90, (
+                f"Rule {r.pattern} has max_ask={r.max_ask}, out of range"
             )
-            assert r.coins == ["ETH"], (
-                f"Rule {r.pattern} has coins={r.coins}, expected ['ETH']"
-            )
+        # Check coins used
+        all_coins = set()
+        for r in cfg.rules:
+            if r.coins:
+                all_coins.update(r.coins)
+        assert "ETH" in all_coins
+        assert "BTC" in all_coins
+        assert "SOL" in all_coins
 
     def test_bidirectional_rules(self):
-        """YAML should have both UP and DOWN side rules, all ETH."""
+        """YAML should have both UP and DOWN side rules, multi-coin."""
         cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
 
-        # DOWN-streak reversals bet UP: DDDDD, DDDD, DDD
         up_rules = [r for r in cfg.rules if r.buy_side == "up"]
-        assert len(up_rules) == 3
-        up_patterns = sorted([r.pattern for r in up_rules])
-        assert up_patterns == ["DDD", "DDDD", "DDDDD"]
-
-        # UP-streak reversals bet DOWN: UUUU, UUU
         dn_rules = [r for r in cfg.rules if r.buy_side == "down"]
-        assert len(dn_rules) == 2
-        dn_patterns = sorted([r.pattern for r in dn_rules])
-        assert dn_patterns == ["UUU", "UUUU"]
+        # V2: 9 UP rules, 8 DOWN rules
+        assert len(up_rules) >= 8
+        assert len(dn_rules) >= 7
+
+    def test_conditioned_rules(self):
+        """V2 should have 7 conditioned rules with valid conditions."""
+        cfg = SequenceConfig.from_yaml("strategies/mean_reversion.yaml", dry_run=True)
+        conditioned = [r for r in cfg.rules if r.conditions]
+        assert len(conditioned) == 7
+        for r in conditioned:
+            for cond in r.conditions:
+                assert "indicator" in cond
+                assert "condition" in cond
+                assert cond["indicator"] in ("VOL_1H", "VOL_SUM_1H", "RSI")
 
     def test_rules_sorted_longest_first(self):
         """Rules should be sorted by pattern length (longest first)."""

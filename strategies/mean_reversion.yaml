@@ -1,22 +1,28 @@
-# Mean-Reversion Strategy Config (LIVE)
+# Mean-Reversion Strategy Config V2 (LIVE)
 #
-# ETH-only, bidirectional: bet DOWN after UP streaks, UP after DOWN streaks.
-# All 5 patterns Bonferroni-significant on Telonex 74-day dataset.
-# BTC/SOL/XRP removed: 53% WR below 55% breakeven, net -$530 on Telonex.
-# max_ask=0.60 -- CSV sweep shows $0.60-0.67 optimal zone (+$37-46/5d).
-# Avg entry $0.51-0.53 regardless of max_ask (orderbook ceiling).
-# Telonex WR=55.7% confirmed on 3,278 trades.
+# Multi-coin bidirectional mean-reversion with conditional filters.
+# 17 pattern rules across ETH (12), BTC (4), SOL (1).
+#
+# V2 changes vs V1:
+#   - Added BTC and SOL patterns that passed Bonferroni correction
+#   - Added DOWN-streak -> UP rules (bidirectional edge)
+#   - Conditional filters: VOL_1H, VOL_SUM_1H, RSI(7/14) per-rule
+#   - Tighter max_ask per-pattern (0.50-0.56) instead of blanket 0.60
+#   - First-match-wins: longest patterns first, conditioned before fallback
+#
+# Rule ordering is critical:
+#   Within each coin, longest patterns match first. Conditioned variants
+#   of a pattern are listed BEFORE their plain fallback so that the
+#   filter has a chance to fire before the unconditional rule catches.
 #
 # RSI boost: increase bet size when RSI confirms the trade direction.
-# UP bets: RSI < 35 (oversold) -> $8 (from $5 base). Telonex: 772 trades, 58.9% WR.
-# DOWN bets: RSI > 55 (overbought) -> $8. Telonex: 1,362 trades, 56.7% WR.
-# Never skips trades -- base size $5 when RSI doesn't confirm.
-# Validated on Telonex 74 days (no look-ahead bias: uses T-300s candle).
+#   UP bets: RSI < 35 (oversold) -> $8. DOWN bets: RSI > 55 -> $8.
+#   Base size $5 when RSI doesn't confirm. Never skips trades.
 #
 # Execution model:
-# - Place GTC limit at max_ask around t=1s
-# - Cancel all unfilled after 10s
-# - Hold filled size to resolution
+#   - Place GTC limit at max_ask around t=1s
+#   - Cancel all unfilled after 10s
+#   - Hold filled size to resolution
 
 entry_window_start: 1
 entry_window_end: 3
@@ -34,7 +40,6 @@ rsi_filter:
 # Uses ETHUSDT 5m klines from Binance. RSI(7).
 # UP bets: oversold (RSI<35) = higher conviction -> boost to $8
 # DOWN bets: overbought (RSI>55) = higher conviction -> boost to $8
-# Telonex backtest @0.55: UP boost +$76, DOWN boost +$57 (x1.6)
 rsi_boost:
   enabled: true
   period: 7
@@ -52,40 +57,156 @@ drawdown_protection:
   cooldown_minutes: 30
 
 rules:
-  # ---------------------------------------------------------------
-  # DOWN-streak reversals (bet UP) -- ETH only
-  # ---------------------------------------------------------------
+  # =================================================================
+  #  ETH -- bet DOWN after UP streaks (6 rules)
+  #  Ordered: longest pattern first, conditioned before plain fallback
+  # =================================================================
 
-  # DDDDD->UP ETH (60.3% WR Telonex, 61.5% CSV@0.55, N=292)
-  - pattern: "DDDDD"
-    side: "UP"
+  # DUUUUU->DOWN ETH (62.7% WR, N=185)
+  - pattern: "DUUUUU"
+    side: "DOWN"
     coins: ["ETH"]
-    max_ask: 0.60
+    max_ask: 0.56
 
-  # DDDD->UP ETH (58.3% WR Telonex, 54.5% CSV@0.55, N=701)
-  - pattern: "DDDD"
-    side: "UP"
+  # DDUUUU->DOWN ETH (61.1% WR, N=223)
+  - pattern: "DDUUUU"
+    side: "DOWN"
     coins: ["ETH"]
-    max_ask: 0.60
+    max_ask: 0.55
 
-  # DDD->UP ETH (55.6% WR Telonex, 53.3% CSV@0.55, N=1580)
-  - pattern: "DDD"
-    side: "UP"
+  # UUUUU->DOWN ETH, low-vol regime (60.8% WR, N=181)
+  - pattern: "UUUUU"
+    side: "DOWN"
     coins: ["ETH"]
-    max_ask: 0.60
+    max_ask: 0.55
+    conditions:
+      - indicator: "VOL_1H"
+        condition: "<"
+        threshold_pct: 33
 
-  # ---------------------------------------------------------------
-  # UP-streak reversals (bet DOWN) -- ETH only
-  # ---------------------------------------------------------------
+  # UUUUU->DOWN ETH, plain fallback (62.7% WR, N=320)
+  - pattern: "UUUUU"
+    side: "DOWN"
+    coins: ["ETH"]
+    max_ask: 0.55
 
-  # UUUU->DOWN ETH (57.4% WR Telonex, 57.1% CSV@0.55, N=751)
+  # UUUU->DOWN ETH, mid-vol + high cumulative vol (65.0% WR, N=143)
   - pattern: "UUUU"
     side: "DOWN"
     coins: ["ETH"]
-    max_ask: 0.60
+    max_ask: 0.55
+    conditions:
+      - indicator: "VOL_1H"
+        condition: "between"
+        threshold_pct: [33, 66]
+      - indicator: "VOL_SUM_1H"
+        condition: ">"
+        threshold_pct: 66
 
-  # UUU->DOWN ETH (55.8% WR Telonex, 49.1% CSV@0.55, N=1698)
-  - pattern: "UUU"
+  # UUUU->DOWN ETH, plain fallback (57.4% WR, N=751)
+  - pattern: "UUUU"
     side: "DOWN"
     coins: ["ETH"]
-    max_ask: 0.60
+    max_ask: 0.52
+
+  # =================================================================
+  #  ETH -- bet UP after DOWN streaks (6 rules)
+  #  Ordered: longest pattern first, conditioned before plain fallback
+  # =================================================================
+
+  # DUDDDD->UP ETH (60.9% WR, N=192)
+  - pattern: "DUDDDD"
+    side: "UP"
+    coins: ["ETH"]
+    max_ask: 0.55
+
+  # DDDDD->UP ETH (60.3% WR, N=292)
+  - pattern: "DDDDD"
+    side: "UP"
+    coins: ["ETH"]
+    max_ask: 0.55
+
+  # DDDD->UP ETH, low-vol regime (64.2% WR, N=137)
+  - pattern: "DDDD"
+    side: "UP"
+    coins: ["ETH"]
+    max_ask: 0.55
+    conditions:
+      - indicator: "VOL_1H"
+        condition: "<"
+        threshold_pct: 33
+
+  # DDDD->UP ETH, RSI(14) oversold (61.8% WR, N=246)
+  - pattern: "DDDD"
+    side: "UP"
+    coins: ["ETH"]
+    max_ask: 0.55
+    conditions:
+      - indicator: "RSI"
+        period: 14
+        condition: "<"
+        threshold: 40
+
+  # DDDD->UP ETH, plain fallback (58.3% WR, N=701)
+  - pattern: "DDDD"
+    side: "UP"
+    coins: ["ETH"]
+    max_ask: 0.52
+
+  # DDD->UP ETH, RSI(7) oversold (58.2% WR, N=790)
+  - pattern: "DDD"
+    side: "UP"
+    coins: ["ETH"]
+    max_ask: 0.50
+    conditions:
+      - indicator: "RSI"
+        period: 7
+        condition: "<"
+        threshold: 40
+
+  # =================================================================
+  #  BTC (4 rules)
+  # =================================================================
+
+  # DDDD->UP BTC, low-vol regime (66.7% WR, N=156)
+  - pattern: "DDDD"
+    side: "UP"
+    coins: ["BTC"]
+    max_ask: 0.55
+    conditions:
+      - indicator: "VOL_1H"
+        condition: "<"
+        threshold_pct: 33
+
+  # DUDUDD->UP BTC (61.0% WR, N=242)
+  - pattern: "DUDUDD"
+    side: "UP"
+    coins: ["BTC"]
+    max_ask: 0.55
+
+  # DDUDDU->UP BTC (60.6% WR, N=246)
+  - pattern: "DDUDDU"
+    side: "UP"
+    coins: ["BTC"]
+    max_ask: 0.55
+
+  # UU->DOWN BTC, RSI(7) overbought (58.3% WR, N=702)
+  - pattern: "UU"
+    side: "DOWN"
+    coins: ["BTC"]
+    max_ask: 0.50
+    conditions:
+      - indicator: "RSI"
+        period: 7
+        condition: ">"
+        threshold: 70
+
+  # =================================================================
+  #  SOL (1 rule)
+  # =================================================================
+
+  # DUUUU->DOWN SOL (57.3% WR, N=419)
+  - pattern: "DUUUU"
+    side: "DOWN"
+    coins: ["SOL"]
+    max_ask: 0.52

@@ -91,6 +91,7 @@ TELONEX_FILE = DATA_DIR / "telonex_updown_5m.parquet"
 KLINE_CACHE = SCRIPT_DIR / "binance_klines_cache_bt.json"
 OUTPUT_DIR = SCRIPT_DIR / "pngs"
 COINS = ["BTC", "ETH", "SOL", "XRP"]
+COIN_SYMBOL = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
 
 # Default rules (from mean_reversion.yaml — must stay in sync!)
 DEFAULT_RULES = [
@@ -195,6 +196,17 @@ def compute_vol_ratio(volume, period=20):
         if not np.isnan(sma[i]) and sma[i] > 0:
             r[i] = volume[i] / sma[i]
     return r
+
+
+def compute_vol_1h(close: np.ndarray, period: int = 12) -> np.ndarray:
+    """Rolling 1h volatility: std of pct_change over `period` candles (12 x 5m = 1h)."""
+    returns = pd.Series(close).pct_change()
+    return returns.rolling(period, min_periods=period).std().values
+
+
+def compute_vol_sum(volume: np.ndarray, period: int = 12) -> np.ndarray:
+    """Rolling sum of volume over `period` candles (12 x 5m = 1h)."""
+    return pd.Series(volume).rolling(period, min_periods=period).sum().values
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +442,7 @@ def csv_build_cycles(raw: pd.DataFrame):
     return seqs
 
 
-def find_trades_csv(seqs, rules, size=5.0, fee=0.0):
+def find_trades_csv(seqs, rules, size=5.0, fee=0.0, engine=None):
     """Find trades using CSV data with REAL entry prices.
 
     Key differences from Telonex mode:
@@ -438,6 +450,7 @@ def find_trades_csv(seqs, rules, size=5.0, fee=0.0):
     - Applies max_ask filter against real price
     - PnL uses real entry price (price improvement if ask < max_ask)
     - None outcomes break pattern chains
+    - Supports per-rule indicator conditions via engine
     """
     trades = []
     for coin, d in seqs.items():
@@ -469,6 +482,13 @@ def find_trades_csv(seqs, rules, size=5.0, fee=0.0):
                         break
                 if not match:
                     continue
+
+                # Check per-rule conditions (pattern matched, now check indicators)
+                if rule.get("conditions") and engine:
+                    if not engine.check_conditions(
+                        rule["conditions"], coin, int(ts_arr[i])
+                    ):
+                        continue  # condition failed, try next rule
 
                 # Get real entry price for the CORRECT side
                 side = rule["side"]
@@ -548,7 +568,7 @@ def build_sequences(tdf):
 # ---------------------------------------------------------------------------
 # Pattern matching engine
 # ---------------------------------------------------------------------------
-def find_trades(seqs, rules, size=5.0, fee=0.0):
+def find_trades(seqs, rules, size=5.0, fee=0.0, engine=None):
     trades = []
     for coin, d in seqs.items():
         out, dates, ts, n = d["outcomes"], d["dates"], d["start_ts"], d["n"]
@@ -562,6 +582,12 @@ def find_trades(seqs, rules, size=5.0, fee=0.0):
                     continue
                 if any(out[i - pl + j] != pat[j] for j in range(pl)):
                     continue
+                # Check per-rule conditions (pattern matched, now check indicators)
+                if rule.get("conditions") and engine:
+                    if not engine.check_conditions(
+                        rule["conditions"], coin, int(ts[i])
+                    ):
+                        continue  # condition failed, try next rule
                 side, ma = rule["side"], rule["max_ask"]
                 actual = out[i]
                 hit = (side == "DOWN" and actual == "D") or (
@@ -599,36 +625,43 @@ def find_trades(seqs, rules, size=5.0, fee=0.0):
 # Indicator filter engine
 # ---------------------------------------------------------------------------
 class IndicatorEngine:
-    """Fetches klines, computes indicators, and provides fast lookup."""
+    """Fetches klines, computes indicators, and provides fast lookup.
+
+    Supports multiple Binance symbols (BTCUSDT, ETHUSDT, etc.) for
+    per-coin indicator conditions.
+    """
 
     def __init__(self, ts_min: int, ts_max: int):
         self.ts_min = ts_min
         self.ts_max = ts_max
-        self._lookups: Dict[str, Dict[int, dict]] = {}  # tf -> {ts_s -> {col: val}}
-        self._klines: Dict[str, pd.DataFrame] = {}  # tf -> raw klines df
-        self._computed: Dict[str, set] = {}  # tf -> set of computed column names
+        # Keyed by (symbol, tf)
+        self._lookups: Dict[Tuple[str, str], Dict[int, dict]] = {}
+        self._klines: Dict[Tuple[str, str], pd.DataFrame] = {}
+        self._computed: Dict[Tuple[str, str], set] = {}
 
-    def _fetch_klines(self, tf: str) -> pd.DataFrame:
-        if tf in self._klines:
-            return self._klines[tf]
+    def _fetch_klines(self, tf: str, symbol: str = "BTCUSDT") -> pd.DataFrame:
+        key = (symbol, tf)
+        if key in self._klines:
+            return self._klines[key]
         warmup_s = 200 * 300  # 200 candles * 5min
         start_ms = int((self.ts_min - warmup_s) * 1000)
         end_ms = int((self.ts_max + 600) * 1000)
-        kl = fetch_klines("BTCUSDT", tf, start_ms, end_ms)
+        kl = fetch_klines(symbol, tf, start_ms, end_ms)
         if not kl.empty:
             kl = kl.sort_values("open_time").reset_index(drop=True)
             kl["ts_s"] = (kl["open_time_ms"] / 1000).astype(int)
-        self._klines[tf] = kl
+        self._klines[key] = kl
         return kl
 
-    def ensure_timeframe(self, tf: str, filters: List[dict]):
-        kl = self._fetch_klines(tf)
+    def ensure_timeframe(self, tf: str, filters: List[dict], symbol: str = "BTCUSDT"):
+        key = (symbol, tf)
+        kl = self._fetch_klines(tf, symbol)
         if kl.empty:
-            self._lookups[tf] = {}
+            self._lookups[key] = {}
             return
 
-        if tf not in self._computed:
-            self._computed[tf] = set()
+        if key not in self._computed:
+            self._computed[key] = set()
 
         close = kl["close"].values
         high = kl["high"].values
@@ -639,7 +672,7 @@ class IndicatorEngine:
 
         for filt in tf_filters:
             col = _col_name(filt)
-            if col in self._computed[tf]:
+            if col in self._computed[key]:
                 continue  # already computed
             ind = filt["indicator"]
             p = filt.get("period")
@@ -657,15 +690,19 @@ class IndicatorEngine:
                 kl[col] = compute_stoch(close, high, low, p or 14)
             elif ind == "VOL_RATIO":
                 kl[col] = compute_vol_ratio(vol)
-            self._computed[tf].add(col)
+            elif ind == "VOL_1H":
+                kl[col] = compute_vol_1h(close, p or 12)
+            elif ind == "VOL_SUM_1H":
+                kl[col] = compute_vol_sum(vol, p or 12)
+            self._computed[key].add(col)
             new_cols = True
 
-        if new_cols or tf not in self._lookups:
+        if new_cols or key not in self._lookups:
             # Rebuild lookup with all columns
             lookup = {}
             for _, row in kl.iterrows():
                 lookup[int(row["ts_s"])] = row.to_dict()
-            self._lookups[tf] = lookup
+            self._lookups[key] = lookup
 
     # Timeframe string -> seconds mapping for kline boundary snapping
     _TF_SECONDS = {
@@ -679,7 +716,7 @@ class IndicatorEngine:
         "1d": 86400,
     }
 
-    def get_value(self, tf: str, ts: int, col: str) -> float:
+    def get_value(self, tf: str, ts: int, col: str, symbol: str = "BTCUSDT") -> float:
         """Look up indicator value for the most recent COMPLETED candle.
 
         Snaps the query timestamp to the nearest kline boundary, then
@@ -687,14 +724,11 @@ class IndicatorEngine:
         than fixed offsets when cycle timestamps don't exactly align
         with Binance kline open times.
         """
-        lk = self._lookups.get(tf, {})
+        key = (symbol, tf)
+        lk = self._lookups.get(key, {})
         if not lk:
             return np.nan
         tf_s = self._TF_SECONDS.get(tf, 300)
-        # Snap to the kline boundary at or before this timestamp.
-        # The candle at `snapped` opens at T and covers [T, T+tf_s) — it is
-        # NOT yet complete at trade decision time.  The last COMPLETED candle
-        # opened at snapped - tf_s and closed at snapped.
         snapped = (ts // tf_s) * tf_s
         last_completed = snapped - tf_s
         for candidate in [last_completed, last_completed - tf_s]:
@@ -706,6 +740,83 @@ class IndicatorEngine:
                 ):
                     return float(v)
         return np.nan
+
+    def get_percentile(
+        self, symbol: str, tf: str, col: str, pct: float
+    ) -> float:
+        """Get percentile value for a column from all kline data."""
+        key = (symbol, tf)
+        kl = self._klines.get(key)
+        if kl is None or col not in kl.columns:
+            return np.nan
+        return float(kl[col].dropna().quantile(pct / 100.0))
+
+    def prepare_for_rules(self, rules: List[dict]):
+        """Pre-fetch klines and compute all indicators needed by rule conditions."""
+        work: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
+        for rule in rules:
+            for cond in rule.get("conditions", []):
+                tf = cond.get("timeframe", "5m")
+                for coin in rule.get("coins", COINS):
+                    sym = cond.get("symbol", COIN_SYMBOL.get(coin, "BTCUSDT"))
+                    work[(sym, tf)].append(cond)
+        for (sym, tf), conds in work.items():
+            # Deduplicate conditions by indicator column
+            seen_cols = set()
+            unique_conds = []
+            for c in conds:
+                col = _col_name(c)
+                if col not in seen_cols:
+                    seen_cols.add(col)
+                    unique_conds.append(c)
+            self.ensure_timeframe(tf, unique_conds, symbol=sym)
+
+    def check_conditions(
+        self, conditions: List[dict], coin: str, ts: int
+    ) -> bool:
+        """Check all conditions for a rule. Returns True if all pass."""
+        if not conditions:
+            return True
+        symbol = COIN_SYMBOL.get(coin, "BTCUSDT")
+        for cond in conditions:
+            tf = cond.get("timeframe", "5m")
+            col = _col_name(cond)
+            sym = cond.get("symbol", symbol)
+            value = self.get_value(tf, ts, col, symbol=sym)
+            if np.isnan(value):
+                return False
+
+            # Resolve threshold (fixed or percentile-based)
+            threshold = cond.get("threshold")
+            if threshold is None and "threshold_pct" in cond:
+                pct = cond["threshold_pct"]
+                if isinstance(pct, list):
+                    threshold = [self.get_percentile(sym, tf, col, p) for p in pct]
+                else:
+                    threshold = self.get_percentile(sym, tf, col, pct)
+                if threshold is None:
+                    return False
+                if isinstance(threshold, float) and np.isnan(threshold):
+                    return False
+
+            op = cond["condition"]
+            if op == "<":
+                if not (value < threshold):
+                    return False
+            elif op == ">":
+                if not (value > threshold):
+                    return False
+            elif op == "<=":
+                if not (value <= threshold):
+                    return False
+            elif op == ">=":
+                if not (value >= threshold):
+                    return False
+            elif op == "between":
+                lo, hi = threshold
+                if not (lo <= value <= hi):
+                    return False
+        return True
 
 
 def _col_name(f):
@@ -723,6 +834,10 @@ def _col_name(f):
         return f"STOCH_K_{p or 14}"
     if ind == "VOL_RATIO":
         return "VOL_RATIO"
+    if ind == "VOL_1H":
+        return f"VOL_1H_{p or 12}"
+    if ind == "VOL_SUM_1H":
+        return f"VOL_SUM_1H_{p or 12}"
     return ind
 
 
@@ -730,7 +845,7 @@ def apply_filters(trades_df, filters, engine):
     if trades_df.empty or not filters:
         return trades_df.copy()
     for tf in set(f.get("timeframe", "5m") for f in filters):
-        engine.ensure_timeframe(tf, filters)
+        engine.ensure_timeframe(tf, filters, symbol="BTCUSDT")
     df = trades_df.copy()
     df["_pass"] = True
     for filt in filters:
@@ -1062,6 +1177,152 @@ RSI14_60 = [
     }
 ]
 
+# ---------------------------------------------------------------------------
+# V2 Rules — 17 patterns with per-rule indicator conditions
+# Research-validated on Telonex 74-day + OOS.
+# Conditions use coin-specific Binance klines (ETHUSDT, BTCUSDT, SOLUSDT).
+# threshold_pct = percentile computed from kline data (adapts to data period).
+# Ordering: longest patterns first, conditioned before unconditioned.
+# ---------------------------------------------------------------------------
+V2_RULES = [
+    # === ETH buy DOWN (after UP streaks) ===
+    {"pattern": "DUUUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.56},
+    {"pattern": "DDUUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.55},
+    # UUUUU with low volatility (bottom tercile vol_1h)
+    {
+        "pattern": "UUUUU",
+        "side": "DOWN",
+        "coins": ["ETH"],
+        "max_ask": 0.55,
+        "conditions": [
+            {
+                "indicator": "VOL_1H",
+                "timeframe": "5m",
+                "condition": "<",
+                "threshold_pct": 33,
+            }
+        ],
+    },
+    # UUUUU plain (catches non-low-vol)
+    {"pattern": "UUUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.55},
+    # UUUU with medium vol + high volume
+    {
+        "pattern": "UUUU",
+        "side": "DOWN",
+        "coins": ["ETH"],
+        "max_ask": 0.55,
+        "conditions": [
+            {
+                "indicator": "VOL_1H",
+                "timeframe": "5m",
+                "condition": "between",
+                "threshold_pct": [33, 66],
+            },
+            {
+                "indicator": "VOL_SUM_1H",
+                "timeframe": "5m",
+                "condition": ">",
+                "threshold_pct": 66,
+            },
+        ],
+    },
+    # UUUU plain
+    {"pattern": "UUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.55},
+    # === ETH buy UP (after DOWN streaks) ===
+    {"pattern": "DUDDDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.55},
+    {"pattern": "DDDDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.55},
+    # DDDD with low volatility
+    {
+        "pattern": "DDDD",
+        "side": "UP",
+        "coins": ["ETH"],
+        "max_ask": 0.55,
+        "conditions": [
+            {
+                "indicator": "VOL_1H",
+                "timeframe": "5m",
+                "condition": "<",
+                "threshold_pct": 33,
+            }
+        ],
+    },
+    # DDDD with RSI(14) < 40 (oversold confirmation)
+    {
+        "pattern": "DDDD",
+        "side": "UP",
+        "coins": ["ETH"],
+        "max_ask": 0.55,
+        "conditions": [
+            {
+                "indicator": "RSI",
+                "period": 14,
+                "timeframe": "5m",
+                "condition": "<",
+                "threshold": 40,
+            }
+        ],
+    },
+    # DDDD plain
+    {"pattern": "DDDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.52},
+    # DDD with RSI(7) < 40
+    {
+        "pattern": "DDD",
+        "side": "UP",
+        "coins": ["ETH"],
+        "max_ask": 0.50,
+        "conditions": [
+            {
+                "indicator": "RSI",
+                "period": 7,
+                "timeframe": "5m",
+                "condition": "<",
+                "threshold": 40,
+            }
+        ],
+    },
+    # === BTC ===
+    # DDDD with low volatility
+    {
+        "pattern": "DDDD",
+        "side": "UP",
+        "coins": ["BTC"],
+        "max_ask": 0.55,
+        "conditions": [
+            {
+                "indicator": "VOL_1H",
+                "timeframe": "5m",
+                "condition": "<",
+                "threshold_pct": 33,
+            }
+        ],
+    },
+    {"pattern": "DUDUDD", "side": "UP", "coins": ["BTC"], "max_ask": 0.55},
+    {"pattern": "DDUDDU", "side": "UP", "coins": ["BTC"], "max_ask": 0.55},
+    # UU with RSI(7) > 70 (overbought confirmation)
+    {
+        "pattern": "UU",
+        "side": "DOWN",
+        "coins": ["BTC"],
+        "max_ask": 0.50,
+        "conditions": [
+            {
+                "indicator": "RSI",
+                "period": 7,
+                "timeframe": "5m",
+                "condition": ">",
+                "threshold": 70,
+            }
+        ],
+    },
+    # === SOL ===
+    {"pattern": "DUUUU", "side": "DOWN", "coins": ["SOL"], "max_ask": 0.52},
+]
+
+# V2 without conditions — same patterns but no indicator filters (for comparison)
+V2_RULES_PLAIN = [
+    {k: v for k, v in r.items() if k != "conditions"} for r in V2_RULES
+]
+
 
 PRESETS = {
     "default": {
@@ -1213,6 +1474,15 @@ PRESETS = {
             ("No UUU + RSI(7)<60", STRATEGY_NO_UUU, RSI7_60),
             ("Tight + RSI(7)<65", STRATEGY_TIGHT, RSI7_65),
         ],
+    },
+    "v2": {
+        "title": "V2 Strategy: 17 Patterns with Per-Rule Conditions",
+        "configs": [
+            ("V2 Full (conditions)", V2_RULES, []),
+            ("V2 Plain (no conditions)", V2_RULES_PLAIN, []),
+            ("Current Config (baseline)", STRATEGY_CURRENT, []),
+        ],
+        "has_conditions": True,  # flag for engine preparation
     },
 }
 
@@ -1584,6 +1854,7 @@ def main():
     engine = IndicatorEngine(ts_min, ts_max)
 
     # --max-ask override: multiple curves at that max_ask with different filters
+    preset = None
     if args.max_ask is not None:
         ma = args.max_ask
         rules_ma = make_rules_with_maxask(ma)
@@ -1649,6 +1920,24 @@ def main():
     # Choose the right trade finder
     trade_finder = find_trades_csv if use_csv else find_trades
 
+    # Check if any config has per-rule conditions
+    has_conditions = False
+    if isinstance(preset, dict) and preset.get("has_conditions"):
+        has_conditions = True
+    else:
+        for _, rules, _ in configs:
+            if any(r.get("conditions") for r in rules):
+                has_conditions = True
+                break
+
+    # Pre-compute indicators for per-rule conditions
+    if has_conditions:
+        all_rules = []
+        for _, rules, _ in configs:
+            all_rules.extend(rules)
+        print("  Preparing per-rule indicator data (multi-symbol klines)...")
+        engine.prepare_for_rules(all_rules)
+
     # Run all configs
     results = []
     print(f"\n  Running {len(configs)} configurations...\n")
@@ -1659,10 +1948,20 @@ def main():
         seen = set()
         for r in rules:
             coins_str = ",".join(r["coins"]) if len(r["coins"]) < 4 else "ALL"
-            key = (r["pattern"], coins_str, r["max_ask"])
+            conds_str = ""
+            if r.get("conditions"):
+                cond_labels = []
+                for c in r["conditions"]:
+                    ind = c["indicator"]
+                    p = c.get("period", "")
+                    thr = c.get("threshold", c.get("threshold_pct", ""))
+                    cond_labels.append(f"{ind}({p}){c['condition']}{thr}")
+                conds_str = " IF " + " & ".join(cond_labels)
+            key = (r["pattern"], r["side"], coins_str, r["max_ask"], conds_str)
             if key not in seen:
                 print(
-                    f"    {r['pattern']:6} [{coins_str:10}] max_ask=${r['max_ask']:.2f}"
+                    f"    {r['pattern']:8} -> {r['side']:4} [{coins_str:4}] "
+                    f"max_ask=${r['max_ask']:.2f}{conds_str}"
                 )
                 seen.add(key)
         if filters:
@@ -1670,7 +1969,10 @@ def main():
                 print(
                     f"    filter: {f['indicator']}({f.get('period', '')}) {f['condition']} {f['threshold']}"
                 )
-        trades = trade_finder(seqs, rules, size=size, fee=fee)
+
+        # Pass engine to trade finder when rules have conditions
+        use_engine = engine if any(r.get("conditions") for r in rules) else None
+        trades = trade_finder(seqs, rules, size=size, fee=fee, engine=use_engine)
         if filters and not trades.empty:
             trades = apply_filters(trades, filters, engine)
         s = stats(trades)

@@ -74,15 +74,16 @@ DEFAULT_CONFIG = Path(__file__).resolve().parent / "mean_reversion.yaml"
 # Outcome inference thresholds (applied at t >= INFERENCE_TIME)
 # Last 5 seconds of the 300s cycle — use only near-certain terminal ticks.
 INFERENCE_TIME = 295  # seconds into cycle to read outcome
+EARLY_INFERENCE_START = 280  # start checking for decided markets 20s before cycle end
 CERTAIN_UP_ASK = 0.99  # UP ask >= this => provisional UP
 CERTAIN_DOWN_ASK = 0.01  # UP ask <= this => provisional DOWN
-GAMMA_RECHECK_INITIAL_DELAY = 45  # ~45s after cycle closes (markets settle in 15-30s)
-GAMMA_RECHECK_RETRY_DELAY = 300  # retry every cycle if unresolved
+GAMMA_RECHECK_INITIAL_DELAY = 15  # ~15s after cycle closes (markets settle in 15-30s)
+GAMMA_RECHECK_RETRY_DELAY = 60  # retry every 60s if unresolved
 
 # Book-confirm threshold: if a side's bid >= this after cycle ends, that side won.
 # Market makers leave residual bids near $1 for resolved shares; checking this
 # at cycle rollover gives near-instant confirmation without waiting for Gamma.
-BOOK_CONFIRM_BID = 0.95
+BOOK_CONFIRM_BID = 0.90
 
 # Max ask price filter — don't buy when ask is too expensive (bad risk/reward)
 DEFAULT_MAX_ASK = 0.60  # only enter if ask <= this
@@ -98,7 +99,15 @@ SIM_FEE_RATE = 0.015  # 1.5% one-way taker fee
 
 # Binance REST klines URL
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
-BINANCE_SYMBOL = "ETHUSDT"
+BINANCE_SYMBOL = "ETHUSDT"  # default for RSI filter/boost
+
+# Per-coin Binance symbols (for per-rule indicator conditions)
+COIN_BINANCE_SYMBOL: Dict[str, str] = {
+    "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "SOL": "SOLUSDT",
+    "XRP": "XRPUSDT",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +392,236 @@ class DrawdownProtection:
 
 
 # ---------------------------------------------------------------------------
+# Live Indicator Engine — per-rule condition evaluation
+# ---------------------------------------------------------------------------
+class LiveIndicatorEngine:
+    """Multi-symbol indicator engine for per-rule conditions.
+
+    Fetches Binance 5m klines per coin and computes:
+      - VOL_1H:     rolling 1h volatility (std of 5m pct_change, 12 bars)
+      - VOL_SUM_1H: rolling 1h sum of quote volume (12 bars)
+      - RSI:        with configurable period, per coin
+
+    Percentile thresholds (1st–99th) are computed from historical data
+    at startup and refreshed every REFRESH_INTERVAL seconds.
+
+    Condition checking logic:
+      - Percentile conditions (threshold_pct): compare current value's
+        percentile rank against the threshold.
+      - Absolute conditions (threshold): compare raw value directly.
+      - Fail-FALSE when data unavailable — caller falls through to next rule.
+    """
+
+    VOL_WINDOW: int = 12  # 12 × 5m = 1 hour
+    HISTORY_CANDLES: int = 1000  # for percentile computation
+    REFRESH_INTERVAL: float = 300.0  # refresh klines every 5 min
+
+    def __init__(self, rules: list):
+        # Determine which coins need kline data
+        self._needed_coins: Set[str] = set()
+        self._needed_rsi_periods: Set[int] = set()
+        for rule in rules:
+            conds = getattr(rule, "conditions", None)
+            if not conds:
+                continue
+            coins = rule.coins if rule.coins else COINS
+            self._needed_coins.update(coins)
+            for cond in conds:
+                if cond.get("indicator") == "RSI":
+                    self._needed_rsi_periods.add(int(cond.get("period", 7)))
+        if not self._needed_rsi_periods:
+            self._needed_rsi_periods = {7}
+
+        # State
+        self._closes: Dict[str, np.ndarray] = {}
+        self._volumes: Dict[str, np.ndarray] = {}
+        self._vol_1h_pcts: Dict[str, np.ndarray] = {}  # coin -> sorted values
+        self._vol_sum_1h_pcts: Dict[str, np.ndarray] = {}
+        self._current_vol_1h: Dict[str, float] = {}
+        self._current_vol_sum_1h: Dict[str, float] = {}
+        self._rsi_cache: Dict[Tuple[str, int], float] = {}
+        self._last_fetch_ts: Dict[str, float] = {c: 0.0 for c in self._needed_coins}
+        self._warmed_up: bool = False
+
+    @property
+    def has_conditions(self) -> bool:
+        return len(self._needed_coins) > 0
+
+    def _fetch_klines_sync(self, coin: str) -> Optional[list]:
+        """Fetch 5m klines from Binance (synchronous, called in executor)."""
+        symbol = COIN_BINANCE_SYMBOL.get(coin)
+        if not symbol:
+            return None
+        url = (
+            f"{BINANCE_KLINES_URL}?symbol={symbol}"
+            f"&interval=5m&limit={self.HISTORY_CANDLES}"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+
+    def _process_klines(self, coin: str, data: list) -> None:
+        """Process raw klines into indicators and percentile distributions."""
+        closes = np.array([float(c[4]) for c in data])
+        volumes = np.array([float(c[7]) for c in data])  # quote volume
+        self._closes[coin] = closes
+        self._volumes[coin] = volumes
+
+        # VOL_1H: rolling std of pct_change
+        if len(closes) > self.VOL_WINDOW + 1:
+            pct = np.diff(closes) / closes[:-1]
+            vol_values = []
+            for i in range(self.VOL_WINDOW - 1, len(pct)):
+                window = pct[i - self.VOL_WINDOW + 1 : i + 1]
+                vol_values.append(float(np.std(window)))
+            if vol_values:
+                vol_arr = np.array(vol_values)
+                self._vol_1h_pcts[coin] = np.sort(vol_arr)
+                self._current_vol_1h[coin] = vol_arr[-1]
+
+        # VOL_SUM_1H: rolling sum of quote volume
+        if len(volumes) >= self.VOL_WINDOW:
+            cumsum = np.cumsum(volumes)
+            vol_sum = np.empty(len(volumes) - self.VOL_WINDOW + 1)
+            vol_sum[0] = cumsum[self.VOL_WINDOW - 1]
+            vol_sum[1:] = cumsum[self.VOL_WINDOW :] - cumsum[: -self.VOL_WINDOW]
+            self._vol_sum_1h_pcts[coin] = np.sort(vol_sum)
+            self._current_vol_sum_1h[coin] = vol_sum[-1]
+
+        # RSI for needed periods
+        for period in self._needed_rsi_periods:
+            rsi = _compute_rsi(closes, period)
+            self._rsi_cache[(coin, period)] = rsi
+
+        self._last_fetch_ts[coin] = time.time()
+
+    def _refresh_coin_sync(self, coin: str) -> bool:
+        """Fetch + process klines for one coin (synchronous)."""
+        try:
+            data = self._fetch_klines_sync(coin)
+            if data:
+                self._process_klines(coin, data)
+                return True
+            return False
+        except Exception as exc:
+            log(f"[indicators] {coin} fetch error: {exc}", "warning")
+            return False
+
+    def warmup_sync(self) -> None:
+        """Synchronous startup warmup: fetch all needed coins."""
+        for coin in sorted(self._needed_coins):
+            ok = self._refresh_coin_sync(coin)
+            if ok:
+                vol = self._current_vol_1h.get(coin, float("nan"))
+                vsum = self._current_vol_sum_1h.get(coin, float("nan"))
+                rsi7 = self._rsi_cache.get((coin, 7), float("nan"))
+                log(
+                    f"  {coin}: VOL_1H={vol:.6f} VOL_SUM={vsum:.0f} "
+                    f"RSI(7)={rsi7:.1f}",
+                    "info",
+                )
+            else:
+                log(f"  {coin}: FAILED to fetch klines", "warning")
+        self._warmed_up = True
+
+    async def update(
+        self, executor: concurrent.futures.ThreadPoolExecutor
+    ) -> None:
+        """Async: refresh stale coins (call from main loop)."""
+        now = time.time()
+        loop = asyncio.get_running_loop()
+        for coin in self._needed_coins:
+            if now - self._last_fetch_ts.get(coin, 0) >= self.REFRESH_INTERVAL:
+                await loop.run_in_executor(
+                    executor, self._refresh_coin_sync, coin
+                )
+
+    def _get_percentile_rank(
+        self, coin: str, indicator: str, value: float
+    ) -> float:
+        """Get percentile rank (0–100) of value in the historical distribution."""
+        if indicator == "VOL_1H":
+            sorted_arr = self._vol_1h_pcts.get(coin)
+        elif indicator == "VOL_SUM_1H":
+            sorted_arr = self._vol_sum_1h_pcts.get(coin)
+        else:
+            return 50.0
+        if sorted_arr is None or len(sorted_arr) == 0:
+            return 50.0
+        idx = float(np.searchsorted(sorted_arr, value))
+        return (idx / len(sorted_arr)) * 100.0
+
+    def check_conditions(self, coin: str, conditions: List[Dict]) -> bool:
+        """Check if ALL conditions are met for a coin.
+
+        Returns False when data is unavailable — caller should fall through
+        to the next (unconditioned) rule.
+        """
+        for cond in conditions:
+            indicator = cond.get("indicator", "")
+            op = cond.get("condition", "")
+
+            if indicator == "RSI":
+                period = int(cond.get("period", 7))
+                rsi = self._rsi_cache.get((coin, period), float("nan"))
+                if np.isnan(rsi):
+                    return False
+                threshold = float(cond.get("threshold", 50))
+                if op == "<" and not (rsi < threshold):
+                    return False
+                if op == ">" and not (rsi > threshold):
+                    return False
+                if op == "<=" and not (rsi <= threshold):
+                    return False
+                if op == ">=" and not (rsi >= threshold):
+                    return False
+
+            elif indicator in ("VOL_1H", "VOL_SUM_1H"):
+                if indicator == "VOL_1H":
+                    current = self._current_vol_1h.get(coin)
+                else:
+                    current = self._current_vol_sum_1h.get(coin)
+                if current is None:
+                    return False
+
+                pct_rank = self._get_percentile_rank(coin, indicator, current)
+
+                if "threshold_pct" in cond:
+                    thr = cond["threshold_pct"]
+                    if isinstance(thr, list) and op == "between":
+                        if not (thr[0] <= pct_rank <= thr[1]):
+                            return False
+                    else:
+                        thr = float(thr)
+                        if op == "<" and not (pct_rank < thr):
+                            return False
+                        if op == ">" and not (pct_rank > thr):
+                            return False
+                        if op == "<=" and not (pct_rank <= thr):
+                            return False
+                        if op == ">=" and not (pct_rank >= thr):
+                            return False
+            else:
+                return False  # unknown indicator -> fail
+
+        return True
+
+    @property
+    def status_str(self) -> str:
+        """Short TUI status string."""
+        if not self._needed_coins:
+            return ""
+        if not self._warmed_up:
+            return "IND:warming"
+        parts = []
+        for coin in sorted(self._needed_coins):
+            age = time.time() - self._last_fetch_ts.get(coin, 0)
+            ok = age < self.REFRESH_INTERVAL * 2
+            parts.append(f"{coin}:{'OK' if ok else 'STALE'}")
+        return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Pattern definitions (unused — kept for reference, config comes from YAML)
 # ---------------------------------------------------------------------------
 BUILTIN_PATTERNS: Dict[str, Tuple[str, str]] = {
@@ -559,16 +798,21 @@ class PatternRule:
     max_ask: float = DEFAULT_MAX_ASK  # per-rule max ask
     coins: Optional[List[str]] = None  # coins this rule applies to (None = all)
     priority: int = 0  # lower = higher priority
+    conditions: Optional[List[Dict[str, Any]]] = None  # per-rule indicator conditions
 
     @property
     def rule_id(self) -> str:
-        """Unique identifier for per-rule tracking. E.g. 'UUUU>DN:ETH'."""
+        """Unique identifier for per-rule tracking. E.g. 'UUUU>DN:ETH[VOL]'."""
         if not self.coins or set(self.coins) >= set(COINS):
             coins_tag = "ALL"
         else:
             coins_tag = ",".join(sorted(self.coins))
         side_tag = "UP" if self.buy_side == "up" else "DN"
-        return f"{self.pattern}>{side_tag}:{coins_tag}"
+        cond_tag = ""
+        if self.conditions:
+            indicators = [c.get("indicator", "?")[:3] for c in self.conditions]
+            cond_tag = f"[{'|'.join(indicators)}]"
+        return f"{self.pattern}>{side_tag}:{coins_tag}{cond_tag}"
 
 
 @dataclass
@@ -615,6 +859,7 @@ class SequenceConfig:
             side = r["side"].lower()
             rule_coins = [c.upper() for c in r["coins"]] if "coins" in r else None
             rule_max_ask = float(r.get("max_ask", DEFAULT_MAX_ASK))
+            rule_conditions = r.get("conditions", None)
             rules.append(
                 PatternRule(
                     pattern=pattern,
@@ -622,6 +867,7 @@ class SequenceConfig:
                     max_ask=rule_max_ask,
                     coins=rule_coins,
                     priority=r.get("priority", i),
+                    conditions=rule_conditions,
                 )
             )
 
@@ -826,6 +1072,11 @@ class SequenceStrategy:
         self._pending_orders: List[PendingOrder] = []
         self._orders_placed_ts: float = 0.0  # when GTC orders were placed this cycle
 
+        # Early inference: pre-emptive orders placed on next cycle's market
+        self._early_pending_orders: List[PendingOrder] = []
+        self._early_inference_done: Set[str] = set()  # coins already early-inferred
+        self._next_market_cache: Dict[str, MarketInfo] = {}  # cached next market per coin
+
         # Positions
         self._current_positions: List[PositionRecord] = []
         self._all_positions: List[PositionRecord] = []
@@ -882,6 +1133,9 @@ class SequenceStrategy:
             down_zones=cfg.rsi_boost_down_zones,
         )
         self._rsi_skips: int = 0  # count of trades skipped by RSI
+
+        # Per-rule indicator engine (VOL_1H, VOL_SUM_1H, RSI per coin)
+        self._indicator_engine = LiveIndicatorEngine(cfg.rules)
 
         # Drawdown protection
         self._drawdown = DrawdownProtection(
@@ -970,7 +1224,8 @@ class SequenceStrategy:
         log(f"  size:     {self.cfg.size} shares")
         if self.cfg.kelly > 0:
             log(f"  kelly:    {self.cfg.kelly} (streak scaling enabled)")
-        log(f"  rules ({len(self.cfg.rules)}):")
+        n_cond = sum(1 for r in self.cfg.rules if r.conditions)
+        log(f"  rules ({len(self.cfg.rules)}, {n_cond} conditioned):")
         for rule in self.cfg.rules:
             coins_str = (
                 "ALL"
@@ -978,11 +1233,15 @@ class SequenceStrategy:
                 else ",".join(rule.coins)
             )
             side_label = "UP" if rule.buy_side == "up" else "DOWN"
+            cond_mark = " *" if rule.conditions else ""
             log(
-                f"    {rule.pattern:<8} {side_label:<5} {coins_str:<12} @{rule.max_ask:.2f}"
+                f"    {rule.pattern:<8} {side_label:<5} {coins_str:<12} @{rule.max_ask:.2f}{cond_mark}"
             )
         log(
             f"  infer:    t>={INFERENCE_TIME}s, UP>={CERTAIN_UP_ASK:.2f}, DOWN<={CERTAIN_DOWN_ASK:.2f}"
+        )
+        log(
+            f"  early:    t>={EARLY_INFERENCE_START}s, pre-emptive orders on next market"
         )
         if self._rsi_filter.enabled:
             log(
@@ -1040,6 +1299,16 @@ class SequenceStrategy:
                         self._rsi_filter.boost_count = 0
                         self._rsi_filter.base_count = 0
                     log(f"  {' '.join(parts)}", "info")
+
+            # Warm up per-rule indicator engine
+            if self._indicator_engine.has_conditions:
+                log(
+                    f"Warming up indicator engine ({', '.join(sorted(self._indicator_engine._needed_coins))})...",
+                    "info",
+                )
+                await asyncio.get_running_loop().run_in_executor(
+                    self._clob_executor, self._indicator_engine.warmup_sync
+                )
 
             await self._start_all_managers()
             _tui_active = True
@@ -1247,10 +1516,45 @@ class SequenceStrategy:
         now = time.time()
         cycle_age = now - self._cycle_start_ts
 
+        # Transfer early orders from previous cycle
+        early_orders = list(self._early_pending_orders)
+        self._early_pending_orders.clear()
+        self._early_inference_done.clear()
+        self._next_market_cache.clear()
+
+        if early_orders:
+            for po in early_orders:
+                self._pending_orders.append(po)
+                self._traded_coins.add(po.coin)
+            self._orders_placed_ts = time.time()  # reset cancel timer to NOW
+            log(
+                f"Transferred {len(early_orders)} early order(s) to new cycle",
+                "trade",
+            )
+
         # Check if we have pattern matches for this new cycle
         matches = self._find_pattern_matches()
 
-        if matches:
+        if early_orders:
+            # Early orders already placed — go to PENDING_ORDERS state
+            if matches:
+                match_strs = [
+                    f"{c}:{r.pattern}->BUY {r.buy_side.upper()}" for c, r in matches
+                ]
+                log(
+                    f"NEW CYCLE #{self.cycles_seen}: "
+                    f"MATCHES: {', '.join(match_strs)}  age={cycle_age:.0f}s "
+                    f"(early orders already placed)",
+                    "trade",
+                )
+            else:
+                log(
+                    f"NEW CYCLE #{self.cycles_seen}: "
+                    f"early orders transferred, waiting for fills.",
+                    "trade",
+                )
+            self.cycle_state = CycleState.PENDING_ORDERS
+        elif matches:
             match_strs = [
                 f"{c}:{r.pattern}->BUY {r.buy_side.upper()}" for c, r in matches
             ]
@@ -1545,6 +1849,249 @@ class SequenceStrategy:
                     )
 
     # ------------------------------------------------------------------
+    # Early inference + pre-emptive entry (last 20s of cycle)
+    # ------------------------------------------------------------------
+    def _fetch_next_market(self, coin: str) -> Optional[MarketInfo]:
+        """Fetch next cycle's market from Gamma API (synchronous, runs in executor).
+
+        Builds the expected slug for the next 5m cycle and fetches market data.
+        Returns MarketInfo or None if the market doesn't exist yet.
+        """
+        if coin in self._next_market_cache:
+            return self._next_market_cache[coin]
+
+        if self._cycle_ts is None:
+            return None
+
+        next_ts = self._cycle_ts + 300
+        slug = self._slug_for_cycle(coin, next_ts)
+
+        try:
+            raw = self._gamma_client.get_market_by_slug(slug)
+            if not raw:
+                return None
+
+            token_ids = self._gamma_client.parse_token_ids(raw)
+            if not token_ids.get("up") or not token_ids.get("down"):
+                return None
+
+            market = MarketInfo(
+                slug=raw.get("slug", slug),
+                question=raw.get("question", ""),
+                end_date=raw.get("endDate", ""),
+                token_ids=token_ids,
+                prices=self._gamma_client.parse_prices(raw),
+                accepting_orders=raw.get("acceptingOrders", False),
+                event_start_time=raw.get("eventStartTime", ""),
+                neg_risk=raw.get("negRisk", False),
+                tick_size=str(raw.get("orderPriceMinTickSize", "0.01")),
+                min_size=float(raw.get("orderMinSize", 0.0)),
+                condition_id=raw.get("conditionId", ""),
+                raw=raw,
+            )
+            self._next_market_cache[coin] = market
+            return market
+        except Exception as exc:
+            log(f"EARLY: fetch next market {coin} failed: {exc}", "warning")
+            return None
+
+    async def _try_early_inference_and_entry(self) -> None:
+        """Detect decided markets early and place orders on next cycle's market.
+
+        Called from _tick() when EARLY_INFERENCE_START <= cycle_age < INFERENCE_TIME.
+        If a market is terminal (ask=1.00/0.01), record the outcome provisionally
+        and place an order on the next market before the WS switches.
+        """
+        if self._cycle_ts is None:
+            return
+
+        # --- Drawdown circuit breaker ---
+        if self._drawdown.should_skip:
+            return
+
+        # --- RSI filter ---
+        if self._rsi_filter.should_skip:
+            return
+
+        cycle_ts = self._cycle_ts
+
+        for coin in COINS:
+            if coin in self._early_inference_done:
+                continue
+
+            # Need fresh data for this cycle
+            if self._up_ask_cycle_seen[coin] != cycle_ts:
+                continue
+
+            up_ask = self._best_asks[coin]["up"]
+            down_ask = self._best_asks[coin]["down"]
+
+            # Check terminal condition (same thresholds as normal inference)
+            is_up = up_ask >= CERTAIN_UP_ASK or down_ask <= CERTAIN_DOWN_ASK
+            is_down = up_ask <= CERTAIN_DOWN_ASK or down_ask >= CERTAIN_UP_ASK
+
+            if not is_up and not is_down:
+                continue  # not decided yet
+
+            outcome = "U" if is_up else "D"
+            self._early_inference_done.add(coin)
+
+            # Check if already inferred for this cycle (normal inference may have run)
+            existing = self._find_outcome_entry(coin, cycle_ts)
+            if existing and existing.outcome != "-":
+                pass  # already recorded, just check patterns below
+            elif existing and existing.outcome == "-":
+                # Upgrade dash to actual outcome
+                existing.outcome = outcome
+                existing.status = ConfirmationStatus.PROVISIONAL
+                existing.observed_up_ask = up_ask
+                log(
+                    f"EARLY INFER: {coin} outcome UPGRADED to {outcome} "
+                    f"(up={up_ask:.3f}, dn={down_ask:.3f})",
+                    "trade",
+                )
+            else:
+                # First record for this cycle
+                slug = self._slug_for_cycle(coin, cycle_ts)
+                entry = OutcomeEntry(
+                    outcome=outcome,
+                    status=ConfirmationStatus.PROVISIONAL,
+                    cycle_ts=cycle_ts,
+                    market_slug=slug,
+                    observed_up_ask=up_ask,
+                )
+                self._outcome_history[coin].append(entry)
+                self._last_inference_ts[coin] = cycle_ts
+                self._queue_outcome_recheck(coin, cycle_ts, slug)
+                log(
+                    f"EARLY INFER: {coin} = {outcome} "
+                    f"(up={up_ask:.3f}, dn={down_ask:.3f})",
+                    "trade",
+                )
+
+        # Check for pattern matches after recording early outcomes
+        matches = self._find_pattern_matches()
+        if not matches:
+            return
+
+        for coin, rule in matches:
+            if coin in self._traded_coins:
+                continue
+            # Don't double-enter via early orders
+            if any(p.coin == coin for p in self._early_pending_orders):
+                continue
+            if (
+                len(self._current_positions)
+                + len(self._pending_orders)
+                + len(self._early_pending_orders)
+                >= self.cfg.max_trades_per_cycle
+            ):
+                break
+
+            # Fetch next market (may not exist yet)
+            loop = asyncio.get_running_loop()
+            next_market = await loop.run_in_executor(
+                self._clob_executor, self._fetch_next_market, coin
+            )
+            if not next_market:
+                log(
+                    f"EARLY: {coin} {rule.pattern} matched but next market not available yet",
+                    "warning",
+                )
+                continue
+
+            if not next_market.accepting_orders:
+                log(
+                    f"EARLY: {coin} next market {next_market.slug} not accepting orders",
+                    "warning",
+                )
+                continue
+
+            buy_side = rule.buy_side
+            token_id = next_market.token_ids.get(buy_side, "")
+            if not token_id:
+                continue
+
+            limit_price = rule.max_ask
+            trade_size = self._rsi_filter.get_trade_size(buy_side, self.cfg.size)
+            hist_str = self._history_values(list(self._outcome_history[coin]))
+            rsi = self._rsi_filter.current_rsi
+            rsi_str = f" RSI={rsi:.1f}" if not np.isnan(rsi) else ""
+
+            log(
+                f"EARLY ENTRY: {coin} [{hist_str}] -> {rule.pattern} -> "
+                f"GTC LIMIT BUY {buy_side.upper()} @ {limit_price:.3f} "
+                f"on next market {next_market.slug}{rsi_str}",
+                "trade",
+            )
+
+            if self.cfg.dry_run:
+                tracker = self._simulate_buy(
+                    coin,
+                    buy_side,
+                    limit_price,  # use limit_price as ask in dry-run
+                    next_market,
+                    rule.pattern,
+                    trade_size,
+                    rule_id=rule.rule_id,
+                )
+                if tracker:
+                    # Wrap as PendingOrder for transfer at cycle transition
+                    early_po = PendingOrder(
+                        coin=coin,
+                        side=buy_side,
+                        token_id=token_id,
+                        order_id=tracker.order_id,
+                        limit_price=limit_price,
+                        size=trade_size,
+                        placed_at=time.time(),
+                        market_slug=next_market.slug,
+                        pattern=rule.pattern,
+                        rule_id=rule.rule_id,
+                        neg_risk=next_market.neg_risk,
+                        tick_size=next_market.tick_size,
+                    )
+                    self._early_pending_orders.append(early_po)
+                    self._traded_coins.add(coin)
+            else:
+                result = await self._submit_limit_buy(
+                    coin,
+                    buy_side,
+                    token_id,
+                    next_market,
+                    limit_price,
+                    rule.pattern,
+                    trade_size,
+                    rule_id=rule.rule_id,
+                    skip_cycle_guard=True,
+                )
+                if result is not None:
+                    if isinstance(result, PositionRecord):
+                        # Immediate fill — wrap as early pending for transfer
+                        early_po = PendingOrder(
+                            coin=coin,
+                            side=buy_side,
+                            token_id=token_id,
+                            order_id=result.order_id,
+                            limit_price=limit_price,
+                            size=trade_size,
+                            placed_at=time.time(),
+                            market_slug=next_market.slug,
+                            pattern=rule.pattern,
+                            rule_id=rule.rule_id,
+                            neg_risk=next_market.neg_risk,
+                            tick_size=next_market.tick_size,
+                        )
+                        self._early_pending_orders.append(early_po)
+                        self._traded_coins.add(coin)
+                    elif isinstance(result, PendingOrder):
+                        # Move from _pending_orders to _early_pending_orders
+                        if result in self._pending_orders:
+                            self._pending_orders.remove(result)
+                        self._early_pending_orders.append(result)
+                        self._traded_coins.add(coin)
+
+    # ------------------------------------------------------------------
     # Book confirmation — check residual bids at cycle rollover
     # ------------------------------------------------------------------
     def _try_confirm_from_book(self) -> None:
@@ -1694,13 +2241,13 @@ class SequenceStrategy:
         If the upgrade creates new pattern matches and we're still inside
         the entry window, automatically transition to ENTRY_WINDOW.
 
-        Retries up to 3 times with 1s delay to handle settling markets.
+        Retries up to 6 times over ~20s to handle settling markets.
         """
         # Small delay to let the market settle — MMs need a moment to
         # post residual bids on the resolved market's book.
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(2.0)
 
-        max_retries = 3
+        max_retries = 6
         for attempt in range(max_retries):
             all_confirmed = True
 
@@ -1749,7 +2296,7 @@ class SequenceStrategy:
             if all_confirmed:
                 break
             if attempt < max_retries - 1:
-                await asyncio.sleep(2.0)  # wait before retry
+                await asyncio.sleep(3.0)  # wait before retry
 
         # Re-check patterns — if new matches appeared, enter trade window.
         cycle_age = time.time() - self._cycle_start_ts
@@ -1781,18 +2328,25 @@ class SequenceStrategy:
         """Check all coins against all rules with per-rule coin filters.
 
         Rules are pre-sorted longest-pattern-first, so the first match per
-        coin is always the highest-priority (longest) pattern. This ensures
-        that if UUUU and UUU both match, UUUU wins (higher WR, higher max_ask).
+        coin is always the highest-priority (longest) pattern.  Conditioned
+        variants are listed BEFORE their plain fallback, so when a
+        conditioned rule's conditions fail, we ``continue`` to try the
+        next rule (which may be the unconditioned fallback for the same
+        pattern, or a shorter pattern).
         """
         matches = []
         active = self.cfg.coins if self.cfg.coins else COINS
+        _TRADEABLE = {
+            ConfirmationStatus.PROVISIONAL,
+            ConfirmationStatus.BOOK_CONFIRMED,
+            ConfirmationStatus.CONFIRMED,
+        }
         for coin in active:
             hist = list(self._outcome_history[coin])
             if not hist:
                 continue
 
             for rule in self.cfg.rules:
-                # Check if this rule applies to this coin
                 if rule.coins and coin not in rule.coins:
                     continue
 
@@ -1802,17 +2356,22 @@ class SequenceStrategy:
 
                 recent_entries = hist[-pattern_len:]
                 recent = self._history_values(recent_entries)
-                if recent == rule.pattern:
-                    # ALL entries must be at least book-confirmed (blue) to trade.
-                    # PROVISIONAL (white) is not sufficient.
-                    _TRADEABLE = {
-                        ConfirmationStatus.BOOK_CONFIRMED,
-                        ConfirmationStatus.CONFIRMED,
-                    }
-                    if any(e.status not in _TRADEABLE for e in recent_entries):
+                if recent != rule.pattern:
+                    continue
+
+                if any(e.status not in _TRADEABLE for e in recent_entries):
+                    continue
+
+                # Check per-rule indicator conditions (if any).
+                # If conditions fail, continue to next rule (fallback).
+                if rule.conditions and self._indicator_engine.has_conditions:
+                    if not self._indicator_engine.check_conditions(
+                        coin, rule.conditions
+                    ):
                         continue
-                    matches.append((coin, rule))
-                    break  # First matching rule wins per coin
+
+                matches.append((coin, rule))
+                break  # First matching rule (with conditions met) wins
 
         return matches
 
@@ -2007,8 +2566,13 @@ class SequenceStrategy:
         pattern: str,
         trade_size: Optional[float] = None,
         rule_id: str = "",
+        skip_cycle_guard: bool = False,
     ) -> Optional[Any]:
         """Submit a GTC limit BUY to the CLOB.
+
+        Args:
+            skip_cycle_guard: If True, skip the market cycle_ts check (used for
+                early entry where we place orders on the NEXT cycle's market).
 
         Returns:
             PositionRecord if immediately matched (full fill).
@@ -2551,6 +3115,16 @@ class SequenceStrategy:
         # --- RSI filter: refresh periodically ---
         await self._rsi_filter.update(self._clob_executor)
 
+        # --- Indicator engine: refresh per-coin klines ---
+        if self._indicator_engine.has_conditions:
+            await self._indicator_engine.update(self._clob_executor)
+
+        # --- Early inference + pre-emptive entry (last 20s of cycle) ---
+        if self._cycle_start_ts > 0:
+            cycle_age = now - self._cycle_start_ts
+            if EARLY_INFERENCE_START <= cycle_age < INFERENCE_TIME:
+                await self._try_early_inference_and_entry()
+
         # --- Outcome inference: near cycle end, read last tick prices ---
         if self._cycle_start_ts > 0:
             cycle_age = now - self._cycle_start_ts
@@ -2762,29 +3336,30 @@ class SequenceStrategy:
             f"{rsi_str}{dd_str}"
         )
 
-        # Rules table — grouped by side, one line per rule
+        # Rules summary — compact per-coin breakdown
         kelly_str = f"  kelly={self.cfg.kelly}" if self.cfg.kelly > 0 else ""
         n_rules = len(self.cfg.rules)
-        lines.append(
-            f"  {D}Rules ({n_rules})  size=${self.cfg.size:.0f}"
-            f"{kelly_str}  cycle #{self.cycles_seen}{X}"
+        n_cond = sum(1 for r in self.cfg.rules if r.conditions)
+        # Count rules per coin
+        coin_rule_counts: Dict[str, Dict[str, int]] = {}
+        for rule in self.cfg.rules:
+            tgt = rule.coins if rule.coins else COINS
+            side_key = "UP" if rule.buy_side == "up" else "DN"
+            for c in tgt:
+                coin_rule_counts.setdefault(c, {"UP": 0, "DN": 0})
+                coin_rule_counts[c][side_key] += 1
+        coin_summary = "  ".join(
+            f"{B}{c}{X}:{G}{v.get('UP', 0)}U{X}/{R}{v.get('DN', 0)}D{X}"
+            for c, v in sorted(coin_rule_counts.items())
         )
-        up_rules = [r for r in self.cfg.rules if r.buy_side == "up"]
-        dn_rules = [r for r in self.cfg.rules if r.buy_side == "down"]
-        for rule in up_rules + dn_rules:
-            coins_str = (
-                "ALL"
-                if not rule.coins or set(rule.coins) >= set(COINS)
-                else ",".join(rule.coins)
-            )
-            side_c = G if rule.buy_side == "up" else R
-            side_label = "UP" if rule.buy_side == "up" else "DN"
-            lines.append(
-                f"    {B}{rule.pattern:<8}{X}"
-                f" {side_c}{side_label:<4}{X}"
-                f" {D}{coins_str:<12}{X}"
-                f" {D}@{rule.max_ask:.2f}{X}"
-            )
+        ind_str = ""
+        if self._indicator_engine.has_conditions:
+            ind_str = f"  {D}IND:{self._indicator_engine.status_str}{X}"
+        lines.append(
+            f"  {D}Rules ({n_rules}, {n_cond} cond)  size=${self.cfg.size:.0f}"
+            f"{kelly_str}  cycle #{self.cycles_seen}{X}{ind_str}"
+        )
+        lines.append(f"  {coin_summary}")
         hsep()
 
         # --- Outcome history ---
@@ -2810,9 +3385,16 @@ class SequenceStrategy:
             else:
                 hist_str = "--"
 
-            # Highlight if pattern matches
+            # Highlight if pattern matches (with coin + condition checks)
             matches = []
+            _TRADEABLE_TUI = {
+                ConfirmationStatus.PROVISIONAL,
+                ConfirmationStatus.BOOK_CONFIRMED,
+                ConfirmationStatus.CONFIRMED,
+            }
             for rule in self.cfg.rules:
+                if rule.coins and coin not in rule.coins:
+                    continue
                 plen = len(rule.pattern)
                 if len(hist) < plen:
                     continue
@@ -2820,13 +3402,19 @@ class SequenceStrategy:
                 recent = self._history_values(recent_entries)
                 if recent != rule.pattern:
                     continue
-                _TRADEABLE = {
-                    ConfirmationStatus.BOOK_CONFIRMED,
-                    ConfirmationStatus.CONFIRMED,
-                }
-                if any(e.status not in _TRADEABLE for e in recent_entries):
+                if any(e.status not in _TRADEABLE_TUI for e in recent_entries):
                     continue
-                matches.append(f"{rule.pattern}->{rule.buy_side[0].upper()}")
+                # Check per-rule conditions
+                if rule.conditions and self._indicator_engine.has_conditions:
+                    if not self._indicator_engine.check_conditions(
+                        coin, rule.conditions
+                    ):
+                        continue
+                cond_mark = "*" if rule.conditions else ""
+                matches.append(
+                    f"{rule.pattern}{cond_mark}->{rule.buy_side[0].upper()}"
+                )
+                break  # first match per coin
 
             match_tag = ""
             if matches:
@@ -2876,26 +3464,31 @@ class SequenceStrategy:
             f"   pnl:{pnl_c}{B}${self.session_pnl:+.2f}{X}"
         )
 
-        # Per-rule breakdown (each rule tracked independently)
+        # Per-rule breakdown — only rules with trades (keep compact)
         rule_parts = []
         for rule in self.cfg.rules:
             rid = rule.rule_id
             pw = self.pattern_wins.get(rid, 0)
             pl = self.pattern_losses.get(rid, 0)
             pr = pw + pl
+            if pr == 0:
+                continue  # skip rules with no trades yet
             pwr = f"{(pw / pr) * 100:.0f}%" if pr > 0 else "--"
             if not rule.coins or set(rule.coins) >= set(COINS):
                 tag = rule.pattern
             else:
                 tag = f"{rule.pattern}:{','.join(rule.coins)}"
+            cond_mark = "*" if rule.conditions else ""
             side_label = "U" if rule.buy_side == "up" else "D"
-            rule_parts.append(f"{tag}->{side_label}: {G}{pw}W{X}/{R}{pl}L{X}={pwr}")
+            rule_parts.append(
+                f"{tag}{cond_mark}->{side_label}:{G}{pw}W{X}/{R}{pl}L{X}={pwr}"
+            )
         if rule_parts:
-            # Split into 2 lines if > 4 rules for readability
-            mid = (len(rule_parts) + 1) // 2
-            lines.append(f"  {D}rules:{X}  " + "  ".join(rule_parts[:mid]))
-            if len(rule_parts) > mid:
-                lines.append(f"         " + "  ".join(rule_parts[mid:]))
+            # Distribute across rows of ~4 each
+            per_row = 4
+            for i in range(0, len(rule_parts), per_row):
+                prefix = f"  {D}rules:{X} " if i == 0 else "         "
+                lines.append(prefix + "  ".join(rule_parts[i : i + per_row]))
 
         # Per-coin breakdown
         coin_parts = []
@@ -2964,7 +3557,8 @@ class SequenceStrategy:
         print("=" * 60)
         print(f"  Size:          {self.cfg.size}")
         print(f"  Dry run:       {self.cfg.dry_run}")
-        print(f"  Rules ({len(self.cfg.rules)}):")
+        n_cond = sum(1 for r in self.cfg.rules if r.conditions)
+        print(f"  Rules ({len(self.cfg.rules)}, {n_cond} conditioned):")
         for rule in self.cfg.rules:
             coins_str = (
                 "ALL"
@@ -2972,8 +3566,17 @@ class SequenceStrategy:
                 else ",".join(rule.coins)
             )
             side_label = "UP" if rule.buy_side == "up" else "DOWN"
+            cond_str = ""
+            if rule.conditions:
+                cond_parts = []
+                for c in rule.conditions:
+                    ind = c.get("indicator", "?")
+                    op = c.get("condition", "?")
+                    thr = c.get("threshold_pct", c.get("threshold", "?"))
+                    cond_parts.append(f"{ind}{op}{thr}")
+                cond_str = f"  [{', '.join(cond_parts)}]"
             print(
-                f"    {rule.pattern:<8} {side_label:<5} {coins_str:<12} @{rule.max_ask:.2f}"
+                f"    {rule.pattern:<8} {side_label:<5} {coins_str:<12} @{rule.max_ask:.2f}{cond_str}"
             )
         print(f"  Cycles seen:   {self.cycles_seen}")
         print(f"  Total fills:   {self.total_fills}")
@@ -3003,13 +3606,14 @@ class SequenceStrategy:
                 else ",".join(rule.coins)
             )
             side_label = "UP" if rule.buy_side == "up" else "DOWN"
+            cond_mark = " *" if rule.conditions else ""
             pw = self.pattern_wins.get(rule.rule_id, 0)
             pl = self.pattern_losses.get(rule.rule_id, 0)
             pr = pw + pl
             pwr = f"{(pw / pr) * 100:.1f}%" if pr > 0 else "--"
             print(
                 f"    {rule.pattern:<8} {side_label:<5} {coins_str:<12}: "
-                f"{pw}W / {pl}L (WR: {pwr})"
+                f"{pw}W / {pl}L (WR: {pwr}){cond_mark}"
             )
 
         # Coin breakdown
@@ -3156,12 +3760,22 @@ def main() -> None:
         log("Drawdown protection: DISABLED", "warning")
     print()
 
-    log("Rules (priority order, longest pattern first):", "info")
+    n_cond = sum(1 for r in cfg.rules if r.conditions)
+    log(f"Rules ({len(cfg.rules)}, {n_cond} conditioned):", "info")
     for rule in cfg.rules:
         coins_str = ",".join(rule.coins) if rule.coins else "ALL"
+        cond_str = ""
+        if rule.conditions:
+            cond_parts = []
+            for c in rule.conditions:
+                ind = c.get("indicator", "?")
+                op = c.get("condition", "?")
+                thr = c.get("threshold_pct", c.get("threshold", "?"))
+                cond_parts.append(f"{ind}{op}{thr}")
+            cond_str = f"  IF [{', '.join(cond_parts)}]"
         log(
             f"  {rule.pattern} -> BUY {rule.buy_side.upper()}  "
-            f"max_ask=${rule.max_ask:.2f}  coins=[{coins_str}]",
+            f"max_ask=${rule.max_ask:.2f}  coins=[{coins_str}]{cond_str}",
             "info",
         )
     print()
