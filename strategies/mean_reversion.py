@@ -1145,6 +1145,7 @@ class SequenceStrategy:
         # Early inference: pre-emptive orders placed on next cycle's market
         self._early_pending_orders: List[PendingOrder] = []
         self._early_inference_done: Set[str] = set()  # coins already early-inferred
+        self._early_filled_coins: Set[str] = set()  # coins with immediate fills (no poll)
         self._next_market_cache: Dict[str, MarketInfo] = {}  # cached next market per coin
 
         # Positions
@@ -1588,9 +1589,15 @@ class SequenceStrategy:
 
         # Transfer early orders from previous cycle
         early_orders = list(self._early_pending_orders)
+        early_filled = set(self._early_filled_coins)
         self._early_pending_orders.clear()
         self._early_inference_done.clear()
+        self._early_filled_coins.clear()
         self._next_market_cache.clear()
+
+        # Block coins that got immediate fills during early entry
+        for coin in early_filled:
+            self._traded_coins.add(coin)
 
         if early_orders:
             for po in early_orders:
@@ -1605,7 +1612,7 @@ class SequenceStrategy:
         # Check if we have pattern matches for this new cycle
         matches = self._find_pattern_matches()
 
-        if early_orders:
+        if early_orders or early_filled:
             # Early orders already placed — go to PENDING_ORDERS state
             if matches:
                 match_strs = [
@@ -2137,23 +2144,11 @@ class SequenceStrategy:
                 )
                 if result is not None:
                     if isinstance(result, PositionRecord):
-                        # Immediate fill — wrap as early pending for transfer
-                        early_po = PendingOrder(
-                            coin=coin,
-                            side=buy_side,
-                            token_id=token_id,
-                            order_id=result.order_id,
-                            limit_price=limit_price,
-                            size=trade_size,
-                            placed_at=time.time(),
-                            market_slug=next_market.slug,
-                            pattern=rule.pattern,
-                            rule_id=rule.rule_id,
-                            neg_risk=next_market.neg_risk,
-                            tick_size=next_market.tick_size,
-                        )
-                        self._early_pending_orders.append(early_po)
+                        # Immediate fill — already logged by _submit_limit_buy.
+                        # Just track the coin so it's blocked in the next cycle.
+                        # Do NOT wrap as PendingOrder (causes double-logging).
                         self._traded_coins.add(coin)
+                        self._early_filled_coins.add(coin)
                     elif isinstance(result, PendingOrder):
                         # Move from _pending_orders to _early_pending_orders
                         if result in self._pending_orders:
@@ -2826,9 +2821,16 @@ class SequenceStrategy:
             except Exception as exc:
                 log(f"Cancel batch error: {exc}", "error")
 
+        # Collect order_ids already tracked as positions (to prevent double-logging)
+        existing_order_ids = {pos.order_id for pos in self._all_positions}
+
         # Now poll each order for fill status
         for p in pending:
             if not p.order_id:
+                continue
+            if p.order_id in existing_order_ids:
+                log(f"Skipping poll for {p.order_id[:16]}... (already filled)", "info")
+                self._traded_coins.add(p.coin)
                 continue
             try:
                 order_data = await asyncio.to_thread(self.clob.get_order, p.order_id)
