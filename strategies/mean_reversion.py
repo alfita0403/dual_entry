@@ -292,6 +292,9 @@ class RSIFilter:
             return rsi
         except Exception as exc:
             self._consecutive_failures += 1
+            # Backoff: set fetch_ts so we wait 30s before retrying
+            # (prevents tight retry loop that blocks the main tick)
+            self._last_fetch_ts = time.time() - self._fetch_interval + 30.0
             if self._consecutive_failures >= 10:
                 log(
                     f"RSI fetch FAILING ({self._consecutive_failures}x in a row): {exc}. "
@@ -461,11 +464,21 @@ class LiveIndicatorEngine:
             return json.loads(resp.read())
 
     def _process_klines(self, coin: str, data: list) -> None:
-        """Process raw klines into indicators and percentile distributions."""
+        """Process raw klines into indicators and percentile distributions.
+
+        Computes all values into local variables first, then assigns them
+        in a tight batch to minimize the window where the main thread could
+        read partial state (Python GIL makes individual dict assignments atomic).
+        """
         closes = np.array([float(c[4]) for c in data])
         volumes = np.array([float(c[7]) for c in data])  # quote volume
-        self._closes[coin] = closes
-        self._volumes[coin] = volumes
+
+        # Compute everything into locals first
+        new_vol_1h_pcts = self._vol_1h_pcts.get(coin)
+        new_current_vol_1h = self._current_vol_1h.get(coin)
+        new_vol_sum_1h_pcts = self._vol_sum_1h_pcts.get(coin)
+        new_current_vol_sum_1h = self._current_vol_sum_1h.get(coin)
+        new_rsi: Dict[Tuple[str, int], float] = {}
 
         # VOL_1H: rolling std of pct_change
         if len(closes) > self.VOL_WINDOW + 1:
@@ -476,8 +489,8 @@ class LiveIndicatorEngine:
                 vol_values.append(float(np.std(window)))
             if vol_values:
                 vol_arr = np.array(vol_values)
-                self._vol_1h_pcts[coin] = np.sort(vol_arr)
-                self._current_vol_1h[coin] = vol_arr[-1]
+                new_vol_1h_pcts = np.sort(vol_arr)
+                new_current_vol_1h = vol_arr[-1]
 
         # VOL_SUM_1H: rolling sum of quote volume
         if len(volumes) >= self.VOL_WINDOW:
@@ -485,14 +498,26 @@ class LiveIndicatorEngine:
             vol_sum = np.empty(len(volumes) - self.VOL_WINDOW + 1)
             vol_sum[0] = cumsum[self.VOL_WINDOW - 1]
             vol_sum[1:] = cumsum[self.VOL_WINDOW :] - cumsum[: -self.VOL_WINDOW]
-            self._vol_sum_1h_pcts[coin] = np.sort(vol_sum)
-            self._current_vol_sum_1h[coin] = vol_sum[-1]
+            new_vol_sum_1h_pcts = np.sort(vol_sum)
+            new_current_vol_sum_1h = vol_sum[-1]
 
         # RSI for needed periods
         for period in self._needed_rsi_periods:
-            rsi = _compute_rsi(closes, period)
-            self._rsi_cache[(coin, period)] = rsi
+            new_rsi[(coin, period)] = _compute_rsi(closes, period)
 
+        # --- Atomic batch assignment (GIL-protected) ---
+        self._closes[coin] = closes
+        self._volumes[coin] = volumes
+        if new_vol_1h_pcts is not None:
+            self._vol_1h_pcts[coin] = new_vol_1h_pcts
+        if new_current_vol_1h is not None:
+            self._current_vol_1h[coin] = new_current_vol_1h
+        if new_vol_sum_1h_pcts is not None:
+            self._vol_sum_1h_pcts[coin] = new_vol_sum_1h_pcts
+        if new_current_vol_sum_1h is not None:
+            self._current_vol_sum_1h[coin] = new_current_vol_sum_1h
+        for key, val in new_rsi.items():
+            self._rsi_cache[key] = val
         self._last_fetch_ts[coin] = time.time()
 
     def _refresh_coin_sync(self, coin: str) -> bool:
@@ -502,8 +527,12 @@ class LiveIndicatorEngine:
             if data:
                 self._process_klines(coin, data)
                 return True
+            # No data but no exception: set backoff timestamp to avoid retry storm
+            self._last_fetch_ts[coin] = time.time() - self.REFRESH_INTERVAL + 60.0
             return False
         except Exception as exc:
+            # Set backoff: retry in 60s instead of every tick (0.1s)
+            self._last_fetch_ts[coin] = time.time() - self.REFRESH_INTERVAL + 60.0
             log(f"[indicators] {coin} fetch error: {exc}", "warning")
             return False
 
@@ -527,14 +556,17 @@ class LiveIndicatorEngine:
     async def update(
         self, executor: concurrent.futures.ThreadPoolExecutor
     ) -> None:
-        """Async: refresh stale coins (call from main loop)."""
+        """Async: refresh stale coins concurrently (call from main loop)."""
         now = time.time()
         loop = asyncio.get_running_loop()
-        for coin in self._needed_coins:
-            if now - self._last_fetch_ts.get(coin, 0) >= self.REFRESH_INTERVAL:
-                await loop.run_in_executor(
-                    executor, self._refresh_coin_sync, coin
-                )
+        # Gather all stale coins and refresh in parallel (non-blocking)
+        tasks = [
+            loop.run_in_executor(executor, self._refresh_coin_sync, coin)
+            for coin in self._needed_coins
+            if now - self._last_fetch_ts.get(coin, 0) >= self.REFRESH_INTERVAL
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _get_percentile_rank(
         self, coin: str, indicator: str, value: float
@@ -1060,9 +1092,14 @@ class SequenceStrategy:
         # Fee cache
         self._fee_rate_cache: Dict[str, int] = {}
 
-        # Dedicated CLOB thread
+        # Dedicated CLOB thread (never shared with Binance HTTP fetches)
         self._clob_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="clob-hot"
+        )
+        # Separate executor for Binance kline fetches (RSI + indicator engine).
+        # Isolated from CLOB so Binance timeouts never block order placement.
+        self._http_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=3, thread_name_prefix="http-fetch"
         )
 
         # Book event (WS callback signals this)
@@ -1282,7 +1319,7 @@ class SequenceStrategy:
             # Warm up RSI filter/boost before entering trades
             if self._rsi_filter.enabled or self._rsi_filter.boost_enabled:
                 log("Warming up RSI (fetching Binance klines)...", "info")
-                await self._rsi_filter.update(self._clob_executor)
+                await self._rsi_filter.update(self._http_executor)
                 rsi = self._rsi_filter.current_rsi
                 if not np.isnan(rsi):
                     parts = [f"RSI({self._rsi_filter.period}) = {rsi:.1f}"]
@@ -1307,7 +1344,7 @@ class SequenceStrategy:
                     "info",
                 )
                 await asyncio.get_running_loop().run_in_executor(
-                    self._clob_executor, self._indicator_engine.warmup_sync
+                    self._http_executor, self._indicator_engine.warmup_sync
                 )
 
             await self._start_all_managers()
@@ -3112,12 +3149,12 @@ class SequenceStrategy:
     async def _tick(self) -> None:
         now = time.time()
 
-        # --- RSI filter: refresh periodically ---
-        await self._rsi_filter.update(self._clob_executor)
+        # --- RSI filter: refresh periodically (uses http executor, not clob) ---
+        await self._rsi_filter.update(self._http_executor)
 
         # --- Indicator engine: refresh per-coin klines ---
         if self._indicator_engine.has_conditions:
-            await self._indicator_engine.update(self._clob_executor)
+            await self._indicator_engine.update(self._http_executor)
 
         # --- Early inference + pre-emptive entry (last 20s of cycle) ---
         if self._cycle_start_ts > 0:
@@ -3308,11 +3345,12 @@ class SequenceStrategy:
             rsi_str = f"   RSI({self._rsi_filter.period}):{rsi_c}{B}{rsi_val:.0f}{X}"
             # Show boost sizes for each side
             if self._rsi_filter.boost_enabled:
+                saved_boost = self._rsi_filter.boost_count
+                saved_base = self._rsi_filter.base_count
                 up_sz = self._rsi_filter.get_trade_size("up", self.cfg.size)
                 dn_sz = self._rsi_filter.get_trade_size("down", self.cfg.size)
-                # Undo the counter increments from display calls
-                self._rsi_filter.boost_count = max(0, self._rsi_filter.boost_count - 2)
-                self._rsi_filter.base_count = max(0, self._rsi_filter.base_count - 2)
+                self._rsi_filter.boost_count = saved_boost
+                self._rsi_filter.base_count = saved_base
                 up_c = G if up_sz > self.cfg.size else D
                 dn_c = G if dn_sz > self.cfg.size else D
                 rsi_str += f"  {up_c}UP=${up_sz:.0f}{X} {dn_c}DN=${dn_sz:.0f}{X}"
