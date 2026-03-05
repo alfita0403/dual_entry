@@ -1,0 +1,66 @@
+# Mean-Reversion V2 — "Safe $30" Config
+#
+# 6 patterns selected for low drawdown from Telonex 21-day backtest.
+# No indicator conditions (proven useless after lookahead fix).
+# No RSI filter/boost. No early inference.
+#
+# Entry: GTC limit at max_ask placed at t=1-3s, cancel at 10s.
+# Size: $5 flat per trade.
+
+# Active coins
+coins: ["BTC", "ETH", "SOL", "XRP"]
+
+# Trade parameters
+size: 5.0
+entry_window_start: 1
+entry_window_end: 3
+cancel_timeout: 10.0
+max_trades_per_cycle: 4
+
+# Drawdown protection
+drawdown_protection:
+  enabled: true
+  max_drawdown: 15.0
+  max_consecutive_losses: 6
+  cooldown_minutes: 15
+
+# Trade log (separate from v1)
+trade_log: meanrev_v2_trades.txt
+
+# Rules (sorted longest-first automatically)
+rules:
+  # UUDUUD->UP BTC: 64-65% WR, $0.88/trade, 4/4 green weeks (N=64-118)
+  - pattern: "UUDUUD"
+    side: "UP"
+    coins: ["BTC"]
+    max_ask: 0.48
+
+  # UDDUUD->UP SOL: 67% WR, $0.82/trade, 3/3 weeks (N=64)
+  - pattern: "UDDUUD"
+    side: "UP"
+    coins: ["SOL"]
+    max_ask: 0.48
+
+  # DDUUD->UP XRP: 53-57% WR, $0.27/trade, 3/4 weeks (N=283-556)
+  - pattern: "DDUUD"
+    side: "UP"
+    coins: ["XRP"]
+    max_ask: 0.48
+
+  # DDUUD->UP BTC: similar edge, higher N
+  - pattern: "DDUUD"
+    side: "UP"
+    coins: ["BTC"]
+    max_ask: 0.48
+
+  # UUUD->DOWN XRP: 60% WR, $0.41/trade, 3/3 weeks (N=244)
+  - pattern: "UUUD"
+    side: "DOWN"
+    coins: ["XRP"]
+    max_ask: 0.55
+
+  # UUU->DOWN SOL: conservative, tight max_ask
+  - pattern: "UUU"
+    side: "DOWN"
+    coins: ["SOL"]
+    max_ask: 0.44
