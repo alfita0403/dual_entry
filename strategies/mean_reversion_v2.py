@@ -75,9 +75,11 @@ ENTRY_WINDOW_START = 1
 ENTRY_WINDOW_END = 3
 DEFAULT_MAX_ASK = 0.60
 
-# Dry-run simulation penalties
-SIM_ENTRY_SLIP = 0.01
-SIM_FEE_RATE = 0.015
+# Dry-run simulation: realistic maker/taker model
+# Taker: limit >= ask → instant fill at ask, 2% fee on shares received
+# Maker: limit < ask → sits on book, fills if ask drops to limit within cancel_timeout, 0% fee
+SIM_TAKER_FEE = 0.02   # 2% taker fee (applied to shares, not cost)
+SIM_MAKER_FEE = 0.00   # 0% maker fee
 
 
 # ===================================================================
@@ -289,6 +291,19 @@ class PendingOrder:
     fee_rate_bps: int = 0
     neg_risk: bool = False
     tick_size: str = "0.01"
+
+
+@dataclass
+class SimPendingOrder:
+    """Simulated maker order sitting on book, waiting for ask to drop to limit."""
+    coin: str
+    side: str  # "up" or "down"
+    limit_price: float
+    size: float
+    placed_at: float
+    market_slug: str
+    pattern: str
+    rule_id: str = ""
 
 
 # ===================================================================
@@ -509,6 +524,9 @@ class PatternStrategy:
         self._pending_orders: List[PendingOrder] = []
         self._orders_placed_ts: float = 0.0
         self._entry_in_progress: bool = False  # guard against concurrent entry
+
+        # Simulated pending maker orders (dry-run only)
+        self._sim_pending_orders: List[SimPendingOrder] = []
 
         # Positions
         self._current_positions: List[PositionRecord] = []
@@ -797,6 +815,10 @@ class PatternStrategy:
         except Exception:
             pass
 
+        # Check simulated maker orders on every book update (dry-run)
+        if self.cfg.dry_run and self._sim_pending_orders:
+            self._check_sim_pending_orders()
+
     # ------------------------------------------------------------------
     # Cycle management
     # ------------------------------------------------------------------
@@ -849,6 +871,7 @@ class PatternStrategy:
         self._traded_coins.clear()
         self._current_positions.clear()
         self._pending_orders.clear()
+        self._sim_pending_orders.clear()
         self._orders_placed_ts = 0.0
         self._fee_rate_cache.clear()
         self.cycles_seen += 1
@@ -918,6 +941,17 @@ class PatternStrategy:
 
     def _transition_to_done(self) -> None:
         self.cycle_state = CycleState.DONE
+
+        # Cancel any remaining sim maker orders (dry-run)
+        if self._sim_pending_orders:
+            for so in self._sim_pending_orders:
+                log(
+                    f"SIM CANCEL (cycle end) {so.coin}-{so.side.upper()} "
+                    f"@ {so.limit_price:.3f}",
+                    "warning",
+                )
+                self._traded_coins.discard(so.coin)
+            self._sim_pending_orders.clear()
 
         if self._pending_orders:
             # Snapshot and clear IMMEDIATELY — the background task will use the
@@ -1520,11 +1554,11 @@ class PatternStrategy:
             )
 
             if self.cfg.dry_run:
-                tracker = self._simulate_buy(
-                    coin, buy_side, current_ask, market, rule.pattern,
-                    trade_size, rule_id=rule.rule_id,
+                result = self._simulate_order(
+                    coin, buy_side, limit_price, current_ask, market,
+                    rule.pattern, trade_size, rule_id=rule.rule_id,
                 )
-                if tracker:
+                if result is not None:
                     self._traded_coins.add(coin)
                     placed_any = True
             else:
@@ -1537,58 +1571,185 @@ class PatternStrategy:
                     if isinstance(result, PositionRecord):
                         self._traded_coins.add(coin)
 
-        if placed_any and not self.cfg.dry_run and self._pending_orders:
-            self._orders_placed_ts = time.time()
-            self.cycle_state = CycleState.PENDING_ORDERS
-            log(
-                f"Placed {len(self._pending_orders)} GTC limit(s). "
-                f"Cancel timeout: {self.cfg.cancel_timeout:.0f}s.",
-                "trade",
-            )
+        if placed_any:
+            if self.cfg.dry_run and self._sim_pending_orders:
+                self._orders_placed_ts = time.time()
+                self.cycle_state = CycleState.PENDING_ORDERS
+                log(
+                    f"SIM: {len(self._sim_pending_orders)} maker order(s) on book. "
+                    f"Watching asks for {self.cfg.cancel_timeout:.0f}s.",
+                    "trade",
+                )
+            elif not self.cfg.dry_run and self._pending_orders:
+                self._orders_placed_ts = time.time()
+                self.cycle_state = CycleState.PENDING_ORDERS
+                log(
+                    f"Placed {len(self._pending_orders)} GTC limit(s). "
+                    f"Cancel timeout: {self.cfg.cancel_timeout:.0f}s.",
+                    "trade",
+                )
 
-    def _simulate_buy(
+    def _simulate_order(
         self,
         coin: str,
         side: str,
-        ask_price: float,
+        limit_price: float,
+        current_ask: float,
         market: MarketInfo,
         pattern: str,
         trade_size: float,
         rule_id: str = "",
     ) -> Optional[PositionRecord]:
-        """Simulate a fill for dry-run mode."""
-        sim_price = ask_price + SIM_ENTRY_SLIP
-        cost = sim_price * trade_size
+        """Simulate order placement with realistic maker/taker logic.
+
+        - limit_price >= current_ask: TAKER — fills immediately at current_ask,
+          2% fee deducted from shares (buy 10, receive 9.80).
+        - limit_price < current_ask: MAKER — order sits on book. Fills if
+          ask drops to limit_price within cancel_timeout. 0% fee.
+        """
+        self.total_orders_placed += 1
+
+        if limit_price >= current_ask:
+            # TAKER: marketable order, fills at the ask
+            fill_price = current_ask
+            fill_shares = trade_size * (1.0 - SIM_TAKER_FEE)  # 2% fee on shares
+            cost = fill_price * trade_size  # pay full price
+
+            pos = PositionRecord(
+                coin=coin,
+                side=side,
+                fill_price=fill_price,
+                fill_size=fill_shares,
+                fill_time=time.time(),
+                market_slug=market.slug,
+                order_id=f"SIM-T-{coin}-{int(time.time())}",
+                cost=cost,
+                pattern=pattern,
+                rule_id=rule_id,
+            )
+            self._current_positions.append(pos)
+            self._all_positions.append(pos)
+            self.total_fills += 1
+            self.total_spent += cost
+            self.total_shares += fill_shares
+            if rule_id in self.pattern_fills:
+                self.pattern_fills[rule_id] += 1
+
+            _append_trade_log(pos, self.cfg, outcome="PENDING", log_file=self.log_file)
+
+            log(
+                f"SIM TAKER {coin}-{side.upper()} @ {fill_price:.4f} "
+                f"x{fill_shares:.2f} (ask={current_ask:.3f}, fee=2%, "
+                f"pattern={pattern})",
+                "success",
+            )
+            return pos
+        else:
+            # MAKER: order sits on book, wait for ask to drop
+            sim_order = SimPendingOrder(
+                coin=coin,
+                side=side,
+                limit_price=limit_price,
+                size=trade_size,
+                placed_at=time.time(),
+                market_slug=market.slug,
+                pattern=pattern,
+                rule_id=rule_id,
+            )
+            self._sim_pending_orders.append(sim_order)
+
+            log(
+                f"SIM MAKER ORDER {coin}-{side.upper()} @ {limit_price:.3f} "
+                f"(ask={current_ask:.3f}, waiting for fill, 0% fee, "
+                f"pattern={pattern})",
+                "trade",
+            )
+            # Return non-None to signal order was placed (blocks same-coin re-entry)
+            # Actual PositionRecord created later by _sim_fill_maker if ask drops
+            return sim_order  # type: ignore[return-value]
+
+    def _sim_fill_maker(self, sim_order: SimPendingOrder) -> None:
+        """Fill a simulated maker order. 0% fee — shares = size."""
+        fill_price = sim_order.limit_price
+        fill_shares = sim_order.size  # 0% maker fee
+        cost = fill_price * sim_order.size
 
         pos = PositionRecord(
-            coin=coin,
-            side=side,
-            fill_price=sim_price,
-            fill_size=trade_size,
+            coin=sim_order.coin,
+            side=sim_order.side,
+            fill_price=fill_price,
+            fill_size=fill_shares,
             fill_time=time.time(),
-            market_slug=market.slug,
-            order_id=f"SIM-{coin}-{int(time.time())}",
+            market_slug=sim_order.market_slug,
+            order_id=f"SIM-M-{sim_order.coin}-{int(time.time())}",
             cost=cost,
-            pattern=pattern,
-            rule_id=rule_id,
+            pattern=sim_order.pattern,
+            rule_id=sim_order.rule_id,
         )
         self._current_positions.append(pos)
         self._all_positions.append(pos)
         self.total_fills += 1
-        self.total_orders_placed += 1
         self.total_spent += cost
-        self.total_shares += trade_size
-        if rule_id in self.pattern_fills:
-            self.pattern_fills[rule_id] += 1
+        self.total_shares += fill_shares
+        if sim_order.rule_id in self.pattern_fills:
+            self.pattern_fills[sim_order.rule_id] += 1
 
         _append_trade_log(pos, self.cfg, outcome="PENDING", log_file=self.log_file)
 
         log(
-            f"SIM FILL {coin}-{side.upper()} @ {sim_price:.4f} x{trade_size:.2f} "
-            f"(pattern={pattern})",
+            f"SIM MAKER FILL {sim_order.coin}-{sim_order.side.upper()} "
+            f"@ {fill_price:.4f} x{fill_shares:.2f} "
+            f"(0% fee, pattern={sim_order.pattern})",
             "success",
         )
-        return pos
+
+    def _check_sim_pending_orders(self) -> None:
+        """Check if any simulated maker orders should fill (ask <= limit)."""
+        if not self._sim_pending_orders:
+            return
+
+        now = time.time()
+        still_pending = []
+
+        for sim_order in self._sim_pending_orders:
+            elapsed = now - sim_order.placed_at
+            if elapsed > self.cfg.cancel_timeout:
+                # Timed out — cancel
+                log(
+                    f"SIM CANCEL {sim_order.coin}-{sim_order.side.upper()} "
+                    f"@ {sim_order.limit_price:.3f} (no fill in "
+                    f"{self.cfg.cancel_timeout:.0f}s)",
+                    "warning",
+                )
+                # Remove from traded_coins since no fill happened
+                self._traded_coins.discard(sim_order.coin)
+                continue
+
+            # Check current ask
+            current_ask = self._best_asks.get(sim_order.coin, {}).get(
+                sim_order.side, 1.0
+            )
+            if current_ask <= sim_order.limit_price:
+                self._sim_fill_maker(sim_order)
+            else:
+                still_pending.append(sim_order)
+
+        self._sim_pending_orders = still_pending
+
+        # If all sim pending resolved, transition state
+        if not self._sim_pending_orders and self.cycle_state == CycleState.PENDING_ORDERS:
+            if self._current_positions:
+                self.cycle_state = CycleState.TRADED
+                log(
+                    f"SIM: All maker orders resolved. "
+                    f"{len(self._current_positions)} position(s) held.",
+                    "trade",
+                )
+            else:
+                log("SIM: All maker orders cancelled, no fills.", "warning")
+                # Clear traded_coins since nothing actually filled
+                self._traded_coins.clear()
+                self.cycle_state = CycleState.OBSERVING
 
     async def _submit_limit_buy(
         self,
@@ -1939,7 +2100,11 @@ class PatternStrategy:
             self.total_resolved += 1
 
             if self.cfg.dry_run:
-                effective_cost = pos.cost * (1.0 + SIM_FEE_RATE)
+                # Fee already applied at fill time:
+                # taker: fill_size = size * 0.98 (2% fee on shares)
+                # maker: fill_size = size (0% fee)
+                # cost = fill_price * original_size (what you paid)
+                effective_cost = pos.cost
             else:
                 # Live mode: apply actual fee from order time
                 fee_frac = pos.fee_rate_bps / 10_000.0 if pos.fee_rate_bps else 0.0
@@ -2065,8 +2230,7 @@ class PatternStrategy:
                         fill_size = _to_float(entry.get("size", "0"))
                         cost = entry_price * fill_size
                         is_dry = entry.get("dry_run", "").lower() == "true"
-                        if is_dry:
-                            cost = cost * (1.0 + SIM_FEE_RATE)
+                        # Fee already applied at fill time in new sim model
 
                         is_win = side == winner
                         coin_key = coin.upper()
@@ -2136,25 +2300,31 @@ class PatternStrategy:
                         "trade",
                     )
             elif cycle_age > ew_end:
-                if not self._traded_coins and not self._pending_orders:
+                if (not self._traded_coins and not self._pending_orders
+                        and not self._sim_pending_orders):
                     log("Entry window expired, no trades executed.", "warning")
                     self.cycle_state = CycleState.OBSERVING
 
         # Pending orders: wait for cancel_timeout
         if self.cycle_state == CycleState.PENDING_ORDERS:
             elapsed = now - self._orders_placed_ts
-            if elapsed >= self.cfg.cancel_timeout:
-                await self._cancel_and_settle_pending()
-                if self._traded_coins:
-                    self.cycle_state = CycleState.TRADED
-                    log(
-                        f"Traded {len(self._traded_coins)} coin(s): "
-                        f"{', '.join(sorted(self._traded_coins))}. Holding to resolution.",
-                        "trade",
-                    )
-                else:
-                    log("All GTC orders cancelled, no fills.", "warning")
-                    self.cycle_state = CycleState.OBSERVING
+            if self.cfg.dry_run:
+                # Sim pending: checked each book update, force-cancel on timeout
+                if elapsed >= self.cfg.cancel_timeout and self._sim_pending_orders:
+                    self._check_sim_pending_orders()  # will cancel timed-out orders
+            else:
+                if elapsed >= self.cfg.cancel_timeout:
+                    await self._cancel_and_settle_pending()
+                    if self._traded_coins:
+                        self.cycle_state = CycleState.TRADED
+                        log(
+                            f"Traded {len(self._traded_coins)} coin(s): "
+                            f"{', '.join(sorted(self._traded_coins))}. Holding to resolution.",
+                            "trade",
+                        )
+                    else:
+                        log("All GTC orders cancelled, no fills.", "warning")
+                        self.cycle_state = CycleState.OBSERVING
 
         # Check if all markets ended
         if self.cycle_state in (
