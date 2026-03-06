@@ -1,31 +1,21 @@
 """
 backtest.py — One-command backtester with equity curve comparison.
 
-Two data modes:
-  --csv   : Use your own scraped 1-second CSVs (data/prices_*.csv)
-            Real entry prices per side (UP_ask for UP bets, DOWN_ask for DOWN bets),
-            real max_ask filter (NO FILL if ask > max_ask), real outcomes.
-  (default): Use Telonex 74-day parquet (outcomes only, assumes entry at max_ask)
+Data modes:
+  (default): Telonex quotes (cycles.parquet / cycles_15m.parquet) — real bid/ask
+  --csv    : Your own scraped 1-second CSVs (data/prices_*.csv)
 
 Usage:
-    # Preset comparison mode (multiple configs on one chart)
+    python research/backtest.py --custom                   # 5m custom config
+    python research/backtest.py --custom --15m             # 15m custom config
     python research/backtest.py --csv                      # CSV mode, default preset
     python research/backtest.py --csv --preset rsi7        # CSV mode, RSI sweep
-    python research/backtest.py --csv --preset maxask      # CSV mode, max_ask sweep
-    python research/backtest.py --csv --preset indicators  # CSV mode, all indicators
-    python research/backtest.py --csv --preset all         # CSV mode, everything
-
-    python research/backtest.py                            # Telonex mode (74 days)
-    python research/backtest.py --preset all               # Telonex, everything
-
-    python research/backtest.py --custom                   # custom config (edit top of file)
     python research/backtest.py --list                     # list presets
 
     # Single-pattern backtest mode (max_ask sweep + per-coin + weekly stability)
     python research/backtest.py --pattern UUU              # All coins, auto side (DOWN)
     python research/backtest.py --pattern UUU --coin ETH   # ETH only
-    python research/backtest.py --pattern DDD              # Auto side: bet UP
-    python research/backtest.py --pattern UUU --max-ask 0.49  # Fixed max_ask + RSI comparison
+    python research/backtest.py --pattern UUU --max-ask 0.49  # Fixed max_ask
     python research/backtest.py --pattern DUDUDD --csv     # CSV data
 """
 
@@ -58,36 +48,89 @@ warnings.filterwarnings("ignore")
 # ============================================================================
 # CUSTOM CONFIG — edit this section to test your own strategy
 # ============================================================================
-CUSTOM_LABEL = "ETH-only @0.60"
+CUSTOM_LABEL = "V2 Live (6 patterns — Safe $30)"
 
+# Current live v2 config (mean_reversion_v2.yaml)
 CUSTOM_RULES = [
-    # --- ETH only, longest patterns first (first match wins) ---
-    # BTC/SOL/XRP removed: 53% WR below 55% breakeven, net -$530 on Telonex.
-    #
-    # DDDDD->UP ETH (60.3% WR Telonex, 61.5% CSV@0.55)
-    {"pattern": "DDDDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.060},
-    # DDDD->UP ETH (58.3% WR Telonex, 54.5% CSV@0.55)
-    {"pattern": "DDDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.060},
-    # UUUU->DOWN ETH (57.4% WR Telonex, 57.1% CSV@0.55)
-    {"pattern": "UUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.060},
-    # UUU->DOWN ETH (55.8% WR Telonex, 54.9% CSV@0.57)
-    {"pattern": "UUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.060},
-    # DDD->UP ETH (55.6% WR Telonex, 53.3% CSV@0.55)
-    {"pattern": "DDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.060},
+    {"pattern": "UUDUUD", "side": "UP",   "coins": ["BTC"],  "max_ask": 0.48},
+    {"pattern": "UDDUUD", "side": "UP",   "coins": ["SOL"],  "max_ask": 0.48},
+    {"pattern": "DDUUD",  "side": "UP",   "coins": ["XRP"],  "max_ask": 0.48},
+    {"pattern": "DDUUD",  "side": "UP",   "coins": ["BTC"],  "max_ask": 0.48},
+    {"pattern": "UUUD",   "side": "DOWN", "coins": ["XRP"],  "max_ask": 0.55},
+    {"pattern": "UUU",    "side": "DOWN", "coins": ["SOL"],  "max_ask": 0.44},
 ]
 
 CUSTOM_FILTERS = []  # No filters — RSI proven useless after look-ahead fix
 
 CUSTOM_SIZE = 5.0
-CUSTOM_FEE = 0.0  # 0% maker on Builder Program
+CUSTOM_FEE = 0.0  # fee handled dynamically (maker 0% / taker 2%)
+MIN_TRADES = 50  # Minimum trades required for statistical significance reporting
 # ============================================================================
 # END CUSTOM CONFIG
+# ============================================================================
+
+# ============================================================================
+# 15-MINUTE CUSTOM CONFIG — patterns validated via exhaustive_15m.py
+# All patterns: 4/4 CV folds positive, p < 0.05, N > 50 (144 days data)
+# ============================================================================
+CUSTOM_LABEL_15M = "15m K-Fold Survivors (not overfit, best ratio)"
+
+CUSTOM_RULES_15M = [
+    # K-fold cross-validated patterns (appeared in 4-5/5 independent folds)
+    # Sorted longest first for first-match-wins
+    # Removed: DU->DOWN ALL (losing -$156), UD->UP ALL (ratio 0.7x),
+    #   DD->UP ALL / DUU->DOWN ALL / UU->DOWN ALL (WR<45%, high DD contributors)
+    {"pattern": "UUDUUU", "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.44},  # 4/5 folds, ratio 3.7x
+    {"pattern": "UDUUU",  "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.41},  # 5/5 folds, ratio 2.5x
+    {"pattern": "UUUUU",  "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.52},  # 4/5 folds, ratio 1.6x
+    {"pattern": "DUUU",   "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.41},  # 5/5 folds, ratio 3.8x
+    {"pattern": "UUU",    "side": "DOWN", "coins": ["ETH"],                       "max_ask": 0.51},  # 4/5 folds, ratio 3.3x
+    {"pattern": "UDU",    "side": "DOWN", "coins": ["XRP"],                       "max_ask": 0.54},  # 4/5 folds, ratio 1.8x
+    {"pattern": "DU",     "side": "DOWN", "coins": ["XRP"],                       "max_ask": 0.54},  # 5/5 folds, ratio 3.6x
+    {"pattern": "UU",     "side": "DOWN", "coins": ["SOL"],                       "max_ask": 0.43},  # 4/5 folds, ratio 3.7x
+    {"pattern": "UU",     "side": "DOWN", "coins": ["ETH"],                       "max_ask": 0.51},  # 5/5 folds, ratio 1.3x
+]
+
+# Classic-only configs for 15m (multiple aggressiveness levels)
+CLASSICS_CONSERVATIVE_15M = [
+    # Sweet spot max_ask from sweep (0.40-0.42), fewer trades, lower DD
+    {"pattern": "UUUU",  "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.42},
+    {"pattern": "UUU",   "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.42},
+    {"pattern": "UU",    "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.40},
+    {"pattern": "DDD",   "side": "UP",   "coins": ["BTC", "ETH"],               "max_ask": 0.41},
+    {"pattern": "DD",    "side": "UP",   "coins": ["BTC", "ETH"],               "max_ask": 0.40},
+]
+
+CLASSICS_MODERATE_15M = [
+    # Moderate max_ask (0.42-0.44), balance volume/edge
+    {"pattern": "UUUU",  "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.44},
+    {"pattern": "UUU",   "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.44},
+    {"pattern": "UU",    "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.42},
+    {"pattern": "DDDD",  "side": "UP",   "coins": ["BTC", "ETH"],               "max_ask": 0.44},
+    {"pattern": "DDD",   "side": "UP",   "coins": ["BTC", "ETH"],               "max_ask": 0.43},
+    {"pattern": "DD",    "side": "UP",   "coins": ["BTC", "ETH"],               "max_ask": 0.42},
+]
+
+CLASSICS_AGGRESSIVE_15M = [
+    # High max_ask (0.48-0.52), max volume, highest DD
+    {"pattern": "UUUUU", "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.52},
+    {"pattern": "UUUU",  "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.50},
+    {"pattern": "UUU",   "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.48},
+    {"pattern": "UU",    "side": "DOWN", "coins": ["BTC", "ETH", "SOL", "XRP"], "max_ask": 0.44},
+    {"pattern": "DDDDD", "side": "UP",   "coins": ["BTC", "ETH"],               "max_ask": 0.52},
+    {"pattern": "DDDD",  "side": "UP",   "coins": ["BTC", "ETH"],               "max_ask": 0.48},
+    {"pattern": "DDD",   "side": "UP",   "coins": ["BTC", "ETH"],               "max_ask": 0.46},
+    {"pattern": "DD",    "side": "UP",   "coins": ["BTC", "ETH"],               "max_ask": 0.44},
+]
+# ============================================================================
+# END 15-MINUTE CUSTOM CONFIG
 # ============================================================================
 
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_DIR = SCRIPT_DIR.parent
 DATA_DIR = PROJECT_DIR / "data"
-TELONEX_FILE = DATA_DIR / "telonex_updown_5m.parquet"
+TELONEX_QUOTES_FILE = PROJECT_DIR / "telonex_data" / "cycles.parquet"
+TELONEX_QUOTES_15M_FILE = PROJECT_DIR / "telonex_data" / "cycles_15m.parquet"
 KLINE_CACHE = SCRIPT_DIR / "binance_klines_cache_bt.json"
 OUTPUT_DIR = SCRIPT_DIR / "pngs"
 COINS = ["BTC", "ETH", "SOL", "XRP"]
@@ -95,26 +138,26 @@ COIN_SYMBOL = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRP
 
 # Default rules (from mean_reversion.yaml — must stay in sync!)
 DEFAULT_RULES = [
-    {"pattern": "UUUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.56},
+    {"pattern": "UUUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.55},
     {
         "pattern": "UUUUU",
         "side": "DOWN",
         "coins": ["BTC", "SOL", "XRP"],
-        "max_ask": 0.56,
+        "max_ask": 0.55,
     },
-    {"pattern": "UUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.56},
+    {"pattern": "UUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.55},
     {
         "pattern": "UUUU",
         "side": "DOWN",
         "coins": ["BTC", "SOL", "XRP"],
-        "max_ask": 0.56,
+        "max_ask": 0.55,
     },
-    {"pattern": "UDUU", "side": "DOWN", "coins": ["BTC"], "max_ask": 0.56},
+    {"pattern": "UDUU", "side": "DOWN", "coins": ["BTC"], "max_ask": 0.55},
     {
         "pattern": "UUU",
         "side": "DOWN",
         "coins": ["BTC", "ETH", "SOL", "XRP"],
-        "max_ask": 0.56,
+        "max_ask": 0.55,
     },
 ]
 
@@ -137,13 +180,7 @@ def compute_rsi(close: np.ndarray, period: int = 14) -> np.ndarray:
     gain = np.where(delta > 0, delta, 0.0)
     loss = np.where(delta < 0, -delta, 0.0)
     # Seed: mean of first `period` deltas (indices 0..period-1)
-    avg_gain = np.mean(gain[:period])
-    avg_loss = np.mean(loss[:period])
-    # Wilder smoothing from index `period` onward
-    for i in range(period, len(delta)):
-        avg_gain = (avg_gain * (period - 1) + gain[i]) / period
-        avg_loss = (avg_loss * (period - 1) + loss[i]) / period
-    # To build the full array, re-run and store at each step.
+    # To build the full array, store RSI at each step.
     # Index mapping: delta[j] corresponds to close[j+1], so RSI at close[j+1]
     # is computed from deltas up to j.  The first valid RSI is at close[period].
     avg_g = np.mean(gain[:period])
@@ -408,6 +445,8 @@ def csv_build_cycles(raw: pd.DataFrame):
                 avg_up_bid = entry[up_bid_col].mean()
                 if 0.01 < avg_up_ask < 0.99:
                     up_ask_val = round(avg_up_ask, 4)
+                # NOTE: approximation — assumes down_ask = 1 - up_bid (zero spread).
+                # Real down_ask may be higher due to bid-ask spread on both sides.
                 down_ask = 1.0 - avg_up_bid
                 if 0.01 < down_ask < 0.99:
                     down_ask_val = round(down_ask, 4)
@@ -442,28 +481,57 @@ def csv_build_cycles(raw: pd.DataFrame):
     return seqs
 
 
-def find_trades_csv(seqs, rules, size=5.0, fee=0.0, engine=None):
-    """Find trades using CSV data with REAL entry prices.
+def find_trades_csv(seqs, rules, size=5.0, fee=0.0, engine=None, cycle_duration=300, shares_mode=False):
+    """Find trades using CSV/Telonex data with REAL entry prices.
 
-    Key differences from Telonex mode:
-    - Uses actual ask at t=5-8 as entry price (UP_ask for UP bets, DOWN_ask for DOWN bets)
-    - Applies max_ask filter against real price
-    - PnL uses real entry price (price improvement if ask < max_ask)
-    - None outcomes break pattern chains
-    - Supports per-rule indicator conditions via engine
+    Realistic fill simulation matching live bot behavior:
+      t=0s   market opens
+      t=1s   WS receives quotes
+      t=2s   pattern chain confirmed from previous market
+      t=3s   GTC limit order placed at max_ask
+      t=3-13s fill window — order rests on book
+      t=13s  order cancelled if not filled
+
+    Maker vs Taker detection (at t=3s, moment order is sent):
+      ask_first = first ask tick in t=3-13s window (what ask looks like at t~3s)
+      ask_min   = minimum ask in t=3-13s window (best price that appears later)
+
+      If ask_first <= max_ask:
+        -> Ask already at/below limit price -> order crosses spread -> TAKER
+        -> 2% fee: you buy shares but receive 2% fewer (implicit commission)
+        -> Entry at ask_first (immediate fill at market ask)
+      If ask_first > max_ask but ask_min <= max_ask:
+        -> Ask starts above limit but dips later -> order was resting -> MAKER
+        -> 0% fee: full shares received
+        -> Entry at max_ask (your limit price, can't fill above it)
+      If ask_min > max_ask:
+        -> Ask never reaches limit -> NO FILL
+
+    PnL formula (size = USDC invested):
+      shares = size / entry_price
+      effective_shares = shares * (1 - taker_fee)   # 0.98 if taker, 1.0 if maker
+      Win:  effective_shares * $1.00 - size
+      Lose: -size  (shares worth $0)
+
+    WARNING: The live bot (strategies/) treats `size` as number of SHARES,
+    not USDC invested.  Live cost = shares * fill_price.  This means backtest
+    PnL projections are ~2x the live bot's actual PnL when size=5 and
+    fill_price ~0.50.  Calibrate drawdown thresholds accordingly.
     """
     trades = []
     for coin, d in seqs.items():
         outcomes = d["outcomes"]
         dates = d["dates"]
         ts_arr = d["start_ts"]
-        up_asks = d["up_ask"]
-        down_asks = d["down_ask"]
+        up_asks = d["up_ask"]         # ask_first (first tick in fill window)
+        down_asks = d["down_ask"]     # ask_first
+        up_asks_min = d.get("up_ask_min")   # ask_min (minimum in fill window)
+        down_asks_min = d.get("down_ask_min")
         n = d["n"]
 
         for i in range(1, n):
             if outcomes[i] is None:
-                continue  # can't resolve this cycle
+                continue
 
             for rule in rules:
                 if coin not in rule["coins"]:
@@ -473,7 +541,11 @@ def find_trades_csv(seqs, rules, size=5.0, fee=0.0, engine=None):
                 if i < pl:
                     continue
 
-                # Check pattern: all prior outcomes must be non-None and match
+                # Gap detection: pattern cycles must be temporally contiguous
+                if ts_arr[i] - ts_arr[i - pl] > pl * cycle_duration + 60:
+                    continue
+
+                # Check pattern match
                 match = True
                 for j in range(pl):
                     prev = outcomes[i - pl + j]
@@ -483,33 +555,59 @@ def find_trades_csv(seqs, rules, size=5.0, fee=0.0, engine=None):
                 if not match:
                     continue
 
-                # Check per-rule conditions (pattern matched, now check indicators)
+                # Check per-rule indicator conditions
                 if rule.get("conditions") and engine:
                     if not engine.check_conditions(
                         rule["conditions"], coin, int(ts_arr[i])
                     ):
-                        continue  # condition failed, try next rule
+                        continue
 
-                # Get real entry price for the CORRECT side
+                # Get ask prices for the bet side
                 side = rule["side"]
-                entry_ask = up_asks[i] if side == "UP" else down_asks[i]
-                if np.isnan(entry_ask):
-                    break  # no price data, skip
+                ask_first = up_asks[i] if side == "UP" else down_asks[i]
+                if np.isnan(ask_first):
+                    continue
 
-                # max_ask filter: would we place the order?
-                if entry_ask > rule["max_ask"]:
-                    break  # too expensive, skip (first matching rule, so break)
+                # ask_min for fill check
+                if up_asks_min is not None and down_asks_min is not None:
+                    ask_min = up_asks_min[i] if side == "UP" else down_asks_min[i]
+                    if np.isnan(ask_min):
+                        ask_min = ask_first
+                else:
+                    ask_min = ask_first
 
-                # Trade executes at real entry_ask (price improvement!)
+                # Fill check: did ask ever dip to max_ask during t=3-13s?
+                if ask_min > rule["max_ask"]:
+                    continue  # no fill
+
+                # --- MAKER vs TAKER detection ---
+                # At t=3s when order is sent: is ask already <= limit?
+                if ask_first <= rule["max_ask"]:
+                    # ASK at/below limit -> instant cross -> TAKER
+                    is_taker = True
+                    taker_fee_rate = 0.02
+                    entry_ask = ask_first  # fill at current market ask
+                else:
+                    # ASK above limit -> order rests -> fills later as MAKER
+                    is_taker = False
+                    taker_fee_rate = 0.0
+                    entry_ask = rule["max_ask"]  # fill at limit price
+
                 actual = outcomes[i]
                 hit = (side == "DOWN" and actual == "D") or (
                     side == "UP" and actual == "U"
                 )
-
-                if hit:
-                    pnl = (1.0 - entry_ask) * size - fee * size
+                if shares_mode:
+                    # size = number of shares (matches live bot)
+                    shares = size
+                    cost = shares * entry_ask
+                    effective_shares = shares * (1.0 - taker_fee_rate)
+                    pnl = (effective_shares * 1.0 - cost) if hit else -cost
                 else:
-                    pnl = -entry_ask * size - fee * size
+                    # size = USDC invested (legacy backtest mode)
+                    shares = size / entry_ask
+                    effective_shares = shares * (1.0 - taker_fee_rate)
+                    pnl = (effective_shares * 1.0 - size) if hit else -size
 
                 trades.append(
                     {
@@ -523,6 +621,8 @@ def find_trades_csv(seqs, rules, size=5.0, fee=0.0, engine=None):
                         "outcome": actual,
                         "hit": hit,
                         "pnl": pnl,
+                        "is_taker": is_taker,
+                        "fee_paid": taker_fee_rate * effective_shares if is_taker else 0.0,
                     }
                 )
                 break  # first matching rule wins
@@ -530,7 +630,6 @@ def find_trades_csv(seqs, rules, size=5.0, fee=0.0, engine=None):
     if not trades:
         return pd.DataFrame()
     df = pd.DataFrame(trades).sort_values("start_ts").reset_index(drop=True)
-    # Assign cycle_idx: unique cycle timestamps in order
     unique_ts = sorted(df["start_ts"].unique())
     ts_to_idx = {ts: idx for idx, ts in enumerate(unique_ts)}
     df["cycle_idx"] = df["start_ts"].map(ts_to_idx)
@@ -538,87 +637,105 @@ def find_trades_csv(seqs, rules, size=5.0, fee=0.0, engine=None):
 
 
 # ---------------------------------------------------------------------------
-# Telonex loader
+# Telonex Quotes loader (cycles.parquet with real bid/ask from Telonex API)
 # ---------------------------------------------------------------------------
-def load_telonex():
-    df = pd.read_parquet(TELONEX_FILE)
-    df = df[df["result_id"].isin(["0", "1"])].copy()
-    df["coin"] = df["slug"].str.extract(r"^(\w+)-updown-5m-")[0].str.upper()
-    df["start_ts"] = df["slug"].str.extract(r"-(\d+)$")[0].astype(float).astype(int)
-    df["outcome"] = df["result_id"].map({"0": "U", "1": "D"})
-    df["start_dt"] = pd.to_datetime(df["start_ts"], unit="s", utc=True)
-    df["date"] = df["start_dt"].dt.date
-    df = df.sort_values(["coin", "start_ts"]).reset_index(drop=True)
+def load_telonex_quotes(coin_filter: str = None, quotes_file: Path = None) -> pd.DataFrame:
+    """Load cycles.parquet produced by telonex_data/build_cycles.py."""
+    qf = quotes_file or TELONEX_QUOTES_FILE
+    if not qf.exists():
+        print(f"  ERROR: {qf} not found")
+        print("  Run: python telonex_data/build_cycles.py")
+        sys.exit(1)
+    df = pd.read_parquet(qf)
+    if coin_filter:
+        df = df[df["coin"] == coin_filter.upper()]
+    df = df.sort_values(["coin", "cycle_ts"]).reset_index(drop=True)
     return df
 
 
-def build_sequences(tdf):
+def tq_build_cycles(df: pd.DataFrame):
+    """Build per-coin outcome sequences + real entry prices from Telonex quotes.
+
+    Entry prices use the realistic fill window (t=3-13s) matching live bot timing.
+    """
+    coin_data = {
+        c: {"outcomes": [], "dates": [], "start_ts": [], "up_ask": [], "down_ask": [],
+            "up_ask_min": [], "down_ask_min": []}
+        for c in COINS
+    }
+
+    for _, row in df.iterrows():
+        coin = row["coin"]
+        if coin not in coin_data:
+            continue
+
+        outcome = "U" if row["outcome"] == "UP" else "D"
+        ts = int(row["cycle_ts"])
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+
+        # Real ask prices from Telonex quotes (fill window t=3-13s)
+        # Use ask_min_3_13 as fill check (would limit order fill?),
+        # and ask_first_3_13 as entry price (conservative: first available price).
+        #
+        # Logic: bot places GTC limit at max_ask around t=3s.
+        # Fill happens when ask <= max_ask at any tick in t=3-13s.
+        # Fill price = ask at that moment (price improvement from CLOB).
+        #
+        # ask_min tells us IF the order fills (min ask <= max_ask?).
+        # ask_first is conservative entry price (first tick in window).
+        # In reality, fill price is somewhere between first and min.
+        # We use ask_first to avoid lookahead bias.
+
+        up_ask_first = row.get("up_ask_first_3_13")
+        down_ask_first = row.get("down_ask_first_3_13")
+        up_ask_min = row.get("up_ask_min_3_13")
+        down_ask_min = row.get("down_ask_min_3_13")
+
+        # Fallback to min if first not available
+        if pd.isna(up_ask_first) if up_ask_first is not None else True:
+            up_ask_first = up_ask_min
+        if pd.isna(down_ask_first) if down_ask_first is not None else True:
+            down_ask_first = down_ask_min
+
+        # Fallback to t=1-3s if fill window missing entirely
+        # NOTE: only for ask_min (fill check). Do NOT use as entry price
+        # to avoid lookahead bias (min in window is unknowable in advance).
+        if pd.isna(up_ask_min) if up_ask_min is not None else True:
+            up_ask_min = row.get("up_ask_min_1_3", np.nan)
+            if pd.isna(up_ask_first) if up_ask_first is not None else True:
+                up_ask_first = up_ask_min
+        if pd.isna(down_ask_min) if down_ask_min is not None else True:
+            down_ask_min = row.get("down_ask_min_1_3", np.nan)
+            if pd.isna(down_ask_first) if down_ask_first is not None else True:
+                down_ask_first = down_ask_min
+
+        up_ask = float(up_ask_first) if pd.notna(up_ask_first) else np.nan
+        down_ask = float(down_ask_first) if pd.notna(down_ask_first) else np.nan
+        up_ask_min_val = float(up_ask_min) if pd.notna(up_ask_min) else np.nan
+        down_ask_min_val = float(down_ask_min) if pd.notna(down_ask_min) else np.nan
+
+        coin_data[coin]["outcomes"].append(outcome)
+        coin_data[coin]["dates"].append(dt)
+        coin_data[coin]["start_ts"].append(ts)
+        coin_data[coin]["up_ask"].append(up_ask)
+        coin_data[coin]["down_ask"].append(down_ask)
+        coin_data[coin]["up_ask_min"].append(up_ask_min_val)
+        coin_data[coin]["down_ask_min"].append(down_ask_min_val)
+
     seqs = {}
     for coin in COINS:
-        c = tdf[tdf["coin"] == coin].sort_values("start_ts").reset_index(drop=True)
+        d = coin_data[coin]
         seqs[coin] = {
-            "outcomes": c["outcome"].values,
-            "dates": c["date"].values,
-            "start_ts": c["start_ts"].values,
-            "n": len(c),
+            "outcomes": d["outcomes"],
+            "dates": d["dates"],
+            "start_ts": d["start_ts"],
+            "up_ask": d["up_ask"],
+            "down_ask": d["down_ask"],
+            "up_ask_min": d["up_ask_min"],
+            "down_ask_min": d["down_ask_min"],
+            "n": len(d["outcomes"]),
         }
     return seqs
-
-
-# ---------------------------------------------------------------------------
-# Pattern matching engine
-# ---------------------------------------------------------------------------
-def find_trades(seqs, rules, size=5.0, fee=0.0, engine=None):
-    trades = []
-    for coin, d in seqs.items():
-        out, dates, ts, n = d["outcomes"], d["dates"], d["start_ts"], d["n"]
-        for i in range(1, n):
-            for rule in rules:
-                if coin not in rule["coins"]:
-                    continue
-                pat = list(rule["pattern"])
-                pl = len(pat)
-                if i < pl:
-                    continue
-                if any(out[i - pl + j] != pat[j] for j in range(pl)):
-                    continue
-                # Check per-rule conditions (pattern matched, now check indicators)
-                if rule.get("conditions") and engine:
-                    if not engine.check_conditions(
-                        rule["conditions"], coin, int(ts[i])
-                    ):
-                        continue  # condition failed, try next rule
-                side, ma = rule["side"], rule["max_ask"]
-                actual = out[i]
-                hit = (side == "DOWN" and actual == "D") or (
-                    side == "UP" and actual == "U"
-                )
-                pnl = (
-                    ((1.0 - ma) * size - fee * size)
-                    if hit
-                    else (-ma * size - fee * size)
-                )
-                trades.append(
-                    {
-                        "coin": coin,
-                        "date": dates[i],
-                        "start_ts": int(ts[i]),
-                        "pattern": rule["pattern"],
-                        "side": side,
-                        "max_ask": ma,
-                        "outcome": actual,
-                        "hit": hit,
-                        "pnl": pnl,
-                    }
-                )
-                break
-    if not trades:
-        return pd.DataFrame()
-    df = pd.DataFrame(trades).sort_values("start_ts").reset_index(drop=True)
-    unique_ts = sorted(df["start_ts"].unique())
-    ts_to_idx = {ts: idx for idx, ts in enumerate(unique_ts)}
-    df["cycle_idx"] = df["start_ts"].map(ts_to_idx)
-    return df
 
 
 # ---------------------------------------------------------------------------
@@ -742,14 +859,25 @@ class IndicatorEngine:
         return np.nan
 
     def get_percentile(
-        self, symbol: str, tf: str, col: str, pct: float
+        self, symbol: str, tf: str, col: str, pct: float,
+        current_ts: Optional[int] = None,
     ) -> float:
-        """Get percentile value for a column from all kline data."""
+        """Get percentile value for a column from kline data.
+
+        If current_ts is provided, only uses data up to that timestamp
+        (expanding window) to avoid lookahead bias.  Otherwise uses all data.
+        """
         key = (symbol, tf)
         kl = self._klines.get(key)
         if kl is None or col not in kl.columns:
             return np.nan
-        return float(kl[col].dropna().quantile(pct / 100.0))
+        if current_ts is not None and "ts_s" in kl.columns:
+            series = kl.loc[kl["ts_s"] <= current_ts, col].dropna()
+        else:
+            series = kl[col].dropna()
+        if series.empty:
+            return np.nan
+        return float(series.quantile(pct / 100.0))
 
     def prepare_for_rules(self, rules: List[dict]):
         """Pre-fetch klines and compute all indicators needed by rule conditions."""
@@ -787,13 +915,14 @@ class IndicatorEngine:
                 return False
 
             # Resolve threshold (fixed or percentile-based)
+            # Pass current_ts to avoid lookahead bias (expanding window)
             threshold = cond.get("threshold")
             if threshold is None and "threshold_pct" in cond:
                 pct = cond["threshold_pct"]
                 if isinstance(pct, list):
-                    threshold = [self.get_percentile(sym, tf, col, p) for p in pct]
+                    threshold = [self.get_percentile(sym, tf, col, p, current_ts=ts) for p in pct]
                 else:
-                    threshold = self.get_percentile(sym, tf, col, pct)
+                    threshold = self.get_percentile(sym, tf, col, pct, current_ts=ts)
                 if threshold is None:
                     return False
                 if isinstance(threshold, float) and np.isnan(threshold):
@@ -844,14 +973,29 @@ def _col_name(f):
 def apply_filters(trades_df, filters, engine):
     if trades_df.empty or not filters:
         return trades_df.copy()
-    for tf in set(f.get("timeframe", "5m") for f in filters):
-        engine.ensure_timeframe(tf, filters, symbol="BTCUSDT")
+    # Ensure klines are fetched for ALL coin symbols in the trades, not just BTCUSDT
+    coin_symbols = set()
+    if "coin" in trades_df.columns:
+        for c in trades_df["coin"].unique():
+            coin_symbols.add(COIN_SYMBOL.get(c, "BTCUSDT"))
+    if not coin_symbols:
+        coin_symbols = {"BTCUSDT"}
+    for sym in coin_symbols:
+        for tf in set(f.get("timeframe", "5m") for f in filters):
+            engine.ensure_timeframe(tf, filters, symbol=sym)
     df = trades_df.copy()
     df["_pass"] = True
     for filt in filters:
         tf = filt.get("timeframe", "5m")
         col = _col_name(filt)
-        vals = df["start_ts"].apply(lambda ts: engine.get_value(tf, ts, col))
+        # Use coin-specific symbol for each trade row
+        vals = df.apply(
+            lambda row: engine.get_value(
+                tf, row["start_ts"], col,
+                symbol=COIN_SYMBOL.get(row.get("coin", "BTC"), "BTCUSDT"),
+            ),
+            axis=1,
+        )
         if filt["condition"] == "<":
             df["_pass"] = df["_pass"] & (vals < filt["threshold"])
         else:
@@ -863,6 +1007,23 @@ def apply_filters(trades_df, filters, engine):
 # ---------------------------------------------------------------------------
 # Stats helpers
 # ---------------------------------------------------------------------------
+def _benjamini_hochberg(pvals: List[float]) -> List[float]:
+    """Benjamini-Hochberg FDR correction for multiple testing."""
+    n = len(pvals)
+    if n == 0:
+        return []
+    indexed = sorted(enumerate(pvals), key=lambda x: x[1])
+    adjusted = [0.0] * n
+    prev = 1.0
+    for rank_from_end, (orig_idx, p) in enumerate(reversed(indexed)):
+        rank = n - rank_from_end  # 1-indexed rank
+        adj = min(prev, p * n / rank)
+        adj = min(adj, 1.0)
+        adjusted[orig_idx] = adj
+        prev = adj
+    return adjusted
+
+
 def stats(df):
     if df.empty:
         return {
@@ -873,6 +1034,12 @@ def stats(df):
             "dd": 0,
             "days": 0,
             "pos_days": 0,
+            "n_maker": 0,
+            "n_taker": 0,
+            "maker_pnl": 0,
+            "taker_pnl": 0,
+            "fees_paid": 0,
+            "max_consec_loss": 0,
         }
     n = len(df)
     wins = df["hit"].sum()
@@ -881,6 +1048,29 @@ def stats(df):
     cum = np.cumsum(df["pnl"].values)
     dd = float(np.max(np.maximum.accumulate(cum) - cum)) if len(cum) else 0
     ndays = len(daily)
+
+    # Maker/taker breakdown (only if column exists)
+    if "is_taker" in df.columns:
+        taker_mask = df["is_taker"]
+        n_taker = int(taker_mask.sum())
+        n_maker = n - n_taker
+        maker_pnl = float(df.loc[~taker_mask, "pnl"].sum())
+        taker_pnl = float(df.loc[taker_mask, "pnl"].sum())
+        fees_paid = float(df["fee_paid"].sum()) if "fee_paid" in df.columns else 0
+    else:
+        n_maker, n_taker = n, 0
+        maker_pnl, taker_pnl, fees_paid = pnl, 0, 0
+
+    # Max consecutive losses
+    max_cl = 0
+    cur_cl = 0
+    for h in df["hit"].values:
+        if not h:
+            cur_cl += 1
+            max_cl = max(max_cl, cur_cl)
+        else:
+            cur_cl = 0
+
     return {
         "n": n,
         "wr": wins / n,
@@ -889,6 +1079,12 @@ def stats(df):
         "dd": dd,
         "days": ndays,
         "pos_days": (daily > 0).sum(),
+        "n_maker": n_maker,
+        "n_taker": n_taker,
+        "maker_pnl": maker_pnl,
+        "taker_pnl": taker_pnl,
+        "fees_paid": fees_paid,
+        "max_consec_loss": max_cl,
     }
 
 
@@ -898,9 +1094,17 @@ def print_stats(label, s):
         f"    Trades: {s['n']:,}  |  WR: {s['wr'] * 100:.1f}%  |  PnL: ${s['pnl']:+,.2f}"
     )
     print(
-        f"    Daily: ${s['daily']:+.2f}/day  |  Max DD: ${s['dd']:.2f}  |  "
-        f"Profitable days: {s['pos_days']}/{s['days']}"
+        f"    $/dia: ${s['daily']:+.2f}  |  Max DD: ${s['dd']:.2f}  |  "
+        f"Dias verdes: {s['pos_days']}/{s['days']}  |  Max rachas rojas: {s['max_consec_loss']}"
     )
+    if s["n_taker"] > 0 or s["n_maker"] < s["n"]:
+        mkr_pct = s["n_maker"] / s["n"] * 100 if s["n"] else 0
+        tkr_pct = s["n_taker"] / s["n"] * 100 if s["n"] else 0
+        print(
+            f"    Maker: {s['n_maker']} ({mkr_pct:.0f}%) ${s['maker_pnl']:+.2f}  |  "
+            f"Taker: {s['n_taker']} ({tkr_pct:.0f}%) ${s['taker_pnl']:+.2f}  |  "
+            f"Fees: ${s['fees_paid']:.2f}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -924,7 +1128,10 @@ def _esc(s: str) -> str:
 
 
 def plot_curves(
-    results: List[Tuple[str, pd.DataFrame]], output_file: Path, title: str = ""
+    results: List[Tuple[str, pd.DataFrame]],
+    output_file: Path,
+    title: str = "",
+    rules_text: str = "",
 ):
     if not HAS_MPL:
         print("  (matplotlib not installed, skipping plot)")
@@ -980,7 +1187,16 @@ def plot_curves(
         ax.legend(loc="upper left", fontsize=9)
         ax.grid(True, alpha=0.3)
 
+        if rules_text:
+            fig.text(
+                0.99, 0.01, rules_text,
+                fontsize=6.5, fontfamily="monospace",
+                verticalalignment="bottom", horizontalalignment="right",
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="wheat", alpha=0.7),
+            )
+
         plt.tight_layout()
+        fig.subplots_adjust(bottom=max(0.12, 0.04 + 0.018 * rules_text.count("\n")) if rules_text else 0.12)
         fig.savefig(str(output_file), dpi=150, bbox_inches="tight")
         plt.close(fig)
     else:
@@ -1022,7 +1238,7 @@ def plot_curves(
         ax_eq.axhline(0, color="black", lw=0.5)
         ax_eq.set_ylabel("Cumulative PnL ($)", fontsize=12)
         ax_eq.set_title(
-            title or "Backtest Comparison — Telonex 74 days",
+            title or "Backtest Comparison — Telonex Quotes",
             fontsize=13,
             fontweight="bold",
         )
@@ -1039,7 +1255,17 @@ def plot_curves(
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
             ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
         fig.autofmt_xdate(rotation=45)
+
+        if rules_text:
+            fig.text(
+                0.99, 0.01, rules_text,
+                fontsize=6.5, fontfamily="monospace",
+                verticalalignment="bottom", horizontalalignment="right",
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="wheat", alpha=0.7),
+            )
+
         plt.tight_layout()
+        fig.subplots_adjust(bottom=max(0.18, 0.10 + 0.018 * rules_text.count("\n")) if rules_text else 0.18)
         fig.savefig(str(output_file), dpi=150, bbox_inches="tight")
         plt.close(fig)
 
@@ -1137,16 +1363,16 @@ STRATEGY_NO_UUU = [  # Drop UUU entirely (lowest edge), keep UUUU+
         "pattern": "UUUUU",
         "side": "DOWN",
         "coins": ["BTC", "SOL", "XRP"],
-        "max_ask": 0.52,
+        "max_ask": 0.55,
     },
     {"pattern": "UUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.55},
     {
         "pattern": "UUUU",
         "side": "DOWN",
         "coins": ["BTC", "SOL", "XRP"],
-        "max_ask": 0.52,
+        "max_ask": 0.55,
     },
-    {"pattern": "UDUU", "side": "DOWN", "coins": ["BTC"], "max_ask": 0.51},
+    {"pattern": "UDUU", "side": "DOWN", "coins": ["BTC"], "max_ask": 0.55},
 ]
 
 RSI7_60 = [
@@ -1186,7 +1412,7 @@ RSI14_60 = [
 # ---------------------------------------------------------------------------
 V2_RULES = [
     # === ETH buy DOWN (after UP streaks) ===
-    {"pattern": "DUUUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.56},
+    {"pattern": "DUUUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.55},
     {"pattern": "DDUUUU", "side": "DOWN", "coins": ["ETH"], "max_ask": 0.55},
     # UUUUU with low volatility (bottom tercile vol_1h)
     {
@@ -1263,13 +1489,13 @@ V2_RULES = [
         ],
     },
     # DDDD plain
-    {"pattern": "DDDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.52},
+    {"pattern": "DDDD", "side": "UP", "coins": ["ETH"], "max_ask": 0.55},
     # DDD with RSI(7) < 40
     {
         "pattern": "DDD",
         "side": "UP",
         "coins": ["ETH"],
-        "max_ask": 0.50,
+        "max_ask": 0.55,
         "conditions": [
             {
                 "indicator": "RSI",
@@ -1281,6 +1507,9 @@ V2_RULES = [
         ],
     },
     # === BTC ===
+    # Longest patterns first (6-char before 4-char)
+    {"pattern": "DUDUDD", "side": "UP", "coins": ["BTC"], "max_ask": 0.55},
+    {"pattern": "DDUDDU", "side": "UP", "coins": ["BTC"], "max_ask": 0.55},
     # DDDD with low volatility
     {
         "pattern": "DDDD",
@@ -1296,14 +1525,12 @@ V2_RULES = [
             }
         ],
     },
-    {"pattern": "DUDUDD", "side": "UP", "coins": ["BTC"], "max_ask": 0.55},
-    {"pattern": "DDUDDU", "side": "UP", "coins": ["BTC"], "max_ask": 0.55},
     # UU with RSI(7) > 70 (overbought confirmation)
     {
         "pattern": "UU",
         "side": "DOWN",
         "coins": ["BTC"],
-        "max_ask": 0.50,
+        "max_ask": 0.55,
         "conditions": [
             {
                 "indicator": "RSI",
@@ -1315,7 +1542,7 @@ V2_RULES = [
         ],
     },
     # === SOL ===
-    {"pattern": "DUUUU", "side": "DOWN", "coins": ["SOL"], "max_ask": 0.52},
+    {"pattern": "DUUUU", "side": "DOWN", "coins": ["SOL"], "max_ask": 0.55},
 ]
 
 # V2 without conditions — same patterns but no indicator filters (for comparison)
@@ -1505,7 +1732,14 @@ def _run_pattern_mode(args):
 
     pattern = args.pattern.upper()
     use_csv = args.csv
-    mode_str = "CSV (real prices)" if use_csv else "Telonex (74 days)"
+    is_15m = getattr(args, "fifteen_min", False)
+    cycle_duration = 900 if is_15m else 300
+    tq_file = TELONEX_QUOTES_15M_FILE if is_15m else TELONEX_QUOTES_FILE
+    cycle_label = "15m" if is_15m else "5m"
+    if use_csv:
+        mode_str = "CSV (real prices)"
+    else:
+        mode_str = f"Telonex Quotes {cycle_label} (real bid/ask)"
     size = args.size
     fee = args.fee
 
@@ -1537,20 +1771,22 @@ def _run_pattern_mode(args):
         for c in COINS:
             all_ts.extend(seqs[c]["start_ts"])
         ts_min, ts_max = min(all_ts), max(all_ts)
-        trade_finder = find_trades_csv
     else:
-        print(f"\n  Loading Telonex data...")
-        tdf = load_telonex()
-        seqs = build_sequences(tdf)
-        n_markets = len(tdf)
-        date_min, date_max = tdf["date"].min(), tdf["date"].max()
+        coin_filter = args.coin if args.coin and args.coin.upper() != "ALL" else None
+        print(f"\n  Loading Telonex quotes ({tq_file.name})...")
+        tq_df = load_telonex_quotes(coin_filter, quotes_file=tq_file)
+        n_markets = len(tq_df)
+        tq_df["_dt"] = pd.to_datetime(tq_df["cycle_ts"], unit="s", utc=True)
+        date_min = tq_df["_dt"].min().date()
+        date_max = tq_df["_dt"].max().date()
         ndays_total = (date_max - date_min).days + 1
-        print(
-            f"  {n_markets:,} markets | {date_min} to {date_max} ({ndays_total} days)"
-        )
-        ts_min = int(tdf["start_ts"].min())
-        ts_max = int(tdf["start_ts"].max())
-        trade_finder = find_trades
+        print(f"  {n_markets:,} cycles | {date_min} to {date_max} ({ndays_total} days)")
+        seqs = tq_build_cycles(tq_df)
+        all_ts = []
+        for c in COINS:
+            all_ts.extend(seqs[c]["start_ts"])
+        ts_min, ts_max = min(all_ts), max(all_ts)
+    trade_finder = find_trades_csv
 
     engine = IndicatorEngine(ts_min, ts_max)
 
@@ -1565,50 +1801,61 @@ def _run_pattern_mode(args):
         show_rsi_comparison = False
 
     print(
-        f"\n  {'MaxAsk':>8} {'Trades':>7} {'Wins':>6} {'WR':>6} {'PnL':>10} {'$/day':>8} {'MaxDD':>8} {'p-value':>10} {'Sig?':>5}"
+        f"\n  {'MaxAsk':>8} {'Trades':>7} {'Wins':>6} {'WR':>6} {'PnL':>10} {'$/day':>8} {'MaxDD':>8} {'p-value':>10} {'p-adj':>10} {'Sig?':>5}"
     )
     print(
-        f"  {'-' * 8} {'-' * 7} {'-' * 6} {'-' * 6} {'-' * 10} {'-' * 8} {'-' * 8} {'-' * 10} {'-' * 5}"
+        f"  {'-' * 8} {'-' * 7} {'-' * 6} {'-' * 6} {'-' * 10} {'-' * 8} {'-' * 8} {'-' * 10} {'-' * 10} {'-' * 5}"
     )
 
     best_pnl = -9999
     best_ma = None
     best_trades_df = None
 
+    # Collect all sweep results first, then apply BH correction
+    sweep_rows = []
     for ma in ma_values:
         rules = [{"pattern": pattern, "side": side, "coins": coins, "max_ask": ma}]
-        trades = trade_finder(seqs, rules, size=size, fee=fee)
+        trades = trade_finder(seqs, rules, size=size, fee=fee, cycle_duration=cycle_duration, shares_mode=is_15m)
         s = stats(trades)
         n, wr = s["n"], s["wr"]
 
         # Statistical significance via binomial test
-        if n > 0:
+        # H0: WR = max_ask (breakeven for binary options), not 0.5
+        if n >= MIN_TRADES:
             wins = int(trades["hit"].sum())
-            bt = binomtest(wins, n, 0.5, alternative="greater")
+            bt = binomtest(wins, n, ma, alternative="greater")
             pval = bt.pvalue
-            sig = (
-                "***"
-                if pval < 0.001
-                else "**"
-                if pval < 0.01
-                else "*"
-                if pval < 0.05
-                else ""
-            )
         else:
             pval = 1.0
-            sig = ""
 
-        marker = " <--" if s["pnl"] > best_pnl and n > 0 else ""
-        print(
-            f"  ${ma:.2f}   {n:>7,} {int(n * wr):>6} {wr * 100:>5.1f}% ${s['pnl']:>+9.2f} "
-            f"${s['daily']:>+7.2f} ${s['dd']:>7.2f}  {pval:>9.6f} {sig:>5}{marker}"
-        )
+        sweep_rows.append({"ma": ma, "n": n, "wr": wr, "s": s, "pval": pval, "trades": trades})
 
         if n > 0 and s["pnl"] > best_pnl:
             best_pnl = s["pnl"]
             best_ma = ma
             best_trades_df = trades
+
+    # Benjamini-Hochberg FDR correction across all max_ask tests
+    raw_pvals = [r["pval"] for r in sweep_rows]
+    adj_pvals = _benjamini_hochberg(raw_pvals)
+
+    for row, adj_p in zip(sweep_rows, adj_pvals):
+        ma, n, wr, s, pval = row["ma"], row["n"], row["wr"], row["s"], row["pval"]
+        if n < MIN_TRADES:
+            sig = "n/s" if n > 0 else ""
+        else:
+            sig = (
+                "***" if adj_p < 0.001
+                else "**" if adj_p < 0.01
+                else "*" if adj_p < 0.05
+                else ""
+            )
+        marker = " <--" if n > 0 and s["pnl"] >= best_pnl and best_pnl > -9999 else ""
+        print(
+            f"  ${ma:.2f}   {n:>7,} {int(n * wr):>6} {wr * 100:>5.1f}% ${s['pnl']:>+9.2f} "
+            f"${s['daily']:>+7.2f} ${s['dd']:>7.2f}  {pval:>9.6f}  {adj_p:>9.6f} {sig:>5}{marker}"
+        )
+    print(f"\n  (p-adj = Benjamini-Hochberg FDR-corrected across {len(ma_values)} tests)")
 
     # --- Per-coin breakdown at best max_ask ---
     if best_trades_df is not None and not best_trades_df.empty:
@@ -1628,18 +1875,23 @@ def _run_pattern_mode(args):
                 w = int(sub["hit"].sum())
                 wr = w / n
                 pnl = sub["pnl"].sum()
-                bt = binomtest(w, n, 0.5, alternative="greater")
-                sig = (
-                    "***"
-                    if bt.pvalue < 0.001
-                    else "**"
-                    if bt.pvalue < 0.01
-                    else "*"
-                    if bt.pvalue < 0.05
-                    else ""
-                )
+                if n >= MIN_TRADES:
+                    bt = binomtest(w, n, best_ma, alternative="greater")
+                    sig = (
+                        "***"
+                        if bt.pvalue < 0.001
+                        else "**"
+                        if bt.pvalue < 0.01
+                        else "*"
+                        if bt.pvalue < 0.05
+                        else ""
+                    )
+                    pval_str = f"{bt.pvalue:>9.6f}"
+                else:
+                    sig = "n/s" if n > 0 else ""
+                    pval_str = "      n/s"
                 print(
-                    f"  {coin:<6} {n:>7} {w:>6} {wr * 100:>5.1f}% ${pnl:>+9.2f}  {bt.pvalue:>9.6f} {sig}"
+                    f"  {coin:<6} {n:>7} {w:>6} {wr * 100:>5.1f}% ${pnl:>+9.2f}  {pval_str} {sig}"
                 )
 
         # --- Weekly stability ---
@@ -1689,7 +1941,7 @@ def _run_pattern_mode(args):
         if show_rsi_comparison and args.max_ask is not None:
             ma = args.max_ask
             rules = [{"pattern": pattern, "side": side, "coins": coins, "max_ask": ma}]
-            base_trades = trade_finder(seqs, rules, size=size, fee=fee)
+            base_trades = trade_finder(seqs, rules, size=size, fee=fee, cycle_duration=cycle_duration, shares_mode=is_15m)
 
             rsi_configs = [
                 ("No filter", []),
@@ -1755,6 +2007,12 @@ def main():
         help="Use real 1-second CSV data (data/prices_*.csv)",
     )
     parser.add_argument(
+        "--15m",
+        dest="fifteen_min",
+        action="store_true",
+        help="Use 15-minute cycle data (cycles_15m.parquet). Implies --tq. Uses CUSTOM_RULES_15M with --custom.",
+    )
+    parser.add_argument(
         "--preset",
         default="default",
         help="Preset to run: default, rsi7, maxask, indicators, all",
@@ -1763,6 +2021,12 @@ def main():
         "--custom",
         action="store_true",
         help="Run only the custom config defined at top of file",
+    )
+    parser.add_argument(
+        "--cross-tf",
+        dest="cross_tf",
+        action="store_true",
+        help="With --custom: run CUSTOM_RULES_15M on 5m data (cross-timeframe test)",
     )
     parser.add_argument("--list", action="store_true", help="List available presets")
     parser.add_argument(
@@ -1795,6 +2059,9 @@ def main():
     )
     args = parser.parse_args()
 
+    is_15m = getattr(args, "fifteen_min", False)
+    cycle_duration = 900 if is_15m else 300
+
     if args.list:
         print("Available presets:")
         for name, preset in PRESETS.items():
@@ -1816,7 +2083,9 @@ def main():
         return
 
     use_csv = args.csv
-    mode_str = "CSV (real prices)" if use_csv else "Telonex (74 days)"
+    tq_file = TELONEX_QUOTES_15M_FILE if is_15m else TELONEX_QUOTES_FILE
+    cycle_label = "15m" if is_15m else "5m"
+    mode_str = "CSV (real prices)" if use_csv else f"Telonex Quotes {cycle_label} (real bid/ask)"
 
     # Load data
     print("=" * 80)
@@ -1834,22 +2103,37 @@ def main():
         for c in COINS:
             det = sum(1 for o in seqs[c]["outcomes"] if o is not None)
             print(f"    {c}: {seqs[c]['n']:,} cycles ({det} with clear outcome)")
-        # ts range for indicator engine
         all_ts = []
         for c in COINS:
             all_ts.extend(seqs[c]["start_ts"])
         ts_min, ts_max = min(all_ts), max(all_ts)
     else:
-        print(f"\n  Loading Telonex data...")
-        tdf = load_telonex()
-        seqs = build_sequences(tdf)
-        n_markets = len(tdf)
-        date_min, date_max = tdf["date"].min(), tdf["date"].max()
-        print(f"  {n_markets:,} markets | {date_min} to {date_max}")
+        coin_filter = args.coin if args.coin and args.coin.upper() != "ALL" else None
+        print(f"\n  Loading Telonex quotes ({tq_file.name})...")
+        tq_df = load_telonex_quotes(coin_filter, quotes_file=tq_file)
+        n_markets = len(tq_df)
+        tq_df["_dt"] = pd.to_datetime(tq_df["cycle_ts"], unit="s", utc=True)
+        date_min = tq_df["_dt"].min().date()
+        date_max = tq_df["_dt"].max().date()
+        ndays = (date_max - date_min).days + 1
+        print(f"  {n_markets:,} cycles | {date_min} to {date_max} ({ndays} days)")
+        for side in ["down", "up"]:
+            col = f"{side}_ask_min_3_13"
+            if col in tq_df.columns:
+                valid = tq_df[col].notna().sum()
+                print(f"    {col}: {valid}/{n_markets} ({valid/n_markets*100:.0f}%)")
+        seqs = tq_build_cycles(tq_df)
         for c in COINS:
-            print(f"    {c}: {seqs[c]['n']:,}")
-        ts_min = int(tdf["start_ts"].min())
-        ts_max = int(tdf["start_ts"].max())
+            if seqs[c]["n"] > 0:
+                print(f"    {c}: {seqs[c]['n']:,} cycles")
+        all_ts = []
+        for c in COINS:
+            all_ts.extend(seqs[c]["start_ts"])
+        if all_ts:
+            ts_min, ts_max = min(all_ts), max(all_ts)
+        else:
+            print("  ERROR: No cycle data found")
+            return
 
     engine = IndicatorEngine(ts_min, ts_max)
 
@@ -1894,16 +2178,27 @@ def main():
         size = args.size
         fee = args.fee
     elif args.custom:
-        configs = [
-            ("Baseline (no filter)", DEFAULT_RULES, []),
-            (CUSTOM_LABEL, CUSTOM_RULES, CUSTOM_FILTERS),
-        ]
+        if is_15m:
+            configs = [
+                (CUSTOM_LABEL_15M, CUSTOM_RULES_15M, []),
+            ]
+            preset_name = "custom_15m"
+        elif args.cross_tf:
+            configs = [
+                (CUSTOM_LABEL_15M + " [on 5m data]", CUSTOM_RULES_15M, []),
+            ]
+            preset_name = "custom_15m_on_5m"
+        else:
+            configs = [
+                ("Baseline (no filter)", DEFAULT_RULES, []),
+                (CUSTOM_LABEL, CUSTOM_RULES, CUSTOM_FILTERS),
+            ]
+            preset_name = "csv_custom" if use_csv else "custom"
         # In custom mode, use CUSTOM_SIZE/CUSTOM_FEE from the config section
         # at the top of this file.  CLI --size/--fee override if explicitly set.
         size = CUSTOM_SIZE
         fee = CUSTOM_FEE
         title = f"Custom Backtest ({mode_str}) | ${size}/trade"
-        preset_name = "csv_custom" if use_csv else "custom"
     else:
         preset = PRESETS.get(args.preset)
         if not preset:
@@ -1918,7 +2213,8 @@ def main():
         fee = args.fee
 
     # Choose the right trade finder
-    trade_finder = find_trades_csv if use_csv else find_trades
+    # --tq uses same trade finder as CSV (both have real ask prices)
+    trade_finder = find_trades_csv
 
     # Check if any config has per-rule conditions
     has_conditions = False
@@ -1972,7 +2268,8 @@ def main():
 
         # Pass engine to trade finder when rules have conditions
         use_engine = engine if any(r.get("conditions") for r in rules) else None
-        trades = trade_finder(seqs, rules, size=size, fee=fee, engine=use_engine)
+        trades = trade_finder(seqs, rules, size=size, fee=fee, engine=use_engine,
+                              cycle_duration=cycle_duration, shares_mode=is_15m)
         if filters and not trades.empty:
             trades = apply_filters(trades, filters, engine)
         s = stats(trades)
@@ -2062,9 +2359,23 @@ def main():
             w = sub["hit"].sum()
             print(f"  {coin:<6} {n:>7} {w / n * 100:>5.1f}% ${sub['pnl'].sum():>+9.2f}")
 
+    # Build rules text for the plot annotation (use best/last non-baseline config)
+    rules_text = ""
+    for cfg_label, cfg_rules, cfg_filters in reversed(configs):
+        if "baseline" in cfg_label.lower():
+            continue
+        lines = []
+        for r in cfg_rules:
+            coins = r.get("coins", ["ALL"])
+            coins_str = ",".join(coins) if isinstance(coins, list) else str(coins)
+            side = r.get("side", "?").upper()
+            lines.append(f"{r['pattern']:<7} -> {side:<4} [{coins_str:<15}] max={r.get('max_ask', '?')}")
+        rules_text = "\n".join(lines)
+        break
+
     # Plot
     out = Path(args.output) if args.output else OUTPUT_DIR / f"equity_{preset_name}.png"
-    plot_curves(results, out, title)
+    plot_curves(results, out, title, rules_text=rules_text)
 
     print(f"\n  Done! Open the plot: {out}")
 

@@ -1,5 +1,5 @@
 """
-Mean-Reversion V2 — Clean Pattern Strategy for 5-Min Up/Down Markets
+Mean-Reversion V2 — Clean Pattern Strategy for 5-Min / 15-Min Up/Down Markets
 
 Config-driven multi-pattern strategy. Each rule specifies:
 pattern, side, coins, and per-rule max_ask. No indicator conditions,
@@ -57,8 +57,8 @@ COINS: List[str] = ["BTC", "ETH", "SOL", "XRP"]
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "mean_reversion_v2.yaml"
 DEFAULT_TRADE_LOG = Path(__file__).resolve().parent.parent / "meanrev_v2_trades.txt"
 
-# Outcome inference thresholds (last 5s of 300s cycle)
-INFERENCE_TIME = 295
+# Outcome inference thresholds (last 5s of cycle)
+# INFERENCE_TIME is now dynamic via StrategyConfig.inference_time
 CERTAIN_UP_ASK = 0.99
 CERTAIN_DOWN_ASK = 0.01
 GAMMA_RECHECK_INITIAL_DELAY = 15
@@ -150,6 +150,7 @@ class StrategyConfig:
     dry_run: bool = False
     name: str = ""
     coins: Optional[List[str]] = None
+    interval: str = "5m"
     entry_window_start: int = ENTRY_WINDOW_START
     entry_window_end: int = ENTRY_WINDOW_END
     cancel_timeout: float = 10.0
@@ -161,6 +162,14 @@ class StrategyConfig:
     dd_cooldown_minutes: float = 15.0
     # Trade log
     trade_log: str = ""
+
+    @property
+    def cycle_duration(self) -> int:
+        return 300 if self.interval == "5m" else 900
+
+    @property
+    def inference_time(self) -> int:
+        return self.cycle_duration - 5
 
     @classmethod
     def from_yaml(
@@ -194,6 +203,7 @@ class StrategyConfig:
             dry_run=dry_run,
             name=name,
             coins=[c.upper() for c in raw.get("coins", [])] or None,
+            interval=str(raw.get("interval", "5m")),
             entry_window_start=int(raw.get("entry_window_start", ENTRY_WINDOW_START)),
             entry_window_end=int(raw.get("entry_window_end", ENTRY_WINDOW_END)),
             cancel_timeout=float(raw.get("cancel_timeout", 10.0)),
@@ -208,6 +218,8 @@ class StrategyConfig:
         return cfg
 
     def validate(self) -> None:
+        if self.interval not in ("5m", "15m"):
+            raise ValueError(f"interval must be '5m' or '15m', got '{self.interval}'")
         if self.size < 5:
             raise ValueError(f"size must be >= 5, got {self.size}")
         if not self.rules:
@@ -460,7 +472,7 @@ class PatternStrategy:
                 coin=coin,
                 market_check_interval=cfg.market_check_interval,
                 auto_switch_market=True,
-                interval="5m",
+                interval=cfg.interval,
             )
 
         # Cycle state
@@ -673,7 +685,7 @@ class PatternStrategy:
             side_label = "UP" if rule.buy_side == "up" else "DOWN"
             log(f"    {rule.pattern:<8} {side_label:<5} {coins_str:<12} @{rule.max_ask:.2f}")
         log(
-            f"  infer: t>={INFERENCE_TIME}s, UP>={CERTAIN_UP_ASK:.2f}, "
+            f"  infer: t>={self.cfg.inference_time}s, UP>={CERTAIN_UP_ASK:.2f}, "
             f"DOWN<={CERTAIN_DOWN_ASK:.2f}"
         )
         if self._drawdown.enabled:
@@ -726,7 +738,7 @@ class PatternStrategy:
                     break
                 attempts += 1
                 if attempts >= 5:
-                    log(f"  {coin}: no active 5m market after 5 tries", "error")
+                    log(f"  {coin}: no active {self.cfg.interval} market after 5 tries", "error")
                     break
                 log(f"  {coin}: retrying in 2s...", "warning")
                 await asyncio.sleep(2)
@@ -979,9 +991,8 @@ class PatternStrategy:
     # ------------------------------------------------------------------
     # Outcome inference
     # ------------------------------------------------------------------
-    @staticmethod
-    def _slug_for_cycle(coin: str, cycle_ts: int) -> str:
-        return f"{coin.lower()}-updown-5m-{cycle_ts}"
+    def _slug_for_cycle(self, coin: str, cycle_ts: int) -> str:
+        return f"{coin.lower()}-updown-{self.cfg.interval}-{cycle_ts}"
 
     @staticmethod
     def _winner_to_outcome(winner: Optional[str]) -> Optional[str]:
@@ -2028,7 +2039,7 @@ class PatternStrategy:
         if len(parts) == 2:
             ts_suffix = parts[1]
             for c in self.active_coins:
-                slug = f"{c.lower()}-updown-5m-{ts_suffix}"
+                slug = f"{c.lower()}-updown-{self.cfg.interval}-{ts_suffix}"
                 self._schedule_resolution_all(slug)
         else:
             self._schedule_resolution_all(old_slug)
@@ -2277,7 +2288,7 @@ class PatternStrategy:
         # Outcome inference at cycle end
         if self._cycle_start_ts > 0:
             cycle_age = now - self._cycle_start_ts
-            if cycle_age >= INFERENCE_TIME:
+            if cycle_age >= self.cfg.inference_time:
                 self._try_infer_outcomes_from_prices()
 
         # Gamma recheck queue (every 5s)

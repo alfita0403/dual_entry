@@ -1,0 +1,67 @@
+# Mean-Reversion V2 — K-Fold Survivors (15m markets)
+#
+# 9 patterns that survived k-fold cross-validation on 145-day 15m dataset.
+# Uses 15-minute market cycles instead of 5-minute.
+
+interval: "15m"
+coins: ["BTC", "ETH", "SOL", "XRP"]
+
+size: 5.0
+entry_window_start: 1
+entry_window_end: 3
+cancel_timeout: 10.0
+max_trades_per_cycle: 4
+
+drawdown_protection:
+  enabled: true
+  max_drawdown: 75.0
+  max_consecutive_losses: 8
+  cooldown_minutes: 30
+
+trade_log: meanrev_v2_kfold.txt
+
+rules:
+  - pattern: "UUDUUD"
+    side: "UP"
+    coins: ["BTC"]
+    max_ask: 0.48
+
+  - pattern: "DUDDUD"
+    side: "UP"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.55
+
+  - pattern: "DDUDDD"
+    side: "UP"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.55
+
+  - pattern: "UDDUUD"
+    side: "UP"
+    coins: ["SOL"]
+    max_ask: 0.48
+
+  - pattern: "DDUUD"
+    side: "UP"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.55
+
+  - pattern: "UUDDD"
+    side: "UP"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.55
+
+  - pattern: "DUUD"
+    side: "UP"
+    coins: ["BTC"]
+    max_ask: 0.55
+
+  - pattern: "UUUD"
+    side: "DOWN"
+    coins: ["XRP"]
+    max_ask: 0.55
+
+  - pattern: "UDUU"
+    side: "DOWN"
+    coins: ["BTC"]
+    max_ask: 0.55

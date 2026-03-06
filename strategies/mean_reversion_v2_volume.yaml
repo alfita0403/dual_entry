@@ -1,0 +1,91 @@
+# Mean-Reversion V2 — Volume Zone (5m markets)
+#
+# 14 patterns targeting the high-volume ask zone ($0.52-0.55).
+# Best daily PnL in 21-day backtest: $25.50/day, 3459 trades.
+
+coins: ["BTC", "ETH", "SOL", "XRP"]
+
+size: 5.0
+entry_window_start: 1
+entry_window_end: 3
+cancel_timeout: 10.0
+max_trades_per_cycle: 4
+
+drawdown_protection:
+  enabled: true
+  max_drawdown: 75.0
+  max_consecutive_losses: 8
+  cooldown_minutes: 15
+
+trade_log: meanrev_v2_volume.txt
+
+rules:
+  - pattern: "UUDUUD"
+    side: "UP"
+    coins: ["BTC"]
+    max_ask: 0.55
+
+  - pattern: "DUDDUD"
+    side: "UP"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.55
+
+  - pattern: "DDUDDD"
+    side: "UP"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.55
+
+  - pattern: "UDDUUD"
+    side: "UP"
+    coins: ["SOL"]
+    max_ask: 0.55
+
+  - pattern: "DDUUD"
+    side: "UP"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.55
+
+  - pattern: "UUDDD"
+    side: "UP"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.55
+
+  - pattern: "DUUD"
+    side: "UP"
+    coins: ["BTC"]
+    max_ask: 0.55
+
+  - pattern: "UDUU"
+    side: "DOWN"
+    coins: ["BTC"]
+    max_ask: 0.52
+
+  - pattern: "UUUD"
+    side: "DOWN"
+    coins: ["XRP"]
+    max_ask: 0.55
+
+  - pattern: "UUUU"
+    side: "DOWN"
+    coins: ["ETH"]
+    max_ask: 0.55
+
+  - pattern: "DDDD"
+    side: "UP"
+    coins: ["ETH"]
+    max_ask: 0.55
+
+  - pattern: "UUU"
+    side: "DOWN"
+    coins: ["ETH"]
+    max_ask: 0.55
+
+  - pattern: "UUU"
+    side: "DOWN"
+    coins: ["XRP"]
+    max_ask: 0.55
+
+  - pattern: "DDD"
+    side: "UP"
+    coins: ["BTC"]
+    max_ask: 0.55

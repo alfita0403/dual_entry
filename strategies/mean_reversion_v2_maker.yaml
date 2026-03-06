@@ -1,0 +1,102 @@
+# Mean-Reversion V2 — Maker Snipe (5m markets)
+#
+# 16 patterns targeting the maker zone ($0.43-0.48).
+# 0% maker fee, lower fill rate but higher edge per fill.
+# 21-day backtest: $16.70/day, 1640 trades.
+
+coins: ["BTC", "ETH", "SOL", "XRP"]
+
+size: 5.0
+entry_window_start: 1
+entry_window_end: 3
+cancel_timeout: 10.0
+max_trades_per_cycle: 4
+
+drawdown_protection:
+  enabled: true
+  max_drawdown: 60.0
+  max_consecutive_losses: 8
+  cooldown_minutes: 15
+
+trade_log: meanrev_v2_maker.txt
+
+rules:
+  - pattern: "UUDUUD"
+    side: "UP"
+    coins: ["BTC"]
+    max_ask: 0.48
+
+  - pattern: "DUDDUD"
+    side: "UP"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.45
+
+  - pattern: "DDUDDD"
+    side: "UP"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.44
+
+  - pattern: "UDDUUD"
+    side: "UP"
+    coins: ["SOL"]
+    max_ask: 0.48
+
+  - pattern: "UUUUUU"
+    side: "DOWN"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.46
+
+  - pattern: "DDUUD"
+    side: "UP"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.48
+
+  - pattern: "UUDDD"
+    side: "UP"
+    coins: ["BTC", "ETH", "SOL", "XRP"]
+    max_ask: 0.46
+
+  - pattern: "DUUD"
+    side: "UP"
+    coins: ["BTC"]
+    max_ask: 0.48
+
+  - pattern: "UDUU"
+    side: "DOWN"
+    coins: ["BTC"]
+    max_ask: 0.48
+
+  - pattern: "UUUD"
+    side: "DOWN"
+    coins: ["XRP"]
+    max_ask: 0.48
+
+  - pattern: "UUUU"
+    side: "DOWN"
+    coins: ["ETH"]
+    max_ask: 0.45
+
+  - pattern: "DDDD"
+    side: "UP"
+    coins: ["ETH"]
+    max_ask: 0.46
+
+  - pattern: "UUU"
+    side: "DOWN"
+    coins: ["ETH"]
+    max_ask: 0.46
+
+  - pattern: "UUU"
+    side: "DOWN"
+    coins: ["BTC", "SOL", "XRP"]
+    max_ask: 0.44
+
+  - pattern: "DDD"
+    side: "UP"
+    coins: ["ETH"]
+    max_ask: 0.44
+
+  - pattern: "DDD"
+    side: "UP"
+    coins: ["BTC"]
+    max_ask: 0.44
